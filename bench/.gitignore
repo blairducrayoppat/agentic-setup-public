@@ -1,0 +1,7 @@
+# Raw Intel Unified Telemetry / SoCWatch captures are large binaries (100s of MB)
+# and per-run transient state — kept LOCAL, never committed. The community-grade
+# SUMMARY of a run lives in BlarAI docs/performance/*.json + PERFORMANCE_LOG.md;
+# the small reusable artifacts (tier0-*.csv samples, tier0-sampler.ps1) ARE committed.
+*.bin
+ut-*.json
+ut-current.*

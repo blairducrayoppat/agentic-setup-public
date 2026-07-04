@@ -1,0 +1,28 @@
+# Minimal, clean Python project skeleton for the BlarAI dispatch fleet.
+# This is the SHAPE a freshly-decomposed Python target starts from: a single importable
+# package under app/, tests under tests/, zero third-party dependencies (so it builds and
+# tests OFFLINE out of the box). The coder EXTENDS this -- adds modules under app/ and
+# matching tests -- rather than authoring loose top-level scripts.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "app"
+version = "0.1.0"
+description = "A starting skeleton for a Python project (extend this)."
+requires-python = ">=3.10"
+dependencies = []
+
+# Scope discovery to the app package so adding a root-level helper never trips setuptools'
+# "Multiple top-level modules" flat-layout error.
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Make the app package importable under the fleet's gate command -- `uv run --no-project --with
+# pytest pytest`. The console-script `pytest` (unlike `python -m pytest`) does NOT add the project
+# root to sys.path, so `from app.core import ...` in tests/ fails with ModuleNotFoundError without
+# this. pythonpath (pytest>=7) prepends the root so a flat app/ + tests/ layout imports cleanly.
+pythonpath = ["."]

@@ -1,0 +1,13 @@
+# Append the [wsl2] memory/processor caps to C:\Users\mrbla\.wslconfig
+# Your current .wslconfig has ONLY networkingMode=mirrored (good: localhost
+# works both directions between Windows and WSL). It has NO memory cap, so
+# WSL2 may balloon to ~15.7GB (50% of RAM) — fatal for the fleet tier.
+#
+# Target state of C:\Users\mrbla\.wslconfig:
+
+[wsl2]
+networkingMode=mirrored
+memory=4GB
+processors=4
+
+# After editing:  wsl --shutdown   (restarts WSL with the cap)

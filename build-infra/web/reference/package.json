@@ -1,0 +1,10 @@
+{
+  "name": "app",
+  "version": "0.1.0",
+  "description": "Full-stack web skeleton: a node:http back-end (REST + static) and a front-end. Extend this.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "prompt": "Read install.md and set the project up by following its instructions, then write a file named ready.txt at the project root describing what the project is. Do only that.",
+  "timeoutMinutes": 10
+}

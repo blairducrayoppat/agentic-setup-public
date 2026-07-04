@@ -1,0 +1,4 @@
+{
+  "prompt": "Read policy.md and create app_config.py at the project root exactly as it specifies.",
+  "timeoutMinutes": 10
+}

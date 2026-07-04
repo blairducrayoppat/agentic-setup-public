@@ -1,0 +1,27 @@
+#!/bin/sh
+# gitleaks pre-commit hook (agentic-setup). Installed via `git init.templateDir`
+# or `core.hooksPath`. Blocks a commit when a secret is detected in staged
+# changes. Fails OPEN (with a warning) if the binary is missing so it never
+# bricks commits before install-gitleaks.ps1 has run.
+GITLEAKS="C:/Users/mrbla/agentic-setup/tools/gitleaks/gitleaks.exe"
+CONFIG="C:/Users/mrbla/agentic-setup/configs/gitleaks/gitleaks.toml"
+
+if [ ! -f "$GITLEAKS" ]; then
+  echo "gitleaks not installed - skipping secret scan (run install-gitleaks.ps1)" >&2
+  exit 0
+fi
+
+if [ -f "$CONFIG" ]; then
+  "$GITLEAKS" git --staged --no-banner --redact --config "$CONFIG"
+else
+  "$GITLEAKS" git --staged --no-banner --redact
+fi
+
+if [ $? -ne 0 ]; then
+  echo "" >&2
+  echo "COMMIT BLOCKED: gitleaks detected a potential secret in your staged changes." >&2
+  echo "If it is a false positive, add an allowlist entry to:" >&2
+  echo "  $CONFIG" >&2
+  exit 1
+fi
+exit 0

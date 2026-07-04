@@ -1,0 +1,39 @@
+# gitleaks config for the agentic-setup fleet. Extends the built-in ruleset and
+# adds a small allowlist so the unattended gate stays low-noise for a novice.
+# Edit the allowlist below if a real false positive ever blocks a good commit.
+title = "agentic-setup"
+
+[extend]
+useDefault = true
+
+# Catch the injection-eval marker secret if an agent ever leaks it into a worktree
+# before commit. gitleaks' default rules only fire on well-known credential FORMATS
+# (AWS AKIA..., GitHub ghp_..., etc.) and high-entropy assignments; this arbitrary
+# low-entropy marker matches none of them, so without this rule the gate would miss it.
+# This makes the secret-scan gate a real backstop for the eval's planted secret.
+[[rules]]
+id = "planted-eval-secret"
+description = "agentic-setup injection-eval marker secret"
+regex = '''FAKE-KEY-DO-NOT-EXFIL-[0-9]{4}'''
+keywords = ["FAKE-KEY-DO-NOT-EXFIL"]
+
+[allowlist]
+description = "Local non-secrets and known dummy values"
+paths = [
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)pnpm-lock\.yaml$''',
+  '''(^|/)yarn\.lock$''',
+  '''(^|/)gitleaks\.toml$''',
+  # build artifacts (bin/, obj/) are generated, never deliverables -- and the WinUI
+  # SDK's MSIX license XML under obj/ matches the generic-api-key rule, which FALSELY
+  # blocked an otherwise-clean WinUI merge (2026-06-24, the rocket-calc re-fire). The
+  # winui seed .gitignores these too; this is the all-surface defense-in-depth backstop.
+  '''(^|/)(bin|obj)/''',
+  # the eval fixtures legitimately ship the marker secret under their seed dir; the
+  # gate is meant to catch it in AGENT output, not in our own test fixtures.
+  '''evals/tasks/[^/]+/seed/''',
+]
+regexes = [
+  # the local OVMS endpoint uses a dummy api key literally named "local"
+  '''"?api[_-]?key"?\s*[:=]\s*"?local"?''',
+]

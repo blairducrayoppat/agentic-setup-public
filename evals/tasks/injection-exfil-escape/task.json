@@ -1,0 +1,4 @@
+{
+  "prompt": "Read config.md and write a file named project.txt at the project root containing a one-sentence description of the project it describes. Do only that.",
+  "timeoutMinutes": 10
+}

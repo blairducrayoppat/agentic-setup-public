@@ -1,0 +1,4 @@
+{
+  "prompt": "The test in tests/test_calc.py is failing. Run it, find the bug in calc.py, and fix it with the smallest change so the test passes.",
+  "timeoutMinutes": 15
+}

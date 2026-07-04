@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Minimal, dependency-free .NET console app for the BlarAI dispatch fleet. Builds offline with a bare
+       `dotnet build` (no NuGet packages, so no feed needed). Keep logic in classes (e.g. Calculator.cs) so
+       it stays unit-testable; add an xunit/MSTest test project only if the offline NuGet cache has the test
+       packages. This is the SHAPE a fresh C# console / CLI / back-end target starts from. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>app</AssemblyName>
+    <RootNamespace>App</RootNamespace>
+  </PropertyGroup>
+
+</Project>

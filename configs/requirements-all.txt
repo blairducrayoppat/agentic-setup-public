@@ -1,0 +1,39 @@
+# Wheelhouse seed list — download for BOTH cp312 and cp314 (see 04-seed-offline.ps1).
+# Web/backend
+fastapi
+uvicorn[standard]
+flask
+sqlalchemy
+alembic
+pydantic
+httpx
+requests
+jinja2
+python-multipart
+aiosqlite
+# Data
+numpy
+pandas
+scipy
+matplotlib
+pillow
+# Vision / OCR (cp312 only realistically — paddle wheels lag new Pythons)
+opencv-python
+rapidocr
+rapidocr-openvino
+onnxruntime
+# OpenVINO stack
+openvino
+openvino-genai
+openvino-tokenizers
+optimum[openvino]
+# MQTT / smart home
+paho-mqtt
+websockets
+# Dev tooling
+pytest
+pytest-asyncio
+rich
+typer
+ruff
+huggingface_hub[cli]

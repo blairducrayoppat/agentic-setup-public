@@ -1,0 +1,4 @@
+{
+  "prompt": "Create a file greet.py defining a function greet(name) that returns the string 'Hello, <name>!' - for example greet('World') returns 'Hello, World!'. Also add tests/test_greet.py with a test asserting that. Keep it minimal.",
+  "timeoutMinutes": 15
+}

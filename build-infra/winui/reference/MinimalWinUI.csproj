@@ -1,0 +1,76 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Minimal, COMPILABLE WinUI 3 / Windows App SDK reference template for the
+    BlarAI dispatch fleet. A trivial single-window app that builds to App.exe.
+
+    This is the SHAPE a freshly-decomposed WinUI target should start from. It is
+    deliberately the smallest project that:
+      (1) builds with a BARE, flagless `dotnet build` (the fleet gate runs no
+          command-line flags), and
+      (2) restores entirely from the local offline feed (see ../nuget.config).
+
+    Package versions are PINNED to the canonical fact-sheet (do NOT bump without
+    re-mirroring the feed). The two PackageReferences below are the COMPLETE
+    WinUI set a minimal app needs; their full transitive closure (18 packages)
+    is mirrored into C:\Users\mrbla\blarai-build\nuget-feed by ../mirror-feed.ps1.
+
+    BARE-BUILD FALSE-FAIL GUARDS (the load-bearing part of this template):
+      The reference BlarAI.Desktop.csproj sets only the PLURAL
+      <Platforms>x64;ARM64</Platforms> + <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>.
+      Those do NOT select a single architecture, so a flagless build defaults to
+      AnyCPU and the Windows App SDK targets throw
+        "WindowsAppSDKSelfContained requires a supported Windows architecture".
+      A standalone project that must pass a flagless gate MUST bake the SINGULAR
+      selectors into a PropertyGroup so no command line is needed:
+        - <RuntimeIdentifier>win-x64</RuntimeIdentifier>  (SINGULAR) supplies the
+          "supported Windows architecture" the SDK arch-check wants. PRIMARY FIX.
+        - <Platform>x64</Platform> (SINGULAR) pins MSBuild's $(Platform) to x64
+          (default is AnyCPU) so RID resolution and the SDK arch-check agree.
+        - <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained> (paired
+          with WindowsPackageType=None) is fine to keep ONCE the RID is pinned.
+      Do NOT set <SelfContained> independently — WindowsAppSDKSelfContained
+      governs the App SDK runtime here.
+
+      If you later want a multi-arch publish, switch back to the plural
+      Platforms/RuntimeIdentifiers and re-supply `-p:Platform=x64 -r win-x64`
+      (the way the BlarAI runbook/journal builds do).
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>MinimalWinUI</RootNamespace>
+    <AssemblyName>App</AssemblyName>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Unpackaged + self-contained App SDK runtime: no separate install. -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <EnableMsixTooling>true</EnableMsixTooling>
+
+    <!-- SINGULAR selectors so a BARE `dotnet build` passes (see the comment
+         block above). These two together prevent the
+         "requires a supported Windows architecture" false-fail. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platform>x64</Platform>
+
+    <!-- Custom entry point (dead-button fix, 2026-06-24): App.xaml.cs provides a static
+         Main that runs the offline Calculator tests in test mode (no GUI, self-terminating)
+         and launches the app otherwise. Disabling the SDK-generated Main lets that
+         hand-written entry (in the contract's allowed App.xaml.cs, not a second Program.cs)
+         take over, giving the coder a run/read-failure/fix/repeat loop. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <StartupObject>MinimalWinUI.App</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The COMPLETE WinUI set a minimal app needs (versions pinned to the
+         canonical fact-sheet). Their transitive closure is in the offline feed. -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260508005" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.8249" />
+  </ItemGroup>
+
+</Project>

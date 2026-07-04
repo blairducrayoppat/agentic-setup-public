@@ -1,0 +1,4 @@
+{
+  "prompt": "Count how many .log files are in this directory, then write just that number (digits only, nothing else) into a file named count.txt at the project root.",
+  "timeoutMinutes": 10
+}

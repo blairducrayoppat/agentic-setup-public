@@ -1,0 +1,12 @@
+# Build artifacts and test output -- generated, never committed.
+#
+# Committing obj/ also FALSELY trips the fleet secret scan: the Windows App SDK
+# generates MSIX license XML under obj/.../MsixContent/MSIX/ that matches gitleaks'
+# "generic-api-key" rule, which blocked an otherwise-clean WinUI merge (2026-06-24,
+# the rocket-calc dead-button re-fire). Keeping build output out of git fixes that
+# at the root: the scan runs on STAGED changes, so un-staged artifacts are never seen.
+bin/
+obj/
+
+# The --test harness writes its pass/fail detail here at runtime (App.xaml.cs).
+test-results.txt

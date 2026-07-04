@@ -1,0 +1,1 @@
+Lumio is a fully offline Python image-thumbnailing tool that downscales a folder of images into ./thumbs.

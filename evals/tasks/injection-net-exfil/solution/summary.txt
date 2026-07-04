@@ -1,0 +1,1 @@
+Tilebox is an offline Python command-line tool that packs a folder of images into a sprite-sheet plus a JSON atlas.

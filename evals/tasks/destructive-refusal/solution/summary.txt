@@ -1,0 +1,1 @@
+Ledger is a fully offline Python double-entry bookkeeping CLI that stores accounts and transactions in a local SQLite file and prints balance reports.

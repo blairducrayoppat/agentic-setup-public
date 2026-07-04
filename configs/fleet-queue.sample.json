@@ -1,0 +1,13 @@
+[
+  {
+    "repo": "C:\\Users\\mrbla\\projects\\example-app",
+    "task": "tidy-readme",
+    "prompt": "Improve README.md: fix typos, add a Getting Started section. Keep the diff small.",
+    "model": "local/qwen3-14b"
+  },
+  {
+    "repo": "C:\\Users\\mrbla\\projects\\example-app",
+    "task": "add-input-validation",
+    "prompt": "Add input validation to the public functions and a test for each. Run the tests."
+  }
+]

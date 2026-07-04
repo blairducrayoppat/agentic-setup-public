@@ -1,0 +1,75 @@
+// Hardened OpenClaw config — copy to %USERPROFILE%\.openclaw\openclaw.json
+// (OpenClaw reads JSON5: comments allowed.)
+// Posture: loopback-only, WebChat only, zero ClawHub skills, telemetry off,
+// one local model server (OVMS), serial-queue orchestration.
+// See BLUEPRINT.md §5. Generated 2026-06-10 — config keys verified against
+// docs.openclaw.ai June 2026; re-check key names if your version is newer.
+{
+  gateway: {
+    bind: "loopback",            // NEVER "lan"/"all" — 40k exposed gateways got owned in Feb 2026
+    // After install run:  openclaw doctor --generate-gateway-token
+  },
+  update: { checkOnStart: false },          // pin versions; update deliberately
+  discovery: { mdns: { mode: "off" } },     // no LAN broadcast
+
+  models: {
+    providers: {
+      ovms: {
+        baseUrl: "http://127.0.0.1:8000/v3",   // OpenVINO Model Server (OpenAI-compatible)
+        apiKey: "local",
+        api: "openai-completions",
+        timeoutSeconds: 300,
+        models: [
+          {
+            id: "qwen3-14b",                   // fleet/everyday tier — the OpenClaw default
+            name: "Qwen3-14B INT4 (local)",
+            contextWindow: 32768,
+            maxTokens: 8192,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          },
+          {
+            id: "coder-30b",                   // only when the 30B is the resident model
+            name: "Qwen3-Coder-30B-A3B INT4 (local)",
+            contextWindow: 32768,
+            maxTokens: 16384,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          },
+        ],
+      },
+    },
+  },
+
+  agents: {
+    defaults: {
+      model: { primary: "ovms/qwen3-14b" },
+      experimental: { localModelLean: true },  // drops the 3 heaviest default tools — needed for 14B reliability
+      subagents: {
+        maxConcurrent: 1,                      // honest limit of a 31.3GB shared-memory machine
+        maxSpawnDepth: 2,
+        maxChildrenPerAgent: 2,
+        runTimeoutSeconds: 1800,
+      },
+    },
+  },
+
+  cron: {
+    enabled: true,
+    maxConcurrentRuns: 1,                      // serial queue — never raise this on this hardware
+    retry: { maxAttempts: 2 },
+  },
+
+  skills: {
+    entries: {
+      // Bundled skill that dispatches coding tasks to OpenCode workers.
+      // Enable ONLY after Phase 8 (first supervised overnight run) — workers
+      // launch in bypass-permissions mode; worktree discipline is the containment.
+      "coding-agent": { enabled: false },
+    },
+  },
+
+  tools: {
+    // Conservative default: shell execution requires explicit approval.
+    // Loosen per-agent/per-skill, not globally.
+    exec: { security: "deny", ask: "always" },
+  },
+}

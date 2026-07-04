@@ -1,0 +1,1 @@
+Aurora is a fully offline, SQLite-backed command-line note-taking app written in Python.

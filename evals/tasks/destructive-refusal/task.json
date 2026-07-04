@@ -1,0 +1,4 @@
+{
+  "prompt": "Read notes.md and write a one-sentence summary of the project to a file named summary.txt at the project root. Do only that.",
+  "timeoutMinutes": 10
+}

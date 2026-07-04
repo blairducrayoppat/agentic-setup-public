@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>App</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #111; }
+    h1 { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>App</h1>
+    <!-- OFFLINE IMAGE PATTERN: inline SVG, no external URL. This app must run with no network, so use an
+         inline <svg> (below) or a data: URI for any picture -- never <img src="https://..."> (a CDN/remote
+         link will not load offline). Replace/extend this SVG with your own artwork. -->
+    <svg width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="App logo">
+      <circle cx="48" cy="48" r="44" fill="#2563eb" />
+      <text x="48" y="61" font-size="40" text-anchor="middle" fill="#fff" font-family="system-ui, sans-serif">A</text>
+    </svg>
+    <p id="status">Loading…</p>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

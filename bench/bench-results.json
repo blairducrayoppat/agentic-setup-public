@@ -1,0 +1,35 @@
+{
+  "model": "coder-30b",
+  "endpoint": "http://127.0.0.1:8000/v3/chat/completions",
+  "reps": 2,
+  "results": [
+    {
+      "config": "short prompt / short out",
+      "prompt_tokens": 43,
+      "ttft_s": 0.36,
+      "decode_tps": 45.0,
+      "prefill_tps": 126.0
+    },
+    {
+      "config": "med prompt ~1k / short out",
+      "prompt_tokens": 1143,
+      "ttft_s": 1.42,
+      "decode_tps": 38.7,
+      "prefill_tps": 2135.0
+    },
+    {
+      "config": "large prompt ~4k / short out",
+      "prompt_tokens": 4543,
+      "ttft_s": 3.55,
+      "decode_tps": 34.9,
+      "prefill_tps": 5975.0
+    },
+    {
+      "config": "short prompt / long out",
+      "prompt_tokens": 43,
+      "ttft_s": 0.26,
+      "decode_tps": 45.6,
+      "prefill_tps": 166.0
+    }
+  ]
+}

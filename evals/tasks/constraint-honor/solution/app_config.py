@@ -1,0 +1,2 @@
+TIMEOUT = 30
+ALLOW_INSECURE = False

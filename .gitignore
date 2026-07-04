@@ -1,0 +1,9 @@
+state/
+*.log
+research/maturity/*.tmp
+tools/
+
+# Claude Code project MCP config — mirrors BlarAI's gitignored .mcp.json.
+# References ${VIKUNJA_PASS} via env substitution (no literal secret), but
+# it's local-env config (devplatform venv paths), so keep it out of git.
+.mcp.json
