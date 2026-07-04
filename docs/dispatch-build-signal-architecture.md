@@ -10,7 +10,7 @@ increments off-dispatch, then ONE consolidated on-hardware `/dispatch` at the en
 ## 1. Context — why this exists
 
 The matured-pipeline proof run `20260624-084153-bd` (`/dispatch rocket-calc`,
-a pure-product WinUI goal) **parked** after a ~30-minute churn. Root cause, traced
+a pure-product WinUI goal) **parked** after a \~30-minute churn. Root cause, traced
 from the coder transcript (not assumed):
 
 - The **WinUI scaffold never seeded** — the coder's first `glob **` saw only
@@ -21,7 +21,7 @@ from the coder transcript (not assumed):
   no-op'd and nothing seeded.
 - Authoring from zero, the 30B **proliferated**: the real WinUI app *plus* a
   Console-style `Program.cs` with its own `Main()`, a second test project, and
-  ~7 loose `.cs` runner/validation files with top-level statements → `CS8803`
+  \~7 loose `.cs` runner/validation files with top-level statements → `CS8803`
   + a XAML internal compiler error → 30-min circuit-breaker → park.
 - The CS0246 (`RoutedEventArgs` / missing `using`) ceiling is **gone** — the coder
   wrote the usings correctly itself — but that was never the scaffold's doing.
@@ -316,18 +316,18 @@ build-signal channel as `surface` (the 14B classifies; the system maps).
 
 **The budget is variance insurance, not a capability multiplier.** Error-feedback and
 resample reliably converge a small model on a *random, specific* slip (a one-off compile
-error, a transient logic miss — the journal's ~1-random-slip-per-implementation floor,
+error, a transient logic miss — the journal's \~1-random-slip-per-implementation floor,
 retryable). They do NOT converge a *consistent* problem (a capability gap or a spec
 ambiguity) — it fails the same way every pass, so an Nth pass is the 1st pass again.
 
 **Practical ceiling ≈ 3 build passes**, bounded by three limits (not the mechanism):
-1. **Convergence kind, not count** — random slips converge in ~2–4 passes (a Python
+1. **Convergence kind, not count** — random slips converge in \~2–4 passes (a Python
    classifier converged in 4 auto-retries); a consistent problem never does.
 2. **Context bloat turns extra passes negative** — error-feedback appends the failure to
    the prompt; a long prompt *regresses* a small model (measured: the lean prompt beat the
    heavy one). Passes 5–6 can do worse than pass 2.
 3. **Wall-clock** — each pass can run to the 30-min circuit breaker, so 5 passes is up to
-   ~2.5 h of GPU time for one task — impractical to run consistently.
+   \~2.5 h of GPU time for one task — impractical to run consistently.
 
 **Decision (LA 2026-06-24, operator-endorsed reasoning):** keep the build budget modest —
 cap around **3 even for "complex."** The leverage for hard builds is **prevention** (a
@@ -340,5 +340,5 @@ consistent failure, and bloats the prompt against the model).
 
 **Open measurement (set the cap empirically, don't trust the estimate):** the **pass-N
 convergence rate** — across a batch, the fraction of tasks that fail pass N and go green on
-pass N+1. Prior: it falls off a cliff after ~3. Measure once the pipeline is proven and set
+pass N+1. Prior: it falls off a cliff after \~3. Measure once the pipeline is proven and set
 the budget map from the data, not the estimate.

@@ -14,7 +14,7 @@ wrong-language / non-merging coder defects are FLEET defects (agentic-setup), NO
 The first live dispatch (run `20260623-060248-bd`, `is_palindrome` on `fleet-shakedown`) **PROVED
 the Problem-2 swap-back fix**: the teardown fired on its own, the 14B was restored unattended, the
 swap-state phase ended `RECOVERED`, and the worktree sweep ran AFTER the restore. The round-trip's
-swap overhead (step-aside + 30B load + teardown) was ~3.7 min.
+swap overhead (step-aside + 30B load + teardown) was \~3.7 min.
 
 It also surfaced **two BlarAI-side refinements** (below). Both ship dormant; both run through the
 same gated process as Problems 1 & 2. (The run's other problems — the coder wrote JavaScript in a
@@ -40,7 +40,7 @@ Python repo, and nothing merged — are FLEET defects; see the companion brief.)
 
 **Symptom (live):** `write an is_palindrome function` decomposed into **2 tasks** —
 `implement-is-palindrome` + `acceptance-tests` — when it should be **1**. (Big improvement over the
-old ~9, but not yet 1.) The spurious `acceptance-tests` task then ran ~24 min FAILING, because it
+old \~9, but not yet 1.) The spurious `acceptance-tests` task then ran \~24 min FAILING, because it
 was a separate fleet task with its own worktree and the implementation wasn't in it.
 
 **Where:** `shared/fleet/decompose.py` — the Problem-1 right-sizing ruler (`_classify`, `_collapse`,
@@ -71,13 +71,13 @@ prove you didn't trade over-splitting for under-splitting.
 **Symptom (live):** the swap-back fired correctly, but the verify-the-stop wrote a
 `SWAP_FAILED_<run>.txt` ("OVMS still resident after a forced stop") even though OVMS *did* unload
 moments later (the boot reconciler converged it; the operator saw phase `RECOVERED`, 14B up, OVMS
-gone). Cause: a ~15 GB OVMS unload is SLOWER than the verify-the-stop's check-then-one-fast-retry
+gone). Cause: a \~15 GB OVMS unload is SLOWER than the verify-the-stop's check-then-one-fast-retry
 window, so it cried wolf. The fail-loud MECHANISM is correct; the TIMING is too eager.
 
 **Where:** `shared/fleet/swap_driver.py` — the teardown verify step (`_verify_ovms_stopped` and the
 `real_ovms_alive` / `stop_ovms` injected ops in `shared/fleet/swap_ops.py`).
 
-**Fix:** **POLL** `ovms_alive` with a timeout (~30–60 s, a few polls on an injected clock) before
+**Fix:** **POLL** `ovms_alive` with a timeout (\~30–60 s, a few polls on an injected clock) before
 escalating to the forced retry + `signal_failure`. Only after the poll window STILL shows OVMS
 resident → forced retry → if still resident → signal. Give the big-model unload time to finish.
 

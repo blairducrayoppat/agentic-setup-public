@@ -5,7 +5,7 @@ All facts verified by file reads and live commands on this machine (2026-06-10):
 
 1. Read every file in C:\Users\mrbla\agentic-setup\scripts\ (start-llm.ps1, stop-llm.ps1, open-coding.ps1, new-agent-task.ps1, 01-05*.ps1), all 5 root .cmd launchers, and configs\opencode.json + openclaw.json5.
 2. `opencode --help` (run on this machine, v1.17.x): the default TUI command DOES support `-m, --model` in `provider/model` format; `opencode run --help` confirms `--dir` and `-m` both exist, so new-agent-task.ps1's invocation is valid and open-coding.ps1 CAN pin the loaded model.
-3. start-llm.ps1 line 69: `$reclaimFromOvms = 9` flat, with its own comment admitting "14B≈10, VL≈6, 30B≈18". BLUEPRINT.md section 1 table confirms measured residents: coder-30b ~18.8 GB, qwen3-14b ~10.5 GB, qwen3-vl-8b ~6 GB. So with the VL loaded and a 30B request, availability is overstated by ~3 GB (can pass the check then choke); with 30B loaded and 14B requested it is understated by ~9 GB (nags the user to close apps needlessly).
+3. start-llm.ps1 line 69: `$reclaimFromOvms = 9` flat, with its own comment admitting "14B≈10, VL≈6, 30B≈18". BLUEPRINT.md section 1 table confirms measured residents: coder-30b \~18.8 GB, qwen3-14b \~10.5 GB, qwen3-vl-8b \~6 GB. So with the VL loaded and a 30B request, availability is overstated by \~3 GB (can pass the check then choke); with 30B loaded and 14B requested it is understated by \~9 GB (nags the user to close apps needlessly).
 4. start-llm.ps1 line 170 starts OVMS with `Start-Process ... -WindowStyle Minimized` and NO -RedirectStandardOutput/-RedirectStandardError. Manual log files ovms-30b.log / ovms-test.log sitting in agentic-setup\ prove logs had to be captured by hand before; a later crash leaves zero diagnostics. C:\Users\mrbla\agentic-setup\state\logs does not exist (Test-Path = False).
 5. LIVE REPRO of the stop-llm UX bug: the flag file $env:TEMP\agentic-blarai-vm-stopped.flag EXISTS right now and Get-VM shows BlarAI-Orchestrator is Off — start-llm stopped it at some point and nothing ever offered the restart because stop-llm.ps1 (4 lines total) never checks the flag. The flag also lives in %TEMP%, which Storage Sense/Disk Cleanup purges.
 6. Get-VM works without elevation for this user: `whoami /groups` shows BUILTIN\Hyper-V Administrators membership; Get-VM returned BlarAI-Orchestrator (Off). Only that one VM exists today, but the script hardcodes the name and would ignore any future VM (HAOS VM is planned in BLUEPRINT 6.3).
@@ -16,7 +16,7 @@ All facts verified by file reads and live commands on this machine (2026-06-10):
 11. configs\opencode.json sets default `"model": "local/qwen3-14b"` — so when coder-30b is the resident model and the user opens the chat, OpenCode silently targets qwen3-14b, OVMS returns the 'Mediapipe graph not found'-class error. open-coding.ps1 already queries /v3/models (line 14) but throws the answer away and launches bare `opencode` (line 96).
 12. new-agent-task.ps1: native git exit codes are NOT caught by $ErrorActionPreference='Stop' (PS 5.1 and PS 7.x default) and $LASTEXITCODE is never checked after `git worktree add`, so a pre-existing branch/folder lets the script dispatch opencode into a broken worktree; $Task is unsanitized (a space breaks the branch name); the model-server check happens AFTER worktree creation and never verifies the LOADED model matches -Model.
 13. 04-seed-offline.ps1 runs `npm config set registry http://localhost:4873/` unconditionally — if Verdaccio failed to install/start, every future npm install on the machine breaks. 05-overnight-power.ps1 says "Run as Administrator" but never checks (EAP=Continue makes powercfg failures silent). PS 7.6.1 is installed (pwsh path taken by all launchers); PS 5.1 fallback paths have latent bugs: start-llm's Invoke-WebRequest lacks -UseBasicParsing, and open-coding's `git ... 2>$null` under EAP=Stop throws on PS 5.1 when git emits stderr hints.
-14. The opencode shim is AppData\Roaming\npm\opencode.ps1; uv/uvx/git all present (Get-Command verified). Available RAM at scan time ~22.8 GB.
+14. The opencode shim is AppData\Roaming\npm\opencode.ps1; uv/uvx/git all present (Get-Command verified). Available RAM at scan time \~22.8 GB.
 
 ## IMPROVEMENTS
 
@@ -76,7 +76,7 @@ throw "The model server did not become ready in 180s. Log: $ErrLog"
 RISK: Low. Start-Process supports -WindowStyle together with the two redirects; the two files must differ (they do). OVMS logs mostly to stderr, both streams captured.
 
 ### [P0/small] start-llm.ps1: per-model RAM reclaim instead of flat 9 GB
-Line 69 credits a flat 9 GB for any running ovms. Real residents (BLUEPRINT section 1, measured): 30B ~18.8, 14B ~10.5, VL ~6. Two concrete failures: (a) VL loaded -> ask for 30B: availability overstated by ~3 GB, the check passes and the machine crawls/OOMs mid-load; (b) 30B loaded -> ask for 14B: understated by ~9 GB, the assistant nags the user to close apps that do not need closing. Query /v3/models to learn WHICH model is resident and use a per-model table rounded DOWN.
+Line 69 credits a flat 9 GB for any running ovms. Real residents (BLUEPRINT section 1, measured): 30B \~18.8, 14B \~10.5, VL \~6. Two concrete failures: (a) VL loaded -> ask for 30B: availability overstated by \~3 GB, the check passes and the machine crawls/OOMs mid-load; (b) 30B loaded -> ask for 14B: understated by \~9 GB, the assistant nags the user to close apps that do not need closing. Query /v3/models to learn WHICH model is resident and use a per-model table rounded DOWN.
 ```text
 In C:\Users\mrbla\agentic-setup\scripts\start-llm.ps1 replace lines 67-69 with:
 
@@ -301,7 +301,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "OpenCode exited with code $LASTEXITCODE -
 RISK: Low. Sanitization matches open-coding.ps1's existing rule, so names stay consistent.
 
 ### [P2/small] start-llm.ps1: needGB sanity — raise vision from 8 to 10, re-verify 30B's 21 from new logs
-All three model starts pass `--cache_size 4` (4 GB KV cache pre-allocation) — including vision, whose needGB is 8 against ~6 GB resident weights + 4 GB cache + runtime overhead. 14B at 13 (10.5 resident) and 30B at 21 (matches BLUEPRINT's '>= 21 GB' lean rule) are plausible but were never confirmed against captured logs because there were no logs. After the log-capture fix lands, read the first allocation lines of state\logs\ovms-vision-*.err.log and adjust.
+All three model starts pass `--cache_size 4` (4 GB KV cache pre-allocation) — including vision, whose needGB is 8 against \~6 GB resident weights + 4 GB cache + runtime overhead. 14B at 13 (10.5 resident) and 30B at 21 (matches BLUEPRINT's '>= 21 GB' lean rule) are plausible but were never confirmed against captured logs because there were no logs. After the log-capture fix lands, read the first allocation lines of state\logs\ovms-vision-*.err.log and adjust.
 ```text
 In C:\Users\mrbla\agentic-setup\scripts\start-llm.ps1, in the 'vision' switch branch change:
         $needGB = 8

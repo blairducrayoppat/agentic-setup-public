@@ -57,23 +57,23 @@ a verify gate + secret-scan + a human morning-review gate.
   paths short; instruct relative in-project paths.** → BlarAI: give the model short,
   simple paths and prefer relative ones.
 - 🔬 **Per-attempt reliability is low but independent → retry is the big lever.**
-  Single-shot tool-execution success measured ~20–50%. Re-running a no-op from a
-  clean state turns ~50% into ~85–90%. → BlarAI: build a retry-on-no-op loop around
+  Single-shot tool-execution success measured \~20–50%. Re-running a no-op from a
+  clean state turns \~50% into \~85–90%. → BlarAI: build a retry-on-no-op loop around
   any agentic action (see §4).
 - 🔬 **Minimize the tool-call surface of a task.** Reproduced live (2026-06-20): on a
   multi-read task the 30B emitted a `read` call as JSON *text* (not executed) and
   derailed → no-op. Since success ≈ (1−p)^N over N tool calls, the highest-leverage
   tune is a **self-contained prompt** — inline the full contract/types/rules so the
-  model needs ~0 reads and can go straight to a single write + test. → BlarAI: give
+  model needs \~0 reads and can go straight to a single write + test. → BlarAI: give
   the local model everything it needs in the prompt; every avoidable file read is a
   failure die-roll.
 - ❌ **Backslash corruption in file-writes.** A model writing a file through a JSON
   tool call can have its backslashes doubled: an intended `\b` (regex word boundary)
   landed on disk as `\\b`, so the regex matched nothing (the run went from a working
-  ~17/26 to ~1/27). Steer the local model OFF regex backslash escapes (`\b \w \s`
+  \~17/26 to \~1/27). Steer the local model OFF regex backslash escapes (`\b \w \s`
   inside written code) toward plain string ops. → BlarAI: assume tool-call file-writes
   can mangle escapes; prefer escape-free code and verify written files on disk.
-- ❌ **Regression-then-quit.** Mid-iteration the model had ~17/26 passing, then a
+- ❌ **Regression-then-quit.** Mid-iteration the model had \~17/26 passing, then a
   "fix" rewrite regressed it and it STOPPED instead of reverting. Instruct: re-run
   tests after every change, revert any change that increases failures, never stop
   while red. → BlarAI: bake an anti-regression rule into the autonomous loop.
@@ -109,7 +109,7 @@ plumbing bugs. **If output looks like a no-op or help text, suspect the launch, 
 the model.**
 - ❌ **Headless `opencode run` blocks forever at init** reading an inherited non-TTY
   stdin that never EOFs. Every unattended run hung until the timeout. **Fix: feed an
-  empty stdin file via `-RedirectStandardInput`.** Proven by A/B (>60s stall → ~20s
+  empty stdin file via `-RedirectStandardInput`.** Proven by A/B (>60s stall → \~20s
   complete). A parallel "ranked guesses" investigation got this wrong; the
   controlled A/B got it right.
 - ❌ **Going through `cmd /c` exposed the prompt to shell parsing** — a prompt
@@ -118,7 +118,7 @@ the model.**
   shell).**
 - ❌ **(This session, the nastiest one.) `Start-Process -ArgumentList` with an ARRAY
   does not quote — it space-joins, and the child re-splits on every space.** A
-  477-char prompt arrived as ~70 tokens; tokens that looked like flags (`-m`, `-q`,
+  477-char prompt arrived as \~70 tokens; tokens that looked like flags (`-m`, `-q`,
   a bare `-`) were parsed as options, so opencode printed its help and exited — a
   **100% no-op, 3/3 attempts.** It had hidden for sessions because short, punctuation-
   free prompts happened to survive (the variadic positional re-joined plain words).
@@ -207,7 +207,7 @@ the model.**
   design loop; the first real end-to-end run still failed twice, each on a *seam* no
   unit test crossed. (1) A render timeout tuned on an idle box (30s) stalled when the
   app launched cold under resident-30B memory/GPU pressure — fixed with a longer budget
-  + a warm-up retry (it renders in ~1s warm). (2) The auto-FIX callback used
+  + a warm-up retry (it renders in \~1s warm). (2) The auto-FIX callback used
   `.GetNewClosure()`, which rebinds *function* lookup to global; one level deep (every
   `pwsh -File` unit test) it works, but the fleet runs two levels deep (`run-fleet` ->
   `& new-agent-task.ps1`) where the dot-sourced functions live in a nested scope the
@@ -221,14 +221,14 @@ the model.**
 
 ### 7. Operational / resources
 - ✅ **One model resident at a time** (31 GB shared RAM). The 30B needs the "lean
-  profile" (~18–21 GB; close the browser, BlarAI VM off). This session: freed safe
-  background junk to ~8.8 GB used / 22.5 GB free. **A 7 GB-used target was not
-  safely reachable** — Windows + Bitdefender + shell sit at ~8 GB and you should not
+  profile" (\~18–21 GB; close the browser, BlarAI VM off). This session: freed safe
+  background junk to \~8.8 GB used / 22.5 GB free. **A 7 GB-used target was not
+  safely reachable** — Windows + Bitdefender + shell sit at \~8 GB and you should not
   disable AV/shell to chase a number. → BlarAI: budget RAM realistically; don't fight
   the OS/AV baseline.
-- ✅ **Speed:** decode started at ~3.5 t/s (10× too slow → 15-min builds); the fix
+- ✅ **Speed:** decode started at \~3.5 t/s (10× too slow → 15-min builds); the fix
   was Intel **"Shared GPU Memory Override"** (a memory-window bottleneck, not the
-  hardware) → ~40 t/s. → BlarAI: if a local model is mysteriously slow, check the
+  hardware) → \~40 t/s. → BlarAI: if a local model is mysteriously slow, check the
   GPU memory window before blaming the model.
 - ✅ Circuit breaker: hard wall-clock timeout that **kills the whole process tree**
   on a stuck run or doom-loop; resumable journaled task queue. → BlarAI: bound every
@@ -260,7 +260,7 @@ the model.**
 | E4 | OVMS-direct probes prove serving is sound (issue is harness layer); benchmark (3.5 t/s); GPU memory override path | 🔬 |
 | E5 | **Headless stdin-EOF stall fixed** (empty stdin + redirect); eval suite finally runs; found the model is **prompt-injectable** | ❌→✅ |
 | E6 | **Defense-in-depth injection hardening**; `ask` proven fail-closed headless; injection evals 3/3 SECURE | ✅ |
-| E7 | Threat tests T1–T8 closed; tool-call reliability characterized (~20–25% single-shot) as a serving/harness residual | 🔬 |
+| E7 | Threat tests T1–T8 closed; tool-call reliability characterized (\~20–25% single-shot) as a serving/harness residual | 🔬 |
 | E8 | **Removed system-wide LOLBin firewall** (broke user's curl); locked "scope controls to the agent" | ❌→✅ |
 | E9 | On-wire proxy capture: dominant failure was **write-path truncation**, not format; temp/guided-gen are null levers | 🔬 |
 | E10 | OpenCode 1.17.3→**1.17.8**; extracted `Invoke-BuildWithRetry`; `verify-retry.ps1` suite; mutation-tested (6/6 mutants killed) | ✅ |
@@ -316,7 +316,7 @@ the model.**
 - **Exp 1 result — the self-contained prompt BEAT the no-op tax** ✅. The 30B wrote a
   real, structured implementation, ran pytest itself, and iterated — no SPEC read, no
   JSON-as-text derail. The lever works.
-- But it ended at ~1/27 because it **regressed**: mid-run it was at ~17/26, then a
+- But it ended at \~1/27 because it **regressed**: mid-run it was at \~17/26, then a
   rewrite introduced a `\\b` backslash-corruption bug (matches nothing) and it
   **stopped** without reverting; it had also **forgotten `english`**. (See the two new
   Part A bullets: backslash corruption + regression-then-quit.)
@@ -328,13 +328,13 @@ the model.**
   writing; Exp 2 explored first and tripped. The no-op tax is driven by **exploratory
   reads** — each read is a derail die-roll. → BlarAI: push the model to ACT-FIRST (write
   before reading) and use retries to resample past an unlucky explore-and-derail. Note:
-  3 no-ops in a row also means per-attempt success is well under ~60% — raise the retry
+  3 no-ops in a row also means per-attempt success is well under \~60% — raise the retry
   cap for complex tasks.
 - **Exp 3 (running):** "your FIRST tool call MUST be WRITE; do not read/glob", plus 8
   retries to reliably land a write-first run.
 - **Exp 3 result — write-first + 8 retries CLEARED the no-op wall** ✅, and the
   no-backslash + EN/DE/FR + anti-regression steering yielded a mostly-correct
-  implementation: **21/27 passing** (up from ~1). It wrote on attempt 1, no derail.
+  implementation: **21/27 passing** (up from \~1). It wrote on attempt 1, no derail.
   → BlarAI: "act-first + more retries + steer off known bug classes" is the combo that
   gets a small model to a real first draft.
 - The 6 remaining fails were enumerable: (a) it DROPPED the compound REQUIRED cues
@@ -347,7 +347,7 @@ the model.**
   part.* 
 - **Exp 4 result — REGRESSED + doom-loop (overload).** Dumping the 14 examples +
   scoping heuristic OVERWHELMED the model: it looped on the test-like example lines
-  (repeated 21x) and produced broken code (~0/27). The CIRCUIT BREAKER caught it and
+  (repeated 21x) and produced broken code (\~0/27). The CIRCUIT BREAKER caught it and
   parked safely ✅. Lessons: for a small model MORE prompt detail can BACKFIRE — the
   lean Exp-3 prompt (21/27) beat the heavy Exp-4 one; and the failing cases need
   CONFLICTING parse heuristics (splitting on "and" fixes some cases but breaks others),
@@ -369,7 +369,7 @@ the model.**
 - **Exp 6 result — 26/27 again, a DIFFERENT case.** Positional binding FIXED
   proficiency_both, but this rewrite used the alias 'deutschkenntnisse' as the language
   value instead of canonical 'german' (german_von_vorteil failed). KEY LESSON: a small
-  model at its frontier yields ~26/27 with a VARYING single bug per rewrite (Exp 5 missed
+  model at its frontier yields \~26/27 with a VARYING single bug per rewrite (Exp 5 missed
   proficiency; Exp 6 missed the alias). You can't out-retry it (retries catch only
   no-ops, not a 26/27). Converge by PINNING each observed gotcha in the prompt until one
   clean run clears them all. → BlarAI: expect per-rewrite variance from a local model;
@@ -379,7 +379,7 @@ the model.**
 - **Exp 7 result — 26/27, a THIRD distinct slip** (empty evidence for german in the
   ';'-split case). Pinning the first two gotchas worked; a new one appeared. The model
   reliably lands 26/27 but the single failing spot MOVES each rewrite.
-- **Insight / candidate fleet upgrade:** because each independent run is ~26/27 with a
+- **Insight / candidate fleet upgrade:** because each independent run is \~26/27 with a
   RANDOM slip, the fleet could RETRY-ON-TEST-FAILURE (resample a fresh implementation
   until the gate is green), not only retry-on-no-op — that would auto-converge a
   high-variance small model. (Noted for the fleet; for now converging by pinning +
@@ -389,7 +389,7 @@ the model.**
   fixes).
 - **Exp 8 result — 25/27 (REGRESSED).** Pinning evidence fixed it, but the fresh rewrite
   broke dedup_strongest AND the english/german clause. CONCLUSION: pinning does NOT
-  monotonically converge — the model has a roughly fixed error budget (~1 slip) per
+  monotonically converge — the model has a roughly fixed error budget (\~1 slip) per
   implementation of this 27-case task, and over-long prompts make it WORSE. Whack-a-mole
   fails. → BlarAI: a small model has a per-implementation error FLOOR on a complex task;
   don't try to prompt it to zero — RESAMPLE or DECOMPOSE.
@@ -399,8 +399,8 @@ the model.**
 - **Resample result — NO GREEN in 5 (CEILING CONFIRMED).** All 5 fresh runs (plus the 8
   earlier experiments = 13 total) landed 25-26/27, each failing a DIFFERENT case (dedup,
   scoping, positional level, and one literal "\n"-in-source NameError = newline
-  write-corruption). Never 27/27. CONCLUSION: the 30B has a hard ~26/27 autonomous ceiling
-  on this one 27-case nuanced task — ~1 random slip per implementation, not promptable or
+  write-corruption). Never 27/27. CONCLUSION: the 30B has a hard \~26/27 autonomous ceiling
+  on this one 27-case nuanced task — \~1 random slip per implementation, not promptable or
   resamplable (at this rate) to zero. → BlarAI: a complex spec has a real one-shot ceiling
   for a small model; the answer is DECOMPOSITION (sub-tasks sized so each is slip-free),
   not more prompting or resampling.
@@ -421,7 +421,7 @@ the model.**
   helpers.py + language.py; the Guide supplied the spec, the tests, and the verified algorithm.
 
 ### Round-1 conclusion — how a small model reached 100% on a hard task
-The monolith hit a hard ~26/27 one-shot ceiling (13 attempts, ~1 random slip each; not
+The monolith hit a hard \~26/27 one-shot ceiling (13 attempts, \~1 random slip each; not
 promptable or resamplable to zero; over-long prompts regress it). **DECOMPOSITION broke
 through**: 4 small, separately-tested helpers (each landed slip-free first try) + a thin
 orchestrator. → BlarAI MASTER LESSON: **size each unit to the small model's reliable
@@ -587,7 +587,7 @@ The headless-coding **dispatch** loop (BlarAI #670) reached **end-to-end on-hard
 -> the embedded 14B decomposes it -> the box steps the 14B aside and loads the 30B coder (OVMS) -> the fleet
 builds in an isolated worktree, verify-gates, **auto-merges to the target's `main`** -> swaps the 14B back.
 Proven by `/dispatch palindrome-demo | write an is_palindrome function` merging correct, tested Python to
-`main` **unattended in ~6 min, zero resamples** (then re-proven on the clean `rocket-calc`-style path). Five
+`main` **unattended in \~6 min, zero resamples** (then re-proven on the clean `rocket-calc`-style path). Five
 fixes got it there, each scoped as a builder brief, built by a separate builder session, **independently
 gated, merged dormant**: P1 over-decomposition right-sizing, P2 swap-back never-zero teardown, P3
 single-feature fold + OVMS-stop poll, fleet A1 language-pin + A2 wrong-language hard-fail gate, and the
@@ -658,7 +658,7 @@ reusable build *infrastructure* (as opposed to a per-task fix).
   (and mis-guess) it at runtime.
 - ✅🔬 **Proved the shared facts with a real cache-only build before trusting them.** Hand-authored a minimal
   WinUI app and ran `dotnet restore` with online sources *cleared* (a genuine offline test) → resolved from
-  cache in 234 ms; `dotnet build` 0 warn / 0 err in ~11 s on dotnet 8.0.422. A wrong version baked into
+  cache in 234 ms; `dotnet build` 0 warn / 0 err in \~11 s on dotnet 8.0.422. A wrong version baked into
   all-sessions config would silently break every future WinUI build, so the facts were verified, not asserted —
   and the validated skeleton becomes the seed for a reference-template library. → BlarAI: validate any fact you
   bake into shared infrastructure with an objective run first ([[demands-mutation-resistant-verification]]).
@@ -691,7 +691,7 @@ reusable build *infrastructure* (as opposed to a per-task fix).
 
 The minimal WinUI proof (`winui-smoke`, run `20260623-152205-bd`) confirmed the environment-competence layer
 works end-to-end — and in the same run exposed how badly over-decomposition + a flaky review step tax a GUI
-build. It had to be stopped manually (the operator caught the GPU still pegged ~40 min in).
+build. It had to be stopped manually (the operator caught the GPU still pegged \~40 min in).
 
 - ✅ **The env-competence layer is PROVEN through the full dispatch.** From a no-tech natural prompt ("a tiny
   app for Windows with one window that adds two numbers"), the 30B hand-authored a WinUI `.csproj` *verbatim*
@@ -706,7 +706,7 @@ build. It had to be stopped manually (the operator caught the GPU still pegged ~
   ruler must collapse UI+behavior into one task for a single small app (#7).
 - ❌ **The acceptance-tests task is doomed when the feature tasks park.** The features parked (nothing merged to
   `main`), so the `acceptance-tests` worktree — branched from `main` — had no app to test, and ground for many
-  minutes against absent code (the exact earlier-shakedown pattern). It pinned the 30B (~2,150 s CPU, box down to
+  minutes against absent code (the exact earlier-shakedown pattern). It pinned the 30B (\~2,150 s CPU, box down to
   3.84 GB free). → fleet: a test task must be gated on the presence of the feature code (or folded), never
   dispatched against an empty workspace.
 - ❌→note **A correct, building WinUI app PARKED because the REVIEW AGENT crashed.** `REVIEW VERDICT: UNCLEAR` —
@@ -734,7 +734,7 @@ build. It had to be stopped manually (the operator caught the GPU still pegged ~
 
 ## 2026-06-23 — The ultracode root-cause that overturned its own first-draft fixes
 
-A 7-agent root-cause (trace → adversarial-verify → synthesize, ~645K tokens) dissected the three winui-smoke
+A 7-agent root-cause (trace → adversarial-verify → synthesize, \~645K tokens) dissected the three winui-smoke
 failures across BlarAI + fleet and produced two verified builder briefs. The headline isn't the diagnoses (all
 confirmed by EXECUTING the actual code) — it's that the adversarial pass **knocked down two of the workflow's
 own first-draft fixes** before they could reach a builder.
@@ -747,17 +747,17 @@ own first-draft fixes** before they could reach a builder.
 - ❌→note **The review crash was TWO defects, and the earlier lessons-note framing was wrong.** Not "the reviewer
   couldn't produce a verdict" — it DID emit `VERDICT: FIX FIRST` (parsed fine at `new-agent-task.ps1:204-205`),
   and `:208` `if ($rv.TimedOut){ $verdict='UNCLEAR' }` **unconditionally clobbered it**; the timeout itself came
-  from the read-only reviewer churning post-verdict on a malformed `todowrite` + ~8 redundant `dotnet build`
+  from the read-only reviewer churning post-verdict on a malformed `todowrite` + \~8 redundant `dotnet build`
   re-runs (the review path passes no `-JsonStepCap`, so no turn-cap/spin-detector — only the wall clock). The
   merge gate (`:213`) then hinges entirely on `verdict=='MERGE'` with no build-only fallback. LA spot-confirmed
   both line-refs.
 - ❌ **A test task dispatched against an EMPTY workspace.** `swap_driver.py:523-530` runs every task with no
   merge-dependency gate; when the feature tasks PARK, the appended `acceptance-tests` task branches off
-  README-only `main` and grinds ~24 min against absent code. The fix (skip the acceptance task unless all
+  README-only `main` and grinds \~24 min against absent code. The fix (skip the acceptance task unless all
   preceding features MERGED) is the highest-priority containment — it makes a parked run cheap *regardless of
   why* it parked.
 - 🔬 **The adversarial pass also re-targeted and de-scoped fixes:** FIX A retargeted from write/edit (already
-  denied, ~no time) to `todowrite`+`bash` (the real time-sinks) and from the deprecated `tools:` map to a
+  denied, \~no time) to `todowrite`+`bash` (the real time-sinks) and from the deprecated `tools:` map to a
   per-agent `permission:` block; it dropped a redundant `criterion_status` edit (a skip already renders
   `UNVERIFIED`); and it caught that "honor FIX FIRST on timeout" and "FIX C fixes this run" **contradict** —
   resolved as force-`UNCLEAR`-on-timeout (low-trust verdict) then merge clean build-only on `UNCLEAR`.
@@ -811,18 +811,18 @@ you its plan first, and you can stop a bad run in seconds."
   acceptance criteria passed." Nothing built. The build-truth-only gate correctly PARKED it. → BlarAI: (1) the coder
   needs a single-project SCAFFOLD, not just correct settings; (2) a bare `dotnet build` needs ONE project (or a
   `.sln`); (3) the gate never trusting the coder's self-reported "done" is exactly why it exists.
-- ✅🔬 **MASTER velocity lesson — proved the cure in ~13 s, no dispatch.** Staged reusable WinUI build infra (an
+- ✅🔬 **MASTER velocity lesson — proved the cure in \~13 s, no dispatch.** Staged reusable WinUI build infra (an
   offline NuGet feed mirrored from the cache + a known-good minimal reference app) via an ultracode workflow that
   ADVERSARIALLY validated it (restore into an EMPTY cache from the feed only → real `App.exe`; pull one package →
   `NU1101`; restore → green). Then built a single-project rocket calculator on the template with the gate's exact
-  flagless `dotnet build` → 0/0 → `App.exe` in ~13 s; the operator launched it and confirmed the math + div-by-zero.
+  flagless `dotnet build` → 0/0 → `App.exe` in \~13 s; the operator launched it and confirmed the math + div-by-zero.
   → BlarAI: the 30-min swap+build dispatch is for the END-TO-END proof ONLY. Verify build fixes with the gate's own
   `dotnet build` on a scaffold (seconds), decompose fixes with a live decompose, fleet logic with the unit gate.
   Reserve the slow dispatch for ONE consolidated checkpoint after a BATCH — never pay 30 min per change.
 - 🔬 **Two load-bearing WinUI build traps, both on-hardware.** (1) The gate runs a FLAGLESS `dotnet build`; PLURAL
   `Platforms`/`RuntimeIdentifiers` default to AnyCPU → "WindowsAppSDKSelfContained requires a supported Windows
   architecture" → park. Bake SINGULAR `RuntimeIdentifier=win-x64` + `Platform=x64`. (2) `XamlCompiler.exe` is
-  net472 and hits MAX_PATH (~260) → a deep worktree false-fails `WMC1006` on DLLs that ARE present, which the gate
+  net472 and hits MAX_PATH (\~260) → a deep worktree false-fails `WMC1006` on DLLs that ARE present, which the gate
   mis-reads as a real fail. Build from a short path. → both baked into the staged template + the AGENTS.md rule.
 - ✅ **Four maturing fixes BATCHED, each builder-built + LA-gated + merged; full standing gate 4247/0.** #5 build
   infra + a single-project `AGENTS.md` discipline; #6 Part 1 surface the task decomposition in the PLAN preview
@@ -856,9 +856,9 @@ you its plan first, and you can stop a bad run in seconds."
   the gate with the SAME compiler error eight times (`error CS0246: 'RoutedEventArgs' could not be found`): the 30B
   writes WinUI event handlers `Button_Click(object sender, RoutedEventArgs e)` but omits `using Microsoft.UI.Xaml;`.
   The blind resample (fresh worktree, same prompt) just rewrites and re-omits it — so run `20260623-222846-bd`
-  burned two resamples + a 30-min circuit-breaker (~63 min) and STILL parked. Blind resampling converges a RANDOM
+  burned two resamples + a 30-min circuit-breaker (\~63 min) and STILL parked. Blind resampling converges a RANDOM
   slip; it CANNOT fix a SYSTEMATIC bug.
-- A: **Verify output surfaced to the run log (53cdef3).** `verify-project.ps1` already kept the last ~25 build lines
+- A: **Verify output surfaced to the run log (53cdef3).** `verify-project.ps1` already kept the last \~25 build lines
   in each check `.detail`; the caller logged only `verify: fail` and dropped it. Now a verify-fail writes the
   failing checks captured output to the run log — diagnosable post-run, and the raw material for feedback.
 - B: **Error-feedback landed (734c514), mutation-resistant.** On a verify FAIL the runner KEEPS the failing code and
@@ -1044,7 +1044,7 @@ runs (I sequenced the work to avoid the 30B's load window — RAM stayed clear t
 ## 2026-06-24 — The scaffold library didn't fire for how the operator actually speaks; the fix was to stop discarding the 14B's platform read
 
 The matured-pipeline proof — a real `/dispatch rocket-calc` of a pure-product WinUI goal —
-**parked** again (~30 min, run `20260624-084153-bd`), and the trace overturned the assumption
+**parked** again (\~30 min, run `20260624-084153-bd`), and the trace overturned the assumption
 baked into the handoff. The seeded scaffold was supposed to prevent the proliferation; the
 coder transcript showed the scaffold **never seeded at all** (its first `glob **` saw only the
 empty repo; it authored from scratch).
@@ -1055,7 +1055,7 @@ empty repo; it authored from scratch).
   prompt is *pure product intent* ("a calculator that looks like a rocket") with zero tech
   signal — by his own mandate. So the resolver no-op'd, nothing seeded, the 30B authored from
   scratch and proliferated: the real app PLUS a Console `Program.cs` with its own `Main()`, a
-  2nd test project, and ~7 loose top-level-statement `.cs` runner files → CS8803 + a XAML
+  2nd test project, and \~7 loose top-level-statement `.cs` runner files → CS8803 + a XAML
   internal error → the 30-min circuit-breaker → park. The CS0246 `using` ceiling was *gone*
   (the coder wrote the usings itself) — but the scaffold, last session's headline deliverable,
   was never the reason and never fired. → A capability proven only by a unit gate
@@ -1140,15 +1140,15 @@ The build-signal entry above ended on "Next: the operator's Increment-2 test dis
   dependency-free test harness that already builds offline, so the coder EXTENDS working tests
   instead of inventing a framework). → BlarAI: an offline box changes what "write tests" means —
   seed the working test setup; do not trust the model to assemble one from an empty feed.
-- 🔬 **The headline measurement: a ~29 GB load survived a 31 GB box without OOM — and it is not
+- 🔬 **The headline measurement: a \~29 GB load survived a 31 GB box without OOM — and it is not
   magic.** OOM fires on **commit charge > commit LIMIT**, not on working-set > physical RAM, and
-  those differ here: commit limit = physical RAM + pagefile = **31.32 + ~11 = 42.32 GB**. The 30B
-  load is a ~29 GB committed transient — under the limit, so no OOM; what it does is exhaust
-  *physical* headroom (Available → ~67 MB, Committed peak ~29.1 GB — milestone-1's measured
-  trough) and spill ~3.3 GB of modified pages to the pagefile (a brief ~200k-pages/s storm; the
+  those differ here: commit limit = physical RAM + pagefile = **31.32 + \~11 = 42.32 GB**. The 30B
+  load is a \~29 GB committed transient — under the limit, so no OOM; what it does is exhaust
+  *physical* headroom (Available → \~67 MB, Committed peak \~29.1 GB — milestone-1's measured
+  trough) and spill \~3.3 GB of modified pages to the pagefile (a brief \~200k-pages/s storm; the
   pagefile's 3.36 GB peak-ever is that spill). Three levers make it survive: **swap-first**
   (release the 14B, −11 GB baseline) + the **pagefile lifting the commit ceiling 31→42 GB** + the
-  **87% Shared-GPU override** (a ~27 GB iGPU window into the unified pool). Recorded
+  **87% Shared-GPU override** (a \~27 GB iGPU window into the unified pool). Recorded
   community-grade in BlarAI's `PERFORMANCE_LOG.md` +
   `docs/performance/dispatch_swap_telemetry_2026-06-24.json`. → BlarAI: the swap is gated on a
   *headroom* check, not an OOM catch — the box will not OOM, it will page-storm, so the gate must
@@ -1245,7 +1245,7 @@ targeted and surfaced the next one. Four things to keep.
   say explicitly -- do NOT run/execute the tests, no console runner, no `dotnet run`/`dotnet test`;
   the gate is build-only, the tests only need to COMPILE. Kill-test SH7b locks it.
 - 🔬 **Stop a DETERMINED run fast -- don't watch it bleed to the breaker.** I monitored the hung
-  run ~15 min before stopping. Once a run is determined (hung, 0 CPU, no error-feedback path), stop
+  run \~15 min before stopping. Once a run is determined (hung, 0 CPU, no error-feedback path), stop
   it immediately; the only thing left to extract is forensics, and a frozen run gives you those at
   leisure. Dev-cycle speed is the binding constraint. → operator-validated, emphatically: the slow
   dev loop is THE bottleneck; a fast finish (or a fast stop) beats a thorough watch.
@@ -1268,7 +1268,7 @@ fast, not at the 30-min breaker. Operator-requested, emphatically.
 
 - 🔬 **Root cause, precisely.** opencode's bash tool takes a `timeout` (ms) arg, and its description
   tells the model to "retry with a larger timeout if the command is expected to take longer." So the
-  coder gave its `dotnet run` a large timeout; when the console runner hung (0 CPU) it sat ~15 min
+  coder gave its `dotnet run` a large timeout; when the console runner hung (0 CPU) it sat \~15 min
   before the breaker fired — eating the budget with no error-feedback recovery (a timeout is never
   resampled).
 - ✅ **Fix: an opencode PLUGIN that caps the bash timeout.** opencode auto-discovers
@@ -1327,7 +1327,7 @@ caller's scope*, clobbering `$Goal`/`$VisualCriteriaJson`; fixed by capturing th
 lesson again: exercise the real compile/exec path at least once.
 
 **Next:** the operator's on-hardware go-live — a real dispatch with `-EnableVisualCritique` on a visual
-task (30B resident, VLM co-resident ~23 GB, real screenshot + critique), then the auto-rebuild
+task (30B resident, VLM co-resident \~23 GB, real screenshot + critique), then the auto-rebuild
 FIX-iteration, then the OVMS-gated asset-generation ASSETS phase (Playground up front, swap the 30B out —
 the measured 32.5 GB breach — generate, swap back).
 
@@ -1349,7 +1349,7 @@ the intended "signal, not judge" posture.
 
 Two seam bugs surfaced live, both the same shape as the two in the prior entry — *the test passes because
 it doesn't cross the boundary production crosses.* (1) The capture's render timeout (30s, fine on an idle
-box) stalled when the app launched cold under the resident 30B; the warm render is ~1s, so a 90s budget +
+box) stalled when the app launched cold under the resident 30B; the warm render is \~1s, so a 90s budget +
 a warm-up retry fixes it. (2) The auto-FIX callback used `.GetNewClosure()` to freeze its captured vars —
 but GetNewClosure rebinds *function* lookup to global, so two levels deep (`run-fleet` ->
 `& new-agent-task.ps1`) the dot-sourced fleet-lib functions vanished ("Add-VisualFeedback is not
@@ -1393,7 +1393,7 @@ artifact with an objective tool — applies to the CRITIC, not just the coder.**
   sterner prompt / use a bigger VLM" — fails on its face: you don't out-prompt a self-report.
 - ✅ **Progress-aware timeout: a single absolute wall-clock is wrong in both directions.** The per-coder-run
   breaker killed a productive-but-slow coder at the deadline AND let a hung run bleed the whole budget. The
-  pure `Resolve-RunStopDecision` splits it: IDLE (no new step_finish AND no new edit for ~240s = genuinely
+  pure `Resolve-RunStopDecision` splits it: IDLE (no new step_finish AND no new edit for \~240s = genuinely
   stuck → killed fast) vs CEILING (a generous absolute backstop, 30→60 min). Every edit resets the idle
   clock, so a working coder is never idle-killed, and a doomed run dies in minutes instead of an hour.
   verify-runtimeout 29/29 under PS 5.1 AND 7. → BlarAI: an idle/no-progress timeout is almost always the
@@ -1427,7 +1427,7 @@ verify-runtimeout 29/29, verify-critique-loop 143→170, dispatch-harness mTLS 5
 Best-of-N (#689) gives the weak local coder several independent shots at a task and lets the deterministic
 gate pick the winner; #695 makes those shots run AT THE SAME TIME. The measurement (blarai `09dfc41`) had
 already answered the only research question — is the integrated Arc 140V's continuous batching real? — yes:
-~1.9-2.4x aggregate, compute-bound, KV-cache-cheap. So this was an engineering job: wire C concurrent
+\~1.9-2.4x aggregate, compute-bound, KV-cache-cheap. So this was an engineering job: wire C concurrent
 candidates without a scratch on the proven serial path. It went green-on-units immediately and still failed
 its first two live dispatches, which is the whole lesson.
 
@@ -1480,7 +1480,7 @@ its first two live dispatches, which is the whole lesson.
   and coverage is the weak-model bottleneck). At C=3 a complex task's 8 candidates run in three waves of
   3,3,2. Both values are mutation-locked (exact + "concurrent-not-sequential" + "within sweet spot" kills,
   and the complex>moderate ordering the old complex>simple test missed). The honest measurement that came
-  out of watching the live run: **GPU was ~63% active / 37% idle** across the dispatch — the idle is
+  out of watching the live run: **GPU was \~63% active / 37% idle** across the dispatch — the idle is
   structural (an agentic coder only drives the GPU while generating tokens; planning, file edits, git, and
   the trailing CPU test/mutation gate are all GPU-dark). Concurrency is the lever that FILLS that idle (C=1
   would idle through every candidate's tool-work), and the remaining 37% is spare capacity — which is exactly
@@ -1555,7 +1555,7 @@ the **coder** was the wall. Three linked faults, each fixed on a branch and **li
   re-measured live, six runs across throwaway targets. The honest picture: when the coder gets time, it
   does the RIGHT thing — one run wrote a complete, correct offline page (inline-SVG elephant, no external
   URL, `server.listen(0)` tests) and even added its own "no external sources" assertions. But under
-  **concurrent best-of-N on a memory-tight box (~5 GB free with the 30B resident)**, both candidates went
+  **concurrent best-of-N on a memory-tight box (\~5 GB free with the 30B resident)**, both candidates went
   idle and the 240 s breaker killed them before they produced (once after exploratory reads, once with no
   output at all — OVMS and the `:8099` proxy both probed healthy, so it was coder-side startup/generation
   starvation, not the model server). I did NOT loosen the breaker (the brief's hard line). Two responses:

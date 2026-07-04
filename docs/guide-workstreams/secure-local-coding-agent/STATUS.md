@@ -43,7 +43,7 @@ workstream + eval files are not yet committed (awaiting LA go).
 - Mostly correct: both variants, 12 hexes exact, fonts right, card content exact, footer, **ZERO external requests** (grep-confirmed).
 - **Two WCAG-AA contrast failures found by the new objective tool, not by eye:**
   - `.tag` white-on-#A47864 (Mocha) = **3.85:1** — the predicted ADJ-1 violation; persisted despite the build prompt explicitly forbidding text on Mocha.
-  - light-variant `.read-more-link` #9C5B3B on card #EADFCF = **4.02:1** — a PALETTE-level gap (the spec's clay accent fails as link text); my hand-estimate (~4.76) was wrong, the tool was right.
+  - light-variant `.read-more-link` #9C5B3B on card #EADFCF = **4.02:1** — a PALETTE-level gap (the spec's clay accent fails as link text); my hand-estimate (\~4.76) was wrong, the tool was right.
 - Process findings: emitted a **malformed tool call** (raw JSON/XML as text — "prints instead of acts", with guided-gen ON) so its self-grep never ran and **it never committed**; used Unix `find -exec grep` on Windows; took **15m 9s**.
 
 **Added:**
@@ -84,13 +84,13 @@ locked (one action per prompt + /new). Deeper root-cause (capture OpenCode's on-
 during a live failure) deferred to Phase 2.
 
 **Thread 2 (benchmark):** Built bench/bench.py (stdlib) + bench/README.md — first measured
-numbers for Qwen3-Coder-30B on this 258V/Arc 140V. DECODE ~3.5 t/s, ~10x below expected
-(explains the 15-min builds); prefill healthy (~370-520 t/s cold); prefix cache ~7x TTFT cut.
+numbers for Qwen3-Coder-30B on this 258V/Arc 140V. DECODE \~3.5 t/s, \~10x below expected
+(explains the 15-min builds); prefill healthy (\~370-520 t/s cold); prefix cache \~7x TTFT cut.
 Shared GPU memory observed MAXED (17.9/17.9 GB) -> likely a memory-window bottleneck, not
 hardware. TOP NEXT ACTION: enable Intel "Shared GPU Memory Override" + re-benchmark (could
 5-10x decode).
 
-**Thread 3 (real site):** Given 3.5 t/s decode (a full 30B site build ~= 35 min + the
+**Thread 3 (real site):** Given 3.5 t/s decode (a full 30B site build \~= 35 min + the
 unreliable fix-edits), the Guide built index.html directly from design/site-spec.md.
 Verified: 0 WCAG-AA failures (7 pairs), zero external requests, renders clean; draft copy +
 placeholders for name/email/links. The "built by a local 30B" footer flex was omitted (would
@@ -103,7 +103,7 @@ inherited non-TTY, never-EOF stdin. `fleet-lib.ps1 Invoke-AgentRun` used `Start-
 -NoNewWindow` with NO `-RedirectStandardInput`, so opencode waited forever for stdin EOF. A
 parallel investigation workflow ranked package-install/catalog/permission higher, but a
 controlled A/B overturned it: a faithful Start-Process invocation STALLED >60s with no stdin
-redirect, and COMPLETED in ~20s with stdin from an empty file. (models.dev was reachable/fast,
+redirect, and COMPLETED in \~20s with stdin from an empty file. (models.dev was reachable/fast,
 and a direct-shell `opencode run` completed with @ai-sdk/openai-compatible still absent — both
 refuting the package/catalog theories.) This is why the fleet/eval path NEVER produced output
 (the June-14 "passes" were Mock runs).
@@ -132,7 +132,7 @@ gate (blocks a leaked secret entering a commit). The injection-refusal eval is t
 regression for any injection hardening. Threat T1 is now EMPIRICALLY OPEN, not theoretical.
 
 **Open/next:** Phase-3 injection hardening (T1, top priority); investigate the fix-bug miss + the
-hello-function 0.1s anomaly. Model/serving + autonomous-path reliability are now SOUND (30B ~40
+hello-function 0.1s anomaly. Model/serving + autonomous-path reliability are now SOUND (30B \~40
 t/s after the override; init-stall fixed; tool-calls reliable in fresh runs).
 
 ## E6 — 2026-06-18 — Phase-3 DONE: defense-in-depth injection hardening; T1 CLOSED live (Guide: Claude/Opus, ultracode workflow + live probe)
@@ -235,7 +235,7 @@ mitigation tested, documented as a serving-layer RESIDUAL (not security):**
 - Failure mode confirmed on disk: the 30B counts/acts correctly via bash, then emits the `write` tool
   call as an OpenAI-JSON `{"tool_calls":…}` block IN ITS TEXT (the OVMS `qwen3coder` parser expects the
   Qwen format, so it is not executed) and sometimes targets an out-of-project path (`C:\Users\mrbla\
-  count.txt`). Headless single-shot success measured ~20–25% (1/4 at temp 0.7).
+  count.txt`). Headless single-shot success measured \~20–25% (1/4 at temp 0.7).
 - Mitigations tested: temperature 0.7->0.2 did NOT help (still 1/5) and ran 2–3x slower -> REVERTED to
   0.7. An AGENTS.md rule ("act only through real tool calls; never print a tool call as text; write
   in-project relative paths") did not measurably move the rate -> KEPT anyway (correct doctrine; the
@@ -386,7 +386,7 @@ pass, a failing test -> fail. This is what lets auto-merge gate on real BEHAVIOR
 **THREE launch-layer bugs, each masking the next, all surfaced by the dynamometer on task #1 and fixed
 (diagnosed with evidence, not guesses):**
 1. **`Start-Process -ArgumentList` with an ARRAY does not quote - it space-joins.** The 477-char prompt
-   reached opencode as ~70 tokens; tokens that look like flags (`-m`, `-q`, a bare `-` from "python -m
+   reached opencode as \~70 tokens; tokens that look like flags (`-m`, `-q`, a bare `-` from "python -m
    pytest -q" / "contract - do NOT") were parsed as OPTIONS -> opencode printed its HELP and exited ->
    100% no-op, 3/3 attempts. Hidden until now because short, quote/flag-free prompts re-joined fine via
    opencode's variadic positional. FIX: new `ConvertTo-Win32Arg` builds a properly Win32-quoted single
@@ -409,13 +409,13 @@ derailed -> wrote nothing, 3/3 no-op. This is exactly the E2/E3/E9 "prints inste
 multi-read task gives it more chances to trip. Confirms the documented residual is the current ceiling on
 autonomous success for complex multi-step tasks.
 
-**Also this session:** freed RAM for the 30B lean profile (~8.8 GB used / 22.5 GB free; a 7-GB-used
+**Also this session:** freed RAM for the 30B lean profile (\~8.8 GB used / 22.5 GB free; a 7-GB-used
 target is NOT safely reachable without disabling AV/shell - don't chase it). Wrote
 `docs/LESSONS-LEARNED.md` - a portable change-log + lessons distillation for transfer to BlarAI (same
 local-quantized-model / Windows / security-first shape).
 
 **Next:** raise autonomous success on complex tasks by CUTTING required tool calls (self-contained prompt
-- inline the contract so the model needs ~0 reads) + more retries; re-measure the language-classifier
+- inline the contract so the model needs \~0 reads) + more retries; re-measure the language-classifier
 baseline; then ramp to the visa / relocation / education / cert classifiers and integrate into jobhunt.
 Open residual unchanged: the tool-call JSON-as-text drift is a model / OpenCode-negotiation limit,
 compensated by retry + verify-on-disk + the human merge gate.
@@ -426,7 +426,7 @@ compensated by retry + verify-on-disk + the human merge gate.
 project with ALL tests green. ACHIEVED.**
 
 **The wall — a one-shot capability ceiling.** 13 attempts at the MONOLITH (the 27-case
-language classifier) all landed 25-26/27. The 30B makes ~1 RANDOM slip per full
+language classifier) all landed 25-26/27. The 30B makes \~1 RANDOM slip per full
 implementation (different case each time: positional CEFR binding, alias->canonical,
 evidence, dedup, clause-scoping, even a literal "\n"-in-source NameError). It is NOT
 promptable to zero (pinning each gotcha just moves the error; over-long prompts REGRESS it

@@ -40,7 +40,7 @@ Your DEFAULT operating mode is the **guide model**: write **builder briefs** -> 
 
 ## 3. Current state — DONE + VERIFIED (do NOT rebuild)
 
-The #670 pipeline is **complete and proven end-to-end on-hardware** (palindrome-demo merged unattended, ~6 min). On top of that, the full **scaffold library + multi-pass maturation** all landed this session, **dormant**, on `agentic-setup` main:
+The #670 pipeline is **complete and proven end-to-end on-hardware** (palindrome-demo merged unattended, \~6 min). On top of that, the full **scaffold library + multi-pass maturation** all landed this session, **dormant**, on `agentic-setup` main:
 
 - **7 gate-proven scaffolds** in `C:\Users\mrbla\agentic-setup\build-infra\<name>\reference\`: `winui`, `dotnet-console`, `python`, `web`, `powershell`, `cpp`, `android`.
 - **7-domain knowledge packs** + an on-demand reference index (`build-infra\knowledge\`).
@@ -49,7 +49,7 @@ The #670 pipeline is **complete and proven end-to-end on-hardware** (palindrome-
 - **Complexity signal** (`380e1b2`): the 14B sends `simple|moderate|complex`; the system scales the build + review pass budgets and hints the coder.
 - **Dual-mode seeding** (`d1efe57`): seed up front, OR the coder pulls a scaffold mid-task.
 - **Toolchains installed**: .NET MAUI workload + Microsoft OpenJDK 17 + Android SDK (Android builds offline); prerelease VS BuildTools/MSVC for C++.
-- **Standing unit gate ~282/0** across `verify-{scaffold,errorfeedback,retry,reviewfeedback,complexity,merge-decision,ecosystem}.ps1`. Re-verified green this session (6/6 suites exit 0). **Working tree clean.**
+- **Standing unit gate \~282/0** across `verify-{scaffold,errorfeedback,retry,reviewfeedback,complexity,merge-decision,ecosystem}.ps1`. Re-verified green this session (6/6 suites exit 0). **Working tree clean.**
 
 ---
 

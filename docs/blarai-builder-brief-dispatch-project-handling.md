@@ -87,7 +87,7 @@ This brief matures all four into a **select-or-create + confirm + honest-report*
 
 - `list_projects(projects_dir) -> list[str]` — names of direct children that have a `.git` dir **and** pass
   the same fence/containment predicate `validate_repo` uses; name-sorted; best-effort (`os.scandir`, OSError →
-  `[]`). The caller caps the rendered count (~12, then `(+N more)`).
+  `[]`). The caller caps the rendered count (\~12, then `(+N more)`).
 - `create_git_repo(name, projects_dir) -> DispatchResult` — create `projects_dir/<name>` as a fresh git repo
   with **one** initial commit so `validate_repo`'s `.git` check passes. Safety, reusing `validate_repo`'s frame:
   1. **Sanitize by REJECT, never mangle.** Refuse if the name contains a path separator, `..`, a drive letter,
@@ -228,7 +228,7 @@ Dev env: `C:\Users\mrbla\BlarAI\.venv\Scripts\python.exe`, `PYTHONPATH=<worktree
   - `create_git_repo` refuses to clobber an existing dir (incl. the case-insensitive `Calc`/`calc` case).
   - `describe_repo_state`: a repo with commits + an `agent/x` branch reports both; an empty / `git`-less repo
     → `""`.
-- `tests/integration/test_acceptance.py` (rewrites the `detect_run_command` cases ~`:327`):
+- `tests/integration/test_acceptance.py` (rewrites the `detect_run_command` cases \~`:327`):
   - python no-entry, ONE loose `.py` → `python <file>.py`; MULTIPLE loose `.py` → `open the folder` (the case
     the old `python -m` got wrong).
   - dotnet with a built `bin/.../App.exe` → that exe path; dotnet class-lib only → not `dotnet run`.

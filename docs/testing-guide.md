@@ -1,6 +1,6 @@
 # Step-by-step testing guide (for a non-developer)
 
-Try every new capability, safest first. ~15 min.
+Try every new capability, safest first. \~15 min.
 
 > **IMPORTANT - how to paste:** copy and run **ONE line at a time**. Copy a single line,
 > click the PowerShell window, right-click to paste, press **Enter**. Do NOT paste several
@@ -24,7 +24,7 @@ Quick vocabulary:
 
 ---
 
-## TEST 1 - Secret scanner blocks a fake secret (no model needed, ~1 min)
+## TEST 1 - Secret scanner blocks a fake secret (no model needed, \~1 min)
 
 Run this single line:
 ```
@@ -35,7 +35,7 @@ and ends with **RESULT: PASS**. It cleans up after itself.
 
 ---
 
-## TEST 2 - Quality-check harness works (no model needed, ~1 min)
+## TEST 2 - Quality-check harness works (no model needed, \~1 min)
 
 ```
 & "$env:USERPROFILE\agentic-setup\scripts\run-evals.ps1" -Mock
@@ -51,7 +51,7 @@ Leave it open.
 
 ---
 
-## TEST 4 - A real unattended task through ALL the safety gates (~2-6 min)
+## TEST 4 - A real unattended task through ALL the safety gates (\~2-6 min)
 
 The AI builds something on its own; the gates decide if it's safe to keep. One line:
 ```
@@ -65,7 +65,7 @@ Both outcomes are safe. The demo is repeatable - run it again any time.
 
 ---
 
-## TEST 5 - See the activity report (~30 sec)
+## TEST 5 - See the activity report (\~30 sec)
 
 In the **AI Control Panel** press **F**. (Or run a single line:)
 ```
@@ -75,7 +75,7 @@ Shows how many tasks merged / parked / blocked and which guardrails fired.
 
 ---
 
-## TEST 6 - (Optional) Does the tool-call guard help? (~5 min, model loaded)
+## TEST 6 - (Optional) Does the tool-call guard help? (\~5 min, model loaded)
 
 Run, and note the score:
 ```

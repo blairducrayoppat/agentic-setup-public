@@ -27,33 +27,33 @@ You are building a fully-offline-capable agentic dev stack with **three layers**
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**The cardinal rule of this machine:** CPU, iGPU, OS, VMs, and build jobs all share ONE 31.3 GB pool. Every decision below follows from that. Your machine idles at **~15 GB in use** with the BlarAI VM running — leaner profiles must be deliberate, not assumed.
+**The cardinal rule of this machine:** CPU, iGPU, OS, VMs, and build jobs all share ONE 31.3 GB pool. Every decision below follows from that. Your machine idles at **\~15 GB in use** with the BlarAI VM running — leaner profiles must be deliberate, not assumed.
 
-**First hour:** run `scripts\01-install-opencode.ps1` (done for you), then `scripts\02-install-ovms-and-models.ps1` (downloads ~17 GB — needs internet + time), then `scripts\start-llm.ps1 -Model coder-30b`, then open a terminal in any repo and type `opencode`.
+**First hour:** run `scripts\01-install-opencode.ps1` (done for you), then `scripts\02-install-ovms-and-models.ps1` (downloads \~17 GB — needs internet + time), then `scripts\start-llm.ps1 -Model coder-30b`, then open a terminal in any repo and type `opencode`.
 
 ---
 
 ## 1. Memory tiers — what can run together
 
-Verified arithmetic (see `research/verification.md`). "Win+tools" = Windows ~6.5–7 GB lean + VS Code/terminals ~3 GB.
+Verified arithmetic (see `research/verification.md`). "Win+tools" = Windows \~6.5–7 GB lean + VS Code/terminals \~3 GB.
 
 | Tier | Resident model(s) | Also running | Total | Headroom | Verdict |
 |---|---|---|---|---|---|
-| **Everyday** | qwen3-14b (~10.5 GB) | Win+tools, BlarAI VM (2), browser (2) | ~24.5 | ~7 GB | ✅ comfortable default |
-| **Everyday+Vision** | qwen3-14b + qwen3-vl-8b (~6) | Win+tools | ~26.5 | ~5 GB | ✅ stop BlarAI VM or close browser |
-| **Power coding** | coder-30b (~18.8 GB) | Win+tools ONLY | ~28.8 | ~2.5 GB | ⚠️ LEAN PROFILE required (below) |
-| **Overnight fleet** | qwen3-14b | OpenClaw (capped), opencode serve, builds | ~24–26 | ~5–7 GB | ✅ 14B only — never fleet on 30B |
-| **Smart-home dev** | qwen3-14b | HAOS VM (3 GB static), Win+tools | ~26.5 | ~5 GB | ✅ BlarAI VM off |
-| ❌ coder-30b + vision resident | 18.8 + 6 | anything | ~35 | — | FAIL — swap models instead |
-| ❌ Qwen3.6-35B-A3B (best model of mid-2026) | ~21.5–22.5 | lean Win | ~31–32 | <0.5 GB | FAIL — rejected |
+| **Everyday** | qwen3-14b (\~10.5 GB) | Win+tools, BlarAI VM (2), browser (2) | \~24.5 | \~7 GB | ✅ comfortable default |
+| **Everyday+Vision** | qwen3-14b + qwen3-vl-8b (\~6) | Win+tools | \~26.5 | \~5 GB | ✅ stop BlarAI VM or close browser |
+| **Power coding** | coder-30b (\~18.8 GB) | Win+tools ONLY | \~28.8 | \~2.5 GB | ⚠️ LEAN PROFILE required (below) |
+| **Overnight fleet** | qwen3-14b | OpenClaw (capped), opencode serve, builds | \~24–26 | \~5–7 GB | ✅ 14B only — never fleet on 30B |
+| **Smart-home dev** | qwen3-14b | HAOS VM (3 GB static), Win+tools | \~26.5 | \~5 GB | ✅ BlarAI VM off |
+| ❌ coder-30b + vision resident | 18.8 + 6 | anything | \~35 | — | FAIL — swap models instead |
+| ❌ Qwen3.6-35B-A3B (best model of mid-2026) | \~21.5–22.5 | lean Win | \~31–32 | <0.5 GB | FAIL — rejected |
 
 **Lean profile is now AUTOMATED (2026-06-10):** `start-llm.ps1` is a guided memory assistant — it measures available RAM, and if there isn't enough it lists what's using memory (BlarAI VM, browser, heavy apps) with how much each would free, and offers to close them one at a time (graceful close, always asks, force-close only with a second explicit yes). It remembers when it stopped the BlarAI VM and offers to restart it when you switch back to the everyday model. **Double-click launchers** exist on the Desktop and in this folder: `Deep Coding (30B).cmd`, `Everyday AI (14B).cmd`, `Screenshot Vision (8B).cmd`, `Stop AI Models.cmd`. For reference, what "lean" means:
 1. BlarAI VM stopped (frees 2 GB).
 2. Browser closed (or ≤3 tabs), no Android Studio, no HAOS VM.
 3. **≥21 GB available** before loading the 30B (the script checks this for you).
-4. GPU note — **the Shared GPU Memory Override is REQUIRED for the 30B, not optional (measured 2026-06-17, see `bench/`):** the Arc 140V's default shared-GPU window is ~17.9–18.3 GB. The 30B's working set (~18 GB: INT4 weights + KV + runtime) *exceeds* it, so it spills onto the slow path and decode collapses to **~3.5 t/s** (GPU memory shows maxed at 17.9/17.9). Enabling Intel Graphics Software → System → **Shared GPU Memory Override → ~87%** and then **rebooting** raises the window to ~27 GB so the whole model fits → decode jumps to **~35–45 t/s (~10×)**, beating Intel's published 34 t/s on the larger 285H. Without it the 30B is effectively unusable for interactive coding. The override doesn't create RAM — it raises the GPU's max share of the same pool; cost is ~3 GB of baseline RAM (the GPU reserves more at idle) in exchange for the 10×.
+4. GPU note — **the Shared GPU Memory Override is REQUIRED for the 30B, not optional (measured 2026-06-17, see `bench/`):** the Arc 140V's default shared-GPU window is \~17.9–18.3 GB. The 30B's working set (\~18 GB: INT4 weights + KV + runtime) *exceeds* it, so it spills onto the slow path and decode collapses to **\~3.5 t/s** (GPU memory shows maxed at 17.9/17.9). Enabling Intel Graphics Software → System → **Shared GPU Memory Override → \~87%** and then **rebooting** raises the window to \~27 GB so the whole model fits → decode jumps to **\~35–45 t/s (\~10×)**, beating Intel's published 34 t/s on the larger 285H. Without it the 30B is effectively unusable for interactive coding. The override doesn't create RAM — it raises the GPU's max share of the same pool; cost is \~3 GB of baseline RAM (the GPU reserves more at idle) in exchange for the 10×.
 
-**Model swap latency is real:** stopping one model and loading another takes ~20–60 s. The `start-llm.ps1` / `stop-llm.ps1` scripts are the swap mechanism. Plan workflows around it (e.g., batch your screenshot-debugging, don't ping-pong).
+**Model swap latency is real:** stopping one model and loading another takes \~20–60 s. The `start-llm.ps1` / `stop-llm.ps1` scripts are the swap mechanism. Plan workflows around it (e.g., batch your screenshot-debugging, don't ping-pong).
 
 ---
 
@@ -61,15 +61,15 @@ Verified arithmetic (see `research/verification.md`). "Win+tools" = Windows ~6.5
 
 | Role | Model | Why | Footprint |
 |---|---|---|---|
-| **Deep agentic coding** | **Qwen3-Coder-30B-A3B-Instruct INT4** (`OpenVINO/Qwen3-Coder-30B-A3B-Instruct-int4-ov`) | The proven local OpenCode model of 2025–26; MoE with 3.3B active params → 20–30 t/s on this iGPU (dense 24B ≈ 5–7 t/s); purpose-built tool-call format served via OVMS's `qwen3coder` parser + the qwen-proxy repair (§3); 64k ctx (u8 KV cache, `opencode.json`) | ~16.3 GB weights, ~18 GB resident @32k |
-| **Everyday / fleet / orchestrator** | **Qwen3-14B INT4** (already on disk — BlarAI's `models/qwen3-14b`, or pull `OpenVINO/Qwen3-14B-int4-ov` for a decoupled copy) | Already validated on YOUR Arc 140V by BlarAI; leaves room for everything else; good (not great) tool calling | ~8.5 GB weights, ~10.5 GB resident |
-| **Vision (screenshots, UI debugging)** | **Qwen3-VL-8B-Instruct INT4** (already on disk in BlarAI models) | Still class-leading at 8B for UI work: ScreenSpot 94.4%, DocVQA 96.1%, OCRBench 89.6% | ~6 GB resident |
-| **Product-label OCR** | **RapidOCR + PP-OCRv5 (OpenVINO backend, NPU target)** | ~80 MB, sub-second/page, fully offline, runs on the NPU so it costs ZERO GPU/LLM memory; escalate hard labels (curved/stylized) to Qwen3-VL-8B | ~80 MB |
-| Tab autocomplete (optional) | qwen2.5-coder:1.5b (existing blob — it's a plain GGUF) via llama.cpp + Continue.dev | Free, you already have it | ~1 GB |
-| Embeddings (future RAG) | jina-code-embeddings-0.5b or Qwen3-Embedding-0.6B | Current 2026 leaders; your nomic-embed/bge-small are now mid-tier | ~0.6 GB |
+| **Deep agentic coding** | **Qwen3-Coder-30B-A3B-Instruct INT4** (`OpenVINO/Qwen3-Coder-30B-A3B-Instruct-int4-ov`) | The proven local OpenCode model of 2025–26; MoE with 3.3B active params → 20–30 t/s on this iGPU (dense 24B ≈ 5–7 t/s); purpose-built tool-call format served via OVMS's `qwen3coder` parser + the qwen-proxy repair (§3); 64k ctx (u8 KV cache, `opencode.json`) | \~16.3 GB weights, \~18 GB resident @32k |
+| **Everyday / fleet / orchestrator** | **Qwen3-14B INT4** (already on disk — BlarAI's `models/qwen3-14b`, or pull `OpenVINO/Qwen3-14B-int4-ov` for a decoupled copy) | Already validated on YOUR Arc 140V by BlarAI; leaves room for everything else; good (not great) tool calling | \~8.5 GB weights, \~10.5 GB resident |
+| **Vision (screenshots, UI debugging)** | **Qwen3-VL-8B-Instruct INT4** (already on disk in BlarAI models) | Still class-leading at 8B for UI work: ScreenSpot 94.4%, DocVQA 96.1%, OCRBench 89.6% | \~6 GB resident |
+| **Product-label OCR** | **RapidOCR + PP-OCRv5 (OpenVINO backend, NPU target)** | \~80 MB, sub-second/page, fully offline, runs on the NPU so it costs ZERO GPU/LLM memory; escalate hard labels (curved/stylized) to Qwen3-VL-8B | \~80 MB |
+| Tab autocomplete (optional) | qwen2.5-coder:1.5b (existing blob — it's a plain GGUF) via llama.cpp + Continue.dev | Free, you already have it | \~1 GB |
+| Embeddings (future RAG) | jina-code-embeddings-0.5b or Qwen3-Embedding-0.6B | Current 2026 leaders; your nomic-embed/bge-small are now mid-tier | \~0.6 GB |
 
 **Rejected (and why), so you don't relitigate later:**
-- **Qwen3.6-35B-A3B** — genuinely the best ≤32 GB-class agentic model (SWE-bench Verified 73.4%, natively multimodal), but IQ4_XS is 19.7 GB and total resident ~21.5–22.5 GB → <0.5 GB headroom on this machine. Also its "near-free KV cache" advantage currently does NOT hold on OpenVINO (open issue: prefix caching with Qwen3.5/3.6 linear-attention "consumes exceeding amount of memory"). Revisit only on future hardware.
+- **Qwen3.6-35B-A3B** — genuinely the best ≤32 GB-class agentic model (SWE-bench Verified 73.4%, natively multimodal), but IQ4_XS is 19.7 GB and total resident \~21.5–22.5 GB → <0.5 GB headroom on this machine. Also its "near-free KV cache" advantage currently does NOT hold on OpenVINO (open issue: prefix caching with Qwen3.5/3.6 linear-attention "consumes exceeding amount of memory"). Revisit only on future hardware.
 - **gpt-oss-20b** — works in OpenCode *only* when the serving layer translates its Harmony format (a 2026 arXiv eval measured ZERO successful scaffold tool calls without it). OVMS does have a `gptoss` parser, so it's a legitimate *alternate*, but Qwen3-Coder is the safer primary.
 - **Devstral Small 2 (24B dense)** — great model, wrong hardware: dense 24B ≈ 5–7 t/s on 136.5 GB/s LPDDR5X. MoE or bust on this machine.
 - **Qwen3-Coder-Next 80B-A3B, GLM-4.5-Air class** — don't fit 31.3 GB at any usable quant.
@@ -85,7 +85,7 @@ Verified arithmetic (see `research/verification.md`). "Win+tools" = Windows ~6.5
 - You're an OpenVINO upstream contributor; OpenVINO GenAI already runs Qwen3-14B on this exact GPU (BlarAI). Zero new runtime surface.
 - OVMS 2026.2 has a **dedicated `qwen3coder` tool parser** + XGrammar tool-guided generation — exactly the plumbing agentic tool-calling needs. Ollama's Qwen3-Coder templates are demonstrably miswired (issues #14493, #14570); llama.cpp's parsing is good but generic.
 - OVMS uses the oneDNN/OpenCL path with XMX — it does **not** depend on the Intel Vulkan driver, which currently has a live TDR/reset bug on Arc 140V (llama.cpp #20554). Driver 32.0.101.8826 (installed) postdates those reports — status unknown, so don't bet on Vulkan.
-- Best published decode for 30B-A3B on Intel iGPU (Intel: 34 t/s on Arc 140T; expect ~25–30 t/s here).
+- Best published decode for 30B-A3B on Intel iGPU (Intel: 34 t/s on Arc 140T; expect \~25–30 t/s here).
 - Native Windows exe, Windows-service deployment, continuous batching, prefix caching, OpenAI-compatible API at **`/v3`**.
 
 **Endpoints:** OVMS serves the OpenAI-compatible API at `http://127.0.0.1:8000/v3`. **OpenCode points at the qwen-proxy at `http://127.0.0.1:8099/v3`** (`tools\qwen-proxy.py`, auto-started by `start-llm.ps1` when a model loads), which transparently forwards to OVMS and repairs Qwen3-Coder-30B's multi-turn tool-call format (plain passthrough for the 14B and VLM). **OpenClaw was evaluated and dropped (see §5)** — orchestration is the fleet + BlarAI's AO/PA, so no extra gateway points at OVMS on your behalf. One model resident at a time; `scripts\start-llm.ps1` is the swapper.
@@ -125,7 +125,7 @@ This can also load your existing Ollama blobs directly (they're plain GGUF): `-m
 2. **Conversational "describe an idea → decompose → dispatch" → BlarAI's 14B AO/PA.** That decompose-and-dispatch brain is the agreed BlarAI integration (`docs/blarai-headless-coding-agent-brief.md`): you talk to the 14B, it enqueues fleet tasks and reads results back. An OpenClaw gateway in the same seat would be a redundant second brain — one with exec rights, the opposite of BlarAI's air-gapped posture.
 3. **Smart-home chat → Home Assistant's own Assist.** When the HAOS VM lands (§6.3), HA Assist can point its conversation agent at the OVMS endpoint (local LLM, loopback) for "dim the lights"-style control with no separate gateway; BlarAI could front it later too.
 
-**Why not install it hardened anyway? The security math is lopsided.** OpenClaw is the most dangerous component the blueprint ever contemplated: it had **137+ security advisories in Feb–Apr 2026**, an actively-exploited one-click RCE (CVE-2026-25253 "ClawBleed"), and a skill registry where ~1 in 12 packages was malicious ("ClawHavoc"). Skills run **in-process with full gateway access**; its per-tool sandbox needs Docker (you don't have it) — and that sandbox **does not even wrap the ACP coding harnesses it would spawn**. Community data also put 14B-class local models in "flaky tool calls" territory for its loop. Bolting the stack's largest attack surface onto a security-first machine to cover jobs now done by a PowerShell supervisor and an air-gapped model is a bad trade.
+**Why not install it hardened anyway? The security math is lopsided.** OpenClaw is the most dangerous component the blueprint ever contemplated: it had **137+ security advisories in Feb–Apr 2026**, an actively-exploited one-click RCE (CVE-2026-25253 "ClawBleed"), and a skill registry where \~1 in 12 packages was malicious ("ClawHavoc"). Skills run **in-process with full gateway access**; its per-tool sandbox needs Docker (you don't have it) — and that sandbox **does not even wrap the ACP coding harnesses it would spawn**. Community data also put 14B-class local models in "flaky tool calls" territory for its loop. Bolting the stack's largest attack surface onto a security-first machine to cover jobs now done by a PowerShell supervisor and an air-gapped model is a bad trade.
 
 **Revisit only if** a concrete need for a unified *multi-channel* chat gateway (WhatsApp/Telegram/Matrix in one brain) appears that HA Assist + BlarAI genuinely cannot meet — and then pinned, loopback-only, zero ClawHub skills, ideally in a memory-capped WSL2 distro, as a deliberate decision rather than a default phase. The full hardened-install plan (posture rules, the WSL2 isolation snippet, OVMS wiring) is preserved in git history (this section before 2026-06-21) and in `research/openclaw.md` if that day comes.
 
@@ -144,15 +144,15 @@ This can also load your existing Ollama blobs directly (they're plain GGUF): `-m
 
 ### 6.3 Smart home + dashboards + cameras
 - **Home Assistant OS in a Hyper-V Gen-2 VM** (3 GB static, Secure Boot OFF, External vSwitch — works reliably over **Ethernet/dock only**; Wi-Fi bridging is flaky). HA Core/venv is deprecated upstream — don't chase it. Add-ons inside HAOS give you Mosquitto, Zigbee2MQTT, Node-RED one-click.
-- **Zigbee: buy a NETWORK coordinator** — SMLIGHT SLZB-06MG24 (~$45, Ethernet/PoE). Hyper-V has NO USB passthrough, so a USB stick can never reach the VM; the network coordinator sidesteps it and survives any future host migration.
+- **Zigbee: buy a NETWORK coordinator** — SMLIGHT SLZB-06MG24 (\~$45, Ethernet/PoE). Hyper-V has NO USB passthrough, so a USB stick can never reach the VM; the network coordinator sidesteps it and survives any future host migration.
 - **Cameras:** ONVIF/RTSP PoE cameras only (Reolink/Amcrest class, never cloud-only). **go2rtc** (single native Windows exe) restreams everything; custom dashboards get sub-second WebRTC video from its `:1984`/`:8555` API.
 - **Dashboards:** HA Lovelace first (covers 90% with zero code, works on Pixel 8 Pro + your Legion Y700 as wall panel). The coding agent builds a custom React page only for the multi-camera live wall (HA WebSocket API for state/control + go2rtc WebRTC for video).
-- **Frigate (person detection): defer to Phase 2.** It's Linux/Docker-only; on this laptop it needs Docker Desktop+WSL2 with fragile iGPU passthrough and the NPU is unreachable from WSL2 today. The honest 24/7 answer: a **~$160 Intel N150 mini PC running HAOS bare-metal with the Frigate add-on** (OpenVINO on its iGPU). Your laptop is a dev machine that sleeps and reboots — don't make it the house's brainstem. HA full-backup restore makes the migration turnkey, and the network Zigbee coordinator moves with zero reconfig.
+- **Frigate (person detection): defer to Phase 2.** It's Linux/Docker-only; on this laptop it needs Docker Desktop+WSL2 with fragile iGPU passthrough and the NPU is unreachable from WSL2 today. The honest 24/7 answer: a **\~$160 Intel N150 mini PC running HAOS bare-metal with the Frigate add-on** (OpenVINO on its iGPU). Your laptop is a dev machine that sleeps and reboots — don't make it the house's brainstem. HA full-backup restore makes the migration turnkey, and the network Zigbee coordinator moves with zero reconfig.
 - APIs for the agent: HA REST + WebSocket (long-lived access token), MQTT, go2rtc HTTP API.
 
 ### 6.4 Android apps for the Pixel 8 Pro
 - **Native Kotlin + Android Studio** (current stable; bundles its own JDK). Seed while online: SDK packages (`platform-tools`, latest platform + build-tools, usb_driver), accept licenses, build one real project to populate `~/.gradle` (wrapper dist + all Maven deps), add a `resolveAllDependencies` task, then live in **`gradlew --offline`** / Studio's "Offline work" toggle.
-- ADB over USB to the Pixel is fully offline (enable Developer options + USB debugging). Skip emulator images (~8 GB each) — you have the real device. Skip NDK unless you do JNI.
+- ADB over USB to the Pixel is fully offline (enable Developer options + USB debugging). Skip emulator images (\~8 GB each) — you have the real device. Skip NDK unless you do JNI.
 - The chronic pain (all frameworks): **adding a NEW dependency while offline fails by design** — budget periodic online re-seeding sessions. If you ever build a C#-centric app: .NET MAUI is actually the most offline-friendly Android pipeline (pure NuGet + workload cache, no Gradle).
 - **RAM:** Android Studio + Gradle daemon = 4–7 GB. Run it in the Everyday tier (14B), never alongside coder-30b.
 
@@ -171,17 +171,17 @@ Your OpenVINO GenAI stack IS the platform: Python 3.12 venvs + `openvino`, `open
 | Python | uv + Pythons 3.12/3.13/3.14 | uv cache (19.4 GB already!) + `C:\offline\wheelhouse` (cp312 AND cp314), `UV_OFFLINE=1` |
 | JS/HTML/CSS | Node 24 + pnpm + Verdaccio local registry | Verdaccio proxy-cache (the ONLY way scaffolders like `npm create vite` work offline) |
 | C# | .NET 10 LTS (8 dies 2026-11-10!) | offline SDK installer + NuGet folder feed + `--locked-mode` + workload cache for MAUI |
-| C++ | VS Build Tools offline layout (~10 GB, MSVC ABI — you need it as an OpenVINO contributor anyway) + w64devkit (120 MB, can-never-break fallback) | layout + vcpkg asset cache (`X_VCPKG_ASSET_SOURCES`) |
+| C++ | VS Build Tools offline layout (\~10 GB, MSVC ABI — you need it as an OpenVINO contributor anyway) + w64devkit (120 MB, can-never-break fallback) | layout + vcpkg asset cache (`X_VCPKG_ASSET_SOURCES`) |
 | Android/Kotlin | Android Studio + seeded SDK/Gradle | `gradlew --offline` after seeding |
 | JSON/config | — | free |
 | Docs for humans | Zeal + docsets | offline by design |
-| Docs for agents | `C:\offline\docs` — git clones of mdn/content (~0.5 GB pure Markdown), dotnet/docs, framework docs repos, Python plain-text docs | agents grep Markdown far better than they drive doc apps |
+| Docs for agents | `C:\offline\docs` — git clones of mdn/content (\~0.5 GB pure Markdown), dotnet/docs, framework docs repos, Python plain-text docs | agents grep Markdown far better than they drive doc apps |
 
 ---
 
 ## 8. Autonomous / fleet operation — honest expectations
 
-**The realistic fleet on this hardware is a serial queue: 1 active coding agent (+1 light lane).** Two 14B agents on one server each run at half speed; more is counterproductive. Cloud-agent blogs assume 64 GB+ or discrete GPUs — calibrate to ~**5–15 completed tasks per night** (agent turns are prefill-dominated, ~100k+ tokens/task at 10–25 t/s).
+**The realistic fleet on this hardware is a serial queue: 1 active coding agent (+1 light lane).** Two 14B agents on one server each run at half speed; more is counterproductive. Cloud-agent blogs assume 64 GB+ or discrete GPUs — calibrate to \~**5–15 completed tasks per night** (agent turns are prefill-dominated, \~100k+ tokens/task at 10–25 t/s).
 
 **The pattern:**
 1. `opencode serve --hostname 127.0.0.1 --port 4096` running persistently (with `OPENCODE_SERVER_PASSWORD`).
@@ -199,12 +199,12 @@ Priority order — `scripts\04-seed-offline.ps1` automates the top of this list:
 1. **Python:** `uv python install 3.12 3.13 3.14`; build `C:\offline\wheelhouse` with `pip download --only-binary=:all:` for **both cp314 and cp312** (paddle/OCR needs 3.12; uses `configs\requirements-all.txt`). NEVER run `uv cache clean` — the 19.4 GB cache is your offline safety net.
 2. **Node:** Verdaccio (+ offline-storage plugin) as a logon task at `http://localhost:4873`; point npm + pnpm at it; scaffold each stack once online (Vite/React/Vue/Next/Express/Tailwind + your e-commerce deps) so every tarball gets cached.
 3. **.NET:** download .NET 10 SDK offline installer NOW; seed `C:\offline\nuget-feed` via a kitchen-sink `dotnet restore --packages`; lockfiles + `--locked-mode`; `dotnet workload install maui-android --download-to-cache` if MAUI interests you.
-4. **C++:** VS Build Tools offline layout (`--layout C:\offline\vslayout --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`, ~6–12 GB) + drop w64devkit zip on disk; set `X_VCPKG_ASSET_SOURCES` file cache.
+4. **C++:** VS Build Tools offline layout (`--layout C:\offline\vslayout --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`, \~6–12 GB) + drop w64devkit zip on disk; set `X_VCPKG_ASSET_SOURCES` file cache.
 5. **Android:** Android Studio + SDK seeding + one full Gradle build (§6.4).
 6. **Docs:** clone mdn/content, dotnet/docs, framework docs; download Python plain-text docs; install Zeal.
 7. **Verification ritual:** airplane mode ON → `uv add` from wheelhouse, `npm create vite`, `dotnet build` with a cached package, `cl /EHsc hello.cpp`, `gradlew --offline assembleDebug`, `adb install`, OpenCode starts and completes a task against OVMS. For hard guarantees, use per-exe outbound firewall rules instead of airplane mode.
 
-**Disk budget:** models ~17 GB new + toolchain seeds 40–60 GB against 230 GB free = fine, but don't add MDN ZIM (10 GB), NDK (4 GB), emulator images (8 GB each), or Flutter (5 GB) until actually needed. Reclaim 16.8 GB by deleting `~/.ollama` after coder-30b is verified.
+**Disk budget:** models \~17 GB new + toolchain seeds 40–60 GB against 230 GB free = fine, but don't add MDN ZIM (10 GB), NDK (4 GB), emulator images (8 GB each), or Flutter (5 GB) until actually needed. Reclaim 16.8 GB by deleting `~/.ollama` after coder-30b is verified.
 
 ---
 
@@ -229,7 +229,7 @@ Priority order — `scripts\04-seed-offline.ps1` automates the top of this list:
 |---|---|---|---|
 | 0 | Recon, blueprint, configs | — | ✅ done (this doc) |
 | 1 | OpenCode + global config | `01-install-opencode.ps1` | ✅ executed 2026-06-10 |
-| 2 | OVMS + coder-30b download (~17 GB) | `02-install-ovms-and-models.ps1` | ⬜ run while online |
+| 2 | OVMS + coder-30b download (\~17 GB) | `02-install-ovms-and-models.ps1` | ⬜ run while online |
 | 3 | First agentic session: `start-llm.ps1 -Model coder-30b` → `opencode` in a test repo | — | ⬜ |
 | 4 | ~~OpenClaw pinned + hardened~~ — **dropped (see §5)**; orchestration = fleet + BlarAI AO/PA, cron = Task Scheduler, HA chat = HA Assist | — | ❌ |
 | 5 | Offline seeding weekend | `04-seed-offline.ps1` + §9 manual items | ⬜ |
@@ -259,7 +259,7 @@ Implemented from a 5-agent audit (`research/maturity/`, plan in `verdict.md`). T
 - Future watchdog contract (Phase 8): health = GET `/v2/health/ready` + id-match on `/v3/models`; must be sentinel-gated so it never fights "Stop AI Models".
 - Vision = swap workflow by policy. No third-party vision plugins (the popular ones are Ollama-hardcoded and would double model RAM).
 - **Browser tool file access:** playwright-mcp blocks `file://` navigation by default; we pass `--allow-unrestricted-file-access` (gauntlet test 2026-06-11 caught this). Accepted residual: the browser can technically read files the agent's read-tool denies (.ssh etc.) — layered defense (AGENTS.md prohibition + harness tamper-evidence) covers it; revisit if multi-user.
-- **Prefix caching is ON** (pinned `--enable_prefix_caching true`; verified 2026-06-10: ~2,900-token re-read dropped from ~14s to ~1s). Conversations do NOT re-read from scratch each turn. The cache legitimately misses (one-time re-read) after: a session compaction (transcript gets rewritten), a model swap or server restart, or when the 4 GB cache pool evicts old sessions. Does not apply to Qwen3.5/3.6-class hybrid models (known OpenVINO memory issue) — ours are unaffected architectures.
+- **Prefix caching is ON** (pinned `--enable_prefix_caching true`; verified 2026-06-10: \~2,900-token re-read dropped from \~14s to \~1s). Conversations do NOT re-read from scratch each turn. The cache legitimately misses (one-time re-read) after: a session compaction (transcript gets rewritten), a model swap or server restart, or when the 4 GB cache pool evicts old sessions. Does not apply to Qwen3.5/3.6-class hybrid models (known OpenVINO memory issue) — ours are unaffected architectures.
 
 **Keys cheat-sheet (OpenCode):** `f2` cycle recent models · `ctrl+x m` model list · `Tab` Build/Plan · `ctrl+x c` compact session · `/new` fresh task · custom keybinds belong in `~/.config/opencode/tui.json`, never opencode.json.
 

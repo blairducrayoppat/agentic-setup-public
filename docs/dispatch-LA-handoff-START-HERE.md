@@ -38,7 +38,7 @@ The full `#670` arc is **complete and merged**: a natural-language goal → the 
 the box swaps in the 30B coder (OVMS) → the agentic-setup **fleet** builds in an isolated git worktree →
 verify-gate → **auto-merges to the project's `main`** → swaps the 14B back. Proven 2026-06-23: a
 `/dispatch palindrome-demo | write an is_palindrome function` produced correct Python with tests and
-**merged to main unattended in ~6 min**. Merged fixes: BlarAI P1 right-sizing (`929ad21`), P2 swap-back
+**merged to main unattended in \~6 min**. Merged fixes: BlarAI P1 right-sizing (`929ad21`), P2 swap-back
 (`fe3604a`), P3 fold+poll (`12bfe44`); fleet eco-adherence A1+A2 (`6a3b30c`), merge-unblock `--no-project`
 (`8fc4e29`). All ship **dormant** (`[fleet_dispatch].enabled=false`); the operator's **uncommitted
 `enabled=true` flip in `default.toml` + a `MainWindow.xaml.cs` edit live in the BlarAI main working tree and
@@ -106,10 +106,10 @@ produced `App.exe` to see the window.
 ## 5. Workstream B — MATURE the dispatch PROJECT-HANDLING (write the builder brief)
 
 The operator flagged real immaturity in how `/dispatch` handles the project/target. **Verified current
-behavior:** the PLAN step (`dispatch_coordinator._plan`, ~:141-182) does NOT check whether the repo exists —
+behavior:** the PLAN step (`dispatch_coordinator._plan`, \~:141-182) does NOT check whether the repo exists —
 it decomposes + previews criteria for ANY name, so it *looks* like it "just works"; the existence requirement
-only bites at EXECUTE (`shared/fleet/dispatch.py::validate_repo` ~:108-129 errors "is not a git repository");
-`_repo_path` (~:279-281) resolves `projects_dir/<name>` but does NOT create it. Same-name reuse works
+only bites at EXECUTE (`shared/fleet/dispatch.py::validate_repo` \~:108-129 errors "is not a git repository");
+`_repo_path` (\~:279-281) resolves `projects_dir/<name>` but does NOT create it. Same-name reuse works
 (idempotent for the same task via `new-agent-task.ps1`; accumulates `agent/<slug>` branches for different
 goals) — not an error, just silent.
 

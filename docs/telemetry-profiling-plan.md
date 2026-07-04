@@ -60,15 +60,15 @@ coder-30b, and confirm the GPU override is doing its job.
 | t/s decay + clocks over a long run (throttle) | HWiNFO logging | unified timeline |
 
 **What good looks like**
-- Decode ≈ **35–45 t/s** (matches the post-override bench). **Red flag: <~10 t/s** ⇒ memory spill /
+- Decode ≈ **35–45 t/s** (matches the post-override bench). **Red flag: <\~10 t/s** ⇒ memory spill /
   override off / driver regression.
-- GPU shared memory **not pinned at the window max** (~27 GB window after the 87% override) ⇒ the
-  ~18 GB working set fits, override effective.
+- GPU shared memory **not pinned at the window max** (\~27 GB window after the 87% override) ⇒ the
+  \~18 GB working set fits, override effective.
 - **NPU ≈ idle** during a pure coding turn ⇒ confirmed offload opportunity (feeds Run 2).
 - No thermal throttling in the first minutes; note any t/s decay over a long run.
 
 **Mutation-resistant proof:** deliberately run with the override OFF (or before reboot) and confirm
-the capture *shows* the spill (GPU mem maxed) and the t/s collapse to ~3.5. If it can't see the
+the capture *shows* the spill (GPU mem maxed) and the t/s collapse to \~3.5. If it can't see the
 known-bad state, the capture is worthless — fix it before trusting green.
 
 ---
@@ -101,7 +101,7 @@ GPU LLM-kernel stream staying continuous across the offload, not a hidden stall.
 frees → OVMS loads the 30B → fleet runs → reload 14B. If the VM holds RAM statically, releasing the
 14B frees memory *inside the guest* but **not on the host**, and the swap silently pages.
 
-> Note: BLUEPRINT lists "BlarAI VM (2 GB)" yet the 14B is ~10.5 GB — that apparent inconsistency is
+> Note: BLUEPRINT lists "BlarAI VM (2 GB)" yet the 14B is \~10.5 GB — that apparent inconsistency is
 > exactly why this is unknown. **Do not assume BlarAI's internal memory layout; measure it.**
 > Host-side measurement only; **do not inspect BlarAI source** (in-VM steps are for the
 > BlarAI-session agent).
@@ -119,7 +119,7 @@ frees → OVMS loads the 30B → fleet runs → reload 14B. If the VM holds RAM 
 
 **What good looks like**
 - ΔAvailable ≈ the 14B's footprint (host reclaims it), host Available **≥ 21 GB**, 30B reaches READY
-  and hits **~35–45 t/s with no paging** ⇒ **Option A is viable.**
+  and hits **\~35–45 t/s with no paging** ⇒ **Option A is viable.**
 
 **What bad looks like**
 - ΔAvailable ≈ 0 (static VM holds the RAM) → host Available < 21 GB → 30B fails/pages ⇒ Option A needs
@@ -133,9 +133,9 @@ Then reload the 14B and smoke-check the AO/PA (never end at zero models).
 ---
 
 ## RUN 4 — (optional) Override + swap validation
-- Re-confirm the 87% Shared-GPU-Memory Override still yields the ~27 GB window + ~10× decode **after
+- Re-confirm the 87% Shared-GPU-Memory Override still yields the \~27 GB window + \~10× decode **after
   any driver update** (driver-bound). Capture window size + t/s with override on vs off.
-- Measure model-swap latency (14B↔30B) and ov_cache rebuild cost; expect ~20–60 s.
+- Measure model-swap latency (14B↔30B) and ov_cache rebuild cost; expect \~20–60 s.
 
 ---
 

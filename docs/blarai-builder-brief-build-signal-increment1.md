@@ -85,7 +85,7 @@ Mirror the **assumptions** pattern (a SEPARATE small model call — do NOT fold 
 criteria call; the criteria JSON contract must stay byte-identical so existing tests
 don't break):
 - `_ASSUMPTIONS_TEMPLATE` at `acceptance.py:229-246`, parsed by `_parse_assumptions`
-  (~`acceptance.py:255`), called inside `generate_plan` (~`acceptance.py:801-804`).
+  (\~`acceptance.py:255`), called inside `generate_plan` (\~`acceptance.py:801-804`).
 - Add a `_BUILD_PLAN_TEMPLATE` (enum-constrained prompt — copy the `tier` enum
   discipline from `_CRITERIA_TEMPLATE` at `acceptance.py:197-208`) + a
   `_parse_build_plan` (validate against the enums above; fail-closed). Call it in
@@ -117,7 +117,7 @@ reaches the queue write.
 
 ### Task 3 — the PLAN preview line (display-only)
 
-- `render_criteria_preview` (`acceptance.py:628-690`; the task list renders ~652-656,
+- `render_criteria_preview` (`acceptance.py:628-690`; the task list renders \~652-656,
   called from `dispatch_coordinator.py:178`). Add a "Building this as: <friendly>"
   line driven by `spec.build_plan.surface`, via a small BlarAI-side surface→friendly
   map: `desktop-gui→"a Windows desktop app"`, `web→"a web app"`,

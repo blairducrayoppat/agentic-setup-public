@@ -46,7 +46,7 @@ extra fields beside `repo`/`task`/`prompt`:
    signature working for callers that pass no surface.
 3. **Thread `surface`/`language_hint` through the run path** the SAME way `complexity`
    already travels: `run-fleet.ps1:101-103` (forward `$t.surface`/`$t.language_hint` into
-   the `new-agent-task.ps1` param splat), `new-agent-task.ps1` params (~:17), and the seed
+   the `new-agent-task.ps1` param splat), `new-agent-task.ps1` params (\~:17), and the seed
    call site (`new-agent-task.ps1:77` — pass surface into `Resolve-TaskScaffold`). Add a
    validated `-Surface` to `add-fleet-task.ps1` (mirror the `-Complexity` ValidateSet at :10,26).
 
@@ -77,7 +77,7 @@ extra fields beside `repo`/`task`/`prompt`:
 - **A real seed proof** (the seed has NEVER engaged in a live dispatch — `verify-scaffold`
   is unit-only): `Copy-ScaffoldInto` the winui scaffold into a temp worktree, then run the
   gate's exact `dotnet build` → 0/0, and `Test-ProjectStructure` → clean.
-- The existing standing unit gate (`verify-{scaffold,errorfeedback,retry,reviewfeedback,complexity,merge-decision,ecosystem}.ps1`, ~282/0) must stay green.
+- The existing standing unit gate (`verify-{scaffold,errorfeedback,retry,reviewfeedback,complexity,merge-decision,ecosystem}.ps1`, \~282/0) must stay green.
 
 ## The over-match lesson (HONOR IT — it bit this exact area before)
 

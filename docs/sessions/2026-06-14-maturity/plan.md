@@ -2,7 +2,7 @@
 
 **Branch:** `maturity/autonomous-2026-06-14`
 **Worktree:** `C:\Users\mrbla\agentic-setup-maturity` (your live `C:\Users\mrbla\agentic-setup` stays on `main`)
-**Operator:** Claude (Opus 4.8), unattended, ~16h window, no human in the loop.
+**Operator:** Claude (Opus 4.8), unattended, \~16h window, no human in the loop.
 
 ## Goal (your words)
 1. **Longer-running agentic sessions** — run unattended coding work reliably for longer.

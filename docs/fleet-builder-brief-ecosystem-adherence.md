@@ -21,7 +21,7 @@ branch `agent/implement-is-palindrome` in `fleet-shakedown`:
 fleet defects combined to let this happen and nearly let it merge:
 
 1. **The coder ignored the target ecosystem.** `new-agent-task.ps1` passes the task prompt straight
-   to the coder (`Invoke-AgentRun -Prompt $Prompt`, ~line 98) with NO language constraint. A
+   to the coder (`Invoke-AgentRun -Prompt $Prompt`, \~line 98) with NO language constraint. A
    language-neutral "is_palindrome" let the 30B default to JavaScript (a classic JS exercise).
 
 2. **The verify gate is blind to a wrong-language deliverable.** In `verify-project.ps1`:
@@ -35,7 +35,7 @@ fleet defects combined to let this happen and nearly let it merge:
 
    So the deterministic gate — the guard auto-merge is supposed to trust — **never checked the
    task's deliverable.** The ONLY thing that blocked the merge was the LLM review returning
-   `FIX FIRST` (`new-agent-task.ps1` requires `verdict -eq 'MERGE'`, ~line 199). Had the review been
+   `FIX FIRST` (`new-agent-task.ps1` requires `verdict -eq 'MERGE'`, \~line 199). Had the review been
    lenient, wrong-language code would have merged.
 
 **Goal of this brief: make the DETERMINISTIC gate the reliable guard (not the LLM review), and stop
@@ -74,7 +74,7 @@ detector.
 
 ## 3. Fix A1 — pin the language in the coder prompt (`new-agent-task.ps1`)
 
-Before the coder runs (~line 98, the `Invoke-AgentRun` inside `Invoke-BuildWithRetry`), compute
+Before the coder runs (\~line 98, the `Invoke-AgentRun` inside `Invoke-BuildWithRetry`), compute
 `Get-ProjectEcosystem $wt` and **PREPEND** a hard constraint to `$Prompt`. Example for a Python repo:
 
 > "TARGET PROJECT LANGUAGE: Python. Write your solution as Python (`.py`) files in this repo, and
@@ -110,7 +110,7 @@ Add a deterministic, high-precision check (a new gate result, e.g. `eco:language
   introduces a new ecosystem *with* its manifest.
 
 This makes `overall='fail'` for the JS-in-Python case → blocks the merge at `new-agent-task.ps1`
-(~line 199) **deterministically, independent of the review verdict.**
+(\~line 199) **deterministically, independent of the review verdict.**
 
 **Optional secondary (ESCALATE, do not silently add):** also failing when an *implementation* task
 produces no executed test in the target language ("no tests ran" + zero `test_*.py` added). This is

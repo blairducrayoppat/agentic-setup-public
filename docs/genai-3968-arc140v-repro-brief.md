@@ -27,15 +27,15 @@ Intel repo is an outward-facing action gated on Blair's explicit approval (and u
 
 - **The issue (#3968):** OPEN, filed 2026-06-10. Reporter's repro: `Qwen3.5-0.8B-int8_asym-ov` consumed **18.4 GB for
   110k tokens** even with `KV_CACHE_PRECISION i4`, vs `OpenVINO/Qwen3-4B-int4-ov` using **9.3 GB** for the same task —
-  i.e. a linear-attention model using ~2× the memory of a comparable standard-attention model. As of last check: no
+  i.e. a linear-attention model using \~2× the memory of a comparable standard-attention model. As of last check: no
   maintainer reply, no linked PR, no milestone. **Re-read the thread before drafting** — it is evolving.
 - **The mitigation:** OVMS **2026.2.1 (2026-06-19)** added a `cache_interval_multiplier` parameter for LLM/VLM models
-  with linear attention; release guidance recommends **~64 for long prompts (>20k tokens)** to curb the blow-up. The
+  with linear attention; release guidance recommends **\~64 for long prompts (>20k tokens)** to curb the blow-up. The
   prior **2026.2 (2026-05-28)** added **Xe-GPU support for MoE models** (the path we test on) and is where the known
   limitation was first documented. **The exact flag name, value range, and where it is set (OVMS CLI vs per-model
   graph/config) MUST be confirmed from the 2026.2.1 release notes/docs before running** — do not assume.
-- **Root cause class:** Qwen3.6-35B-A3B is the **Qwen3-Next hybrid architecture** — ~3:1 Gated DeltaNet (linear,
-  recurrent state, stores *no* per-token KV) to full Gated Attention. Only ~25% of layers contribute to a growing KV
+- **Root cause class:** Qwen3.6-35B-A3B is the **Qwen3-Next hybrid architecture** — \~3:1 Gated DeltaNet (linear,
+  recurrent state, stores *no* per-token KV) to full Gated Attention. Only \~25% of layers contribute to a growing KV
   cache; the blow-up is in how prefix caching handles the recurrent state, not raw KV size. This is a known-hard,
   cross-runtime problem (mlx-lm #980 has the same hybrid prefix-cache bug).
 
@@ -44,14 +44,14 @@ Intel repo is an outward-facing action gated on Blair's explicit approval (and u
 ## 3. Environment (the machine this runs on)
 
 - **HW:** ASUS ExpertBook P5405CSA · Core Ultra 7 258V (Lunar Lake) · **Arc 140V iGPU** · **31.3 GB shared LPDDR5X**
-  (~136 GB/s, not upgradable) · Windows 11 Pro. Idles ~15 GB used with the BlarAI VM up.
+  (\~136 GB/s, not upgradable) · Windows 11 Pro. Idles \~15 GB used with the BlarAI VM up.
 - **Serving:** OVMS native Windows on GPU, OpenAI API at `127.0.0.1:8000/v3`. Launcher: `scripts\start-llm.ps1`
   (one model resident at a time). Models live under `C:\models\`. Pinned flags include
   `--model_path`, `--rest_bind_address 127.0.0.1`, `--enable_prefix_caching true`, and `--kv_cache_precision u8`
   for the coder. **`--enable_prefix_caching true` MUST stay ON — it is the feature under test.**
-- **GPU memory override is REQUIRED** for anything ~18 GB+: Intel Graphics Software → System →
-  Shared GPU Memory Override → ~87% **+ reboot** raises the iGPU window from ~18 GB to ~27 GB. Without it, large models
-  spill to the slow path and collapse to ~3.5 t/s. Confirm it is enabled before measuring (see `bench/`).
+- **GPU memory override is REQUIRED** for anything \~18 GB+: Intel Graphics Software → System →
+  Shared GPU Memory Override → \~87% **+ reboot** raises the iGPU window from \~18 GB to \~27 GB. Without it, large models
+  spill to the slow path and collapse to \~3.5 t/s. Confirm it is enabled before measuring (see `bench/`).
 - **Lean profile** needed for a 35B: BlarAI VM stopped, browser closed, ≥21 GB free before load (`start-llm.ps1`
   checks this). **Never operate inside `C:\Users\mrbla\BlarAI`.** Respect the OpenCode deny-edit configs.
 - **Gotcha:** Bitdefender Advanced Threat Defense blocks pwsh command lines that pattern-match recon
@@ -70,7 +70,7 @@ Intel repo is an outward-facing action gated on Blair's explicit approval (and u
 |---|---|---|---|
 | A | Qwen3.6-35B-A3B int4-ov | **off / default** | reproduce the blow-up |
 | B | Qwen3.6-35B-A3B int4-ov | **64** (per release guidance) | measure the mitigation |
-| C (control) | **Qwen3-Coder-30B-A3B-Instruct-int4-ov** (already at `C:\models\coder-30b`) | n/a (standard attention) | show the blow-up is linear-attention-specific, apples-to-apples (~same size/quant/machine) |
+| C (control) | **Qwen3-Coder-30B-A3B-Instruct-int4-ov** (already at `C:\models\coder-30b`) | n/a (standard attention) | show the blow-up is linear-attention-specific, apples-to-apples (\~same size/quant/machine) |
 
 The control (C) is the strongest part of the repro: it's a standard-attention `Qwen3MoeForCausalLM` of nearly the same
 size and INT4 on the *same* box, mirroring how the issue compared Qwen3.5-0.8B vs Qwen3-4B.
@@ -81,7 +81,7 @@ issue's exact config for comparability), prefix-caching ON, generation length, O
 and idle baseline conditions (lean profile, same background load).
 
 **Prompt design — exercise prefix-cache *reuse*, not just a long prompt.** The bug is about the prefix cache. Use a
-fixed, reproducible ~32k-token prefix, then issue **two requests that share that prefix** (e.g. same 32k context,
+fixed, reproducible \~32k-token prefix, then issue **two requests that share that prefix** (e.g. same 32k context,
 different final question) so the second request hits the cache. Measure peak memory across both. (A single long
 prompt is the weaker version; the issue's scenario is cache reuse.) Commit the exact prompt file to the repro so it's
 reproducible.
@@ -118,8 +118,8 @@ not a failed run. Capture the OOM cleanly (error + memory at point of failure); 
 1. **Model availability.** There may be **no prebuilt `OpenVINO/Qwen3.6-35B-A3B-*-int4-ov`** (only GGUF + a GPTQ-Int4
    exist; OV lists the *architecture* as supported). First check the OpenVINO HF org; if absent, convert via
    `optimum-cli export openvino --model Qwen/Qwen3.6-35B-A3B --weight-format int4 --group-size 128 ...` — which needs
-   (a) an **optimum-intel new enough to support the Qwen3-Next/Qwen3.6 hybrid arch** (verify), (b) ~70 GB FP16 download
-   + ~21 GB output (disk OK: ~230 GB free), (c) significant time. Record the exact source/conversion command for the comment.
+   (a) an **optimum-intel new enough to support the Qwen3-Next/Qwen3.6 hybrid arch** (verify), (b) \~70 GB FP16 download
+   + \~21 GB output (disk OK: \~230 GB free), (c) significant time. Record the exact source/conversion command for the comment.
 2. **OVMS 2026.2.1+ installed**, and the **exact `cache_interval_multiplier` syntax/placement** confirmed from its docs.
 3. **GPU memory override enabled + rebooted**; lean profile achievable (BlarAI VM off, browser closed).
 4. **Fallback if the 35B won't run at 32k even with the flag** on 31.3 GB: fall back to a **smaller linear-attention
@@ -168,7 +168,7 @@ Structure it for a maintainer to act on, concise and factual (no marketing):
 
 ## 11. Open questions for Blair (confirm before executing)
 
-1. Do you already have a Qwen3.6-35B-A3B int4-ov, or should the agent convert it (~70 GB download + time)?
+1. Do you already have a Qwen3.6-35B-A3B int4-ov, or should the agent convert it (\~70 GB download + time)?
 2. Is OVMS updated to 2026.2.1, and is updating it OK?
 3. KV precision for the runs — **u8** (your stack default), **i4** (matches the issue), or both?
 4. OK to attempt the 35B at 32k given the OOM risk + required GPU-override reboot, or start with the smaller-model fallback?

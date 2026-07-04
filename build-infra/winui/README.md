@@ -101,7 +101,7 @@ to or lock it, so it is safe to run alongside a dispatch. The feed at
 ### MAX_PATH: build under a SHORT path (load-bearing, verified)
 
 The WinUI XAML compiler (`XamlCompiler.exe`) runs as **.NET Framework 4.7.2**,
-which is subject to the legacy ~260-char `MAX_PATH` limit. If the build's working
+which is subject to the legacy \~260-char `MAX_PATH` limit. If the build's working
 dir or the temp packages folder sits under a deep path (e.g. a per-session temp
 tree), the compiler **false-fails** with a misleading
 
@@ -110,7 +110,7 @@ tree), the compiler **false-fails** with a misleading
 for projection DLLs that are **present on disk** — the file resolves fine, the
 net472 tool just can't open a path that long (and the error count varies run to
 run, another tell). This was observed and then resolved during staging:
-the identical template + feed **failed** from a ~230-char scratchpad temp path
+the identical template + feed **failed** from a \~230-char scratchpad temp path
 and **built clean (0 warn / 0 err -> App.exe)** the moment the working dir and GPF
 were moved to `C:\bw` / `C:\bg`. So the fleet MUST build WinUI targets and restore
 into **short** paths (a couple of levels off a drive root). This is the single

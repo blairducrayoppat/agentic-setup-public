@@ -22,13 +22,13 @@ agentic-setup fleet + steps the 14B aside for the 30B. The harness is a **headle
   `shared/ipc/vsock.py` (`VsockTransport`, `VsockConfig`, `VsockAddress`, `dev_mode=True`);
   `shared/ipc/protocol.py` (`MessageFramer` — the `encode_*`/`decode_*` methods + `MessageType`).
 - **The gateway dispatch entry:** `services/ui_gateway/src/transport.py` `TransportGateway` — it owns
-  the real plan/execute wiring (`_dispatch_plan_fn` ~:977, `_dispatch_execute_fn` ~:1031) and a
+  the real plan/execute wiring (`_dispatch_plan_fn` \~:977, `_dispatch_execute_fn` \~:1031) and a
   command entry (CONFIRM the exact method — the map says `handle_dispatch_command(session_id, cmd)`).
   Its dispatch logic lives in `services/ui_gateway/src/dispatch_coordinator.py`
   (`parse_dispatch_command`, `handle_command`, `_status`, the Inc-4 clarifying sub-state).
 - **AO handlers:** `services/assistant_orchestrator/src/entrypoint.py` `_handle_plan_request`
-  (~:1773, runs `generate_plan` from `shared/fleet/acceptance.py`) and `_handle_execute_request`
-  (~:1819, `execute_swap_dispatch` → enqueue + spawn `run-fleet.ps1` + step aside).
+  (\~:1773, runs `generate_plan` from `shared/fleet/acceptance.py`) and `_handle_execute_request`
+  (\~:1819, `execute_swap_dispatch` → enqueue + spawn `run-fleet.ps1` + step aside).
 - **Config gate:** `services/assistant_orchestrator/config/default.toml` `[fleet_dispatch].enabled`
   (+ `[ipc].vsock_port`, `agentic_setup_dir`, `projects_dir`, swap gates).
 - **Run state / outcome:** `agentic-setup/state/fleet-runs/<RunId>/` (`SUMMARY.txt`); read via
@@ -63,7 +63,7 @@ agentic-setup fleet + steps the 14B aside for the 30B. The harness is a **headle
 4. **Monitoring = SMART, with stop-doomed-fast (NON-NEGOTIABLE — this is the dev-cycle-speed lesson).**
    Do NOT just poll `SUMMARY.txt`. Poll the **fleet orchestrator log** for step progression, and
    detect a DETERMINED-doomed run and STOP IT FAST: a hang = the OVMS out-log mtime is stale (no
-   generation) AND the relevant `dotnet`/coder child process shows ~0 CPU over a few seconds AND the
+   generation) AND the relevant `dotnet`/coder child process shows \~0 CPU over a few seconds AND the
    agent log content isn't advancing. On "determined", stop the run (the clean `/dispatch stop` path
    if exposed; else surface it) rather than waiting out the 30-min breaker. Detect completion from
    `SUMMARY.txt` (MERGED/PARKED/...). Beware false-positives from grepping the agent log (it echoes

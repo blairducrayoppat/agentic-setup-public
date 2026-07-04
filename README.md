@@ -13,7 +13,7 @@ tuned to the one hard constraint that governs the whole design.
 
 ## The one constraint everything follows from
 
-**CPU, integrated GPU, OS, VMs, and build jobs all share ONE ~31.3 GB memory pool** on
+**CPU, integrated GPU, OS, VMs, and build jobs all share ONE \~31.3 GB memory pool** on
 this hardware (Core Ultra 7 258V / Arc 140V iGPU / 32 GB soldered LPDDR5X). It is not
 upgradable. So exactly **one model is resident at a time**, and every decision — model
 choice, concurrency, swap timing, whether the fleet runs the 30B or the 14B — is a
@@ -55,7 +55,7 @@ native Windows executable with an OpenAI-compatible API.
   browser, heavy apps), how much each would free, and offers to close them one at a time
   (graceful, always asks). It remembers what it stopped and offers to restart it on swap
   back. `scripts/stop-llm.ps1` frees the pool.
-- Prefix caching is on: a ~2,900-token re-read drops from ~14 s to ~1 s, so multi-turn
+- Prefix caching is on: a \~2,900-token re-read drops from \~14 s to \~1 s, so multi-turn
   conversations do not re-prefill from scratch.
 
 **The qwen-proxy** (`tools/qwen-proxy.py`, pure stdlib, auto-started by `start-llm.ps1`)
@@ -69,21 +69,21 @@ in `content` and strips cosmetic trailing markers. It is transparent passthrough
 
 | Role | Model | Resident | Decode (Arc 140V) |
 |---|---|---|---|
-| Deep agentic coding | Qwen3-Coder-30B-A3B-Instruct INT4 (MoE, ~3.3B active) | ~18 GB | ~35–45 t/s |
-| Everyday / fleet / orchestrator | Qwen3-14B INT4 (dense) | ~10.5 GB | ~12 t/s |
-| Vision (screenshot/UI debugging) | Qwen3-VL-8B-Instruct INT4 | ~6 GB | swap-in only |
+| Deep agentic coding | Qwen3-Coder-30B-A3B-Instruct INT4 (MoE, \~3.3B active) | \~18 GB | \~35–45 t/s |
+| Everyday / fleet / orchestrator | Qwen3-14B INT4 (dense) | \~10.5 GB | \~12 t/s |
+| Vision (screenshot/UI debugging) | Qwen3-VL-8B-Instruct INT4 | \~6 GB | swap-in only |
 
 Counter-intuitively the MoE 30B **outruns** the dense 14B once memory isn't the
 bottleneck — it reads fewer active parameters per token. Model swap latency is real
-(~20–60 s of compile/load), so workflows batch around it rather than ping-pong. The
+(\~20–60 s of compile/load), so workflows batch around it rather than ping-pong. The
 fleet runs the **14B only** — the first `npm ci` or pytest spike on top of the 30B starts
 paging exactly when an agent is mid-task.
 
-**The 10× fix (measured, `bench/`).** Out of the box the 30B decodes at ~3.5 t/s: its
-~18 GB working set exceeds the Arc's default ~17.9 GB shared-GPU window and spills onto
-the slow path. Setting Intel Graphics Software → **Shared GPU Memory Override → ~87%**
-and rebooting raises the window to ~27 GB so the whole model fits, and decode jumps to
-~35–45 t/s — beating Intel's own published 34 t/s figure on the larger 285H. On this
+**The 10× fix (measured, `bench/`).** Out of the box the 30B decodes at \~3.5 t/s: its
+\~18 GB working set exceeds the Arc's default \~17.9 GB shared-GPU window and spills onto
+the slow path. Setting Intel Graphics Software → **Shared GPU Memory Override → \~87%**
+and rebooting raises the window to \~27 GB so the whole model fits, and decode jumps to
+\~35–45 t/s — beating Intel's own published 34 t/s figure on the larger 285H. On this
 machine the override is required, not optional. No published tokens/sec numbers for this
 model on this hardware existed before this measurement.
 
@@ -111,7 +111,7 @@ model on this hardware existed before this measurement.
 
 ## The autonomous fleet
 
-Queued, supervised, overnight coding — calibrated honestly to ~5–15 completed tasks a
+Queued, supervised, overnight coding — calibrated honestly to \~5–15 completed tasks a
 night on this hardware (agent turns are prefill-dominated).
 
 - **Queue a task** with `add-fleet-task.ps1` (or the Control Panel's guided prompt),

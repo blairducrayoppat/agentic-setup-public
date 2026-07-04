@@ -53,7 +53,7 @@ LA: Blair. Guide: Claude (Opus 4.x). Started: 2026-06-17.
   outbound blocked); investigated the 30B tool-call-reliability thread (see below). _DONE._
   **Every threat T1–T8 now has a control AND a passing live test, or a documented residual.**
 - **Tool-call reliability (diagnosed E7→E9 via on-wire capture — RELIABILITY, not security):**
-  headless single-shot tool tasks succeed only ~30–60% of the time (high variance). The on-wire
+  headless single-shot tool tasks succeed only \~30–60% of the time (high variance). The on-wire
   proxy capture (E9) shows TWO distinct model-reliability failure modes, neither fixable by OVMS
   serving flags: (a) intermittent OpenAI-JSON-as-text tool calls (the OpenCode<->OVMS format drift —
   most calls DO parse as structured `tool_calls`, so the parser works), and (b) mis-constructed

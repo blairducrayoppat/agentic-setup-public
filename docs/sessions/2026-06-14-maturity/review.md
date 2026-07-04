@@ -2,7 +2,7 @@
 
 > **STATUS (2026-06-14): APPLIED & ARCHIVED.** These changes were merged into `main` and the preview worktree was removed, so the "keep / throw it away" steps below now point at a folder that no longer exists - they are kept only as a record of the original handoff. To undo the changes *now*, use the "If you want to undo EVERYTHING" section of `docs/testing-guide.md`.
 
-Hi. Overnight I built guardrails so smaller models can run **longer unattended sessions safely**, plus a way for you to **see** that it's working. Everything is isolated and reversible. Read this top-to-bottom; it takes ~5 minutes.
+Hi. Overnight I built guardrails so smaller models can run **longer unattended sessions safely**, plus a way for you to **see** that it's working. Everything is isolated and reversible. Read this top-to-bottom; it takes \~5 minutes.
 
 ## TL;DR
 - Your real setup (`C:\Users\mrbla\agentic-setup`, branch `main`) was **not touched**. It still works exactly as before.

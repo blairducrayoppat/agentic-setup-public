@@ -17,11 +17,11 @@ occasionally:
 - tries to write a file to the wrong place (outside the project), which the safety rules
   correctly block.
 
-Either way: zero changes. A single attempt like that succeeds only ~50% of the time.
+Either way: zero changes. A single attempt like that succeeds only \~50% of the time.
 
 **Retry-on-failure** simply notices "this attempt produced no changes" and runs it again,
 from a clean copy, up to a few times. Because each attempt is cheap and independent, a few
-tries turn that ~50% into ~85-90%. Two rules keep it safe and fast:
+tries turn that \~50% into \~85-90%. Two rules keep it safe and fast:
 
 1. It retries **only** a no-op (zero changes). It does **not** retry a *timeout* - a timeout
    means the model is genuinely stuck, and re-running would just waste minutes.

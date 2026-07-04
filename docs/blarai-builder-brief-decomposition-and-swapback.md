@@ -25,7 +25,7 @@
 ## 1. Why now — status
 
 The headless round-trip **works end-to-end** (proven on-hardware 2026-06-22): the 14B decomposes a goal,
-BlarAI steps the embedded 14B aside, the 30B loads (GPU handoff ~24.4 GiB), the headless fleet runs the
+BlarAI steps the embedded 14B aside, the 30B loads (GPU handoff \~24.4 GiB), the headless fleet runs the
 tasks, and **real code is written and merged to `main`** (leap-year + a document-function task both
 landed). The old "generates tokens but writes no files" blocker is **resolved**.
 
@@ -37,10 +37,10 @@ whole product being *usable*, so it comes first.
 ## 2. PROBLEM 1 (PRIORITY) — Over-decomposition
 
 ### Evidence (live, 2026-06-22)
-The goal **"write an `is_leap_year` function"** — a one-liner — was exploded into **~7–9 fleet tasks**:
+The goal **"write an `is_leap_year` function"** — a one-liner — was exploded into **\~7–9 fleet tasks**:
 `define-is-leap-year-function`, `implement-leap-year-logic`, `test-is-leap-year-2024`,
 `test-is-leap-year-1900`, `test-is-leap-year-2000`, `verify-edge-cases`, `acceptance-tests`
-(+ a `create-file` task). Each got its **own git worktree and its own model-swap cycle**; total ~33+ min
+(+ a `create-file` task). Each got its **own git worktree and its own model-swap cycle**; total \~33+ min
 for one line of code. Aimed at a real goal ("build an ecommerce site") this same behavior yields
 *hundreds* of redundant micro-tasks → unusable.
 
@@ -63,7 +63,7 @@ Clarify → Spec → recursive-Decompose → Approve → Execute flow.
 1. **Leaf / stop-condition gate ("is this already small enough?").** A task is a *leaf* (do not split
    further) when it is **one coherent unit a coder implements in a single pass** — e.g. *one function plus
    its tests is ONE task*, not six. Define the criteria explicitly and deterministically (e.g. estimated
-   ≤ ~1 file / ≤ ~a few dozen LOC / single responsibility). The model *proposes* a split; a deterministic
+   ≤ \~1 file / ≤ \~a few dozen LOC / single responsibility). The model *proposes* a split; a deterministic
    check *disposes*.
 2. **Hard depth limit on recursion** (e.g. 2–3 levels). Fail-safe: if a node is still "too big" at max
    depth, keep it as a single flagged task rather than explode it.
@@ -93,7 +93,7 @@ Clarify → Spec → recursive-Decompose → Approve → Execute flow.
 
 ### Evidence
 Across **two** 15–20 min watchers, after the 30B finished its tasks the swap-**back** tail never ran: the
-30B stayed resident, the embedded 14B never returned, RAM stayed pinned (~3.7 GB free). The box had to be
+30B stayed resident, the embedded 14B never returned, RAM stayed pinned (\~3.7 GB free). The box had to be
 torn down **manually**.
 
 ### The manual teardown that worked (this is the correct sequence — encode it)
