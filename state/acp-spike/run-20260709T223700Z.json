@@ -1,0 +1,302 @@
+{
+  "phase": "run",
+  "t_iso": "2026-07-09T22:37:00.056911+00:00",
+  "cwd": "C:/Users/mrbla/projects/acp-spike-cancel2",
+  "model": "local/coder-30b",
+  "prompt_chars": 1088,
+  "cancel_after_s": 150.0,
+  "events_ndjson": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\run-20260709T223700Z.events.ndjson",
+  "opencode_pid": 20980,
+  "initialize": {
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": true,
+      "promptCapabilities": {
+        "image": true,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true,
+        "acp": false
+      },
+      "sessionCapabilities": {
+        "list": {},
+        "fork": {},
+        "resume": {},
+        "close": {}
+      },
+      "auth": {}
+    },
+    "authMethods": [
+      {
+        "id": "opencode-login",
+        "name": "Login with opencode",
+        "description": "Run `opencode auth login` in the terminal"
+      }
+    ],
+    "agentInfo": {
+      "name": "OpenCode",
+      "version": "1.17.8"
+    }
+  },
+  "new_session": {
+    "sessionId": "ses_0b6f90523ffefZCe0LhFdb8jMJ",
+    "configOptions": [
+      {
+        "currentValue": "local/qwen3-14b",
+        "options": [
+          {
+            "value": "opencode/big-pickle",
+            "name": "OpenCode Zen/Big Pickle"
+          },
+          {
+            "value": "opencode/deepseek-v4-flash-free",
+            "name": "OpenCode Zen/DeepSeek V4 Flash Free"
+          },
+          {
+            "value": "opencode/hy3-free",
+            "name": "OpenCode Zen/Hy3 Free"
+          },
+          {
+            "value": "opencode/mimo-v2.5-free",
+            "name": "OpenCode Zen/MiMo V2.5 Free"
+          },
+          {
+            "value": "opencode/nemotron-3-ultra-free",
+            "name": "OpenCode Zen/Nemotron 3 Ultra Free"
+          },
+          {
+            "value": "opencode/north-mini-code-free",
+            "name": "OpenCode Zen/North Mini Code Free"
+          },
+          {
+            "value": "local/qwen3-14b",
+            "name": "Local OVMS (Arc 140V)/Qwen3-14B INT4 — everyday/fleet tier"
+          },
+          {
+            "value": "local/coder-30b",
+            "name": "Local OVMS (Arc 140V)/Qwen3-Coder-30B-A3B INT4 — power tier (lean profile!)"
+          },
+          {
+            "value": "local/qwen3-vl-8b",
+            "name": "Local OVMS (Arc 140V)/Qwen3-VL-8B INT4 — vision/screenshots"
+          }
+        ],
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select"
+      },
+      {
+        "currentValue": "build",
+        "options": [
+          {
+            "value": "build",
+            "name": "build",
+            "description": "The default agent. Executes tools based on configured permissions."
+          },
+          {
+            "value": "critic",
+            "name": "critic",
+            "description": "Cross-model pre-merge code critic - finds ONLY real, test-checkable blockers; read-only, never edits, never runs tests or servers"
+          },
+          {
+            "value": "debug",
+            "name": "debug",
+            "description": "Evidence-first debugging - observe, hypothesize, smallest fix, verify"
+          },
+          {
+            "value": "plan",
+            "name": "plan",
+            "description": "Plan mode. Disallows all edit tools."
+          },
+          {
+            "value": "review",
+            "name": "review",
+            "description": "Read-only code reviewer - finds problems, never edits"
+          }
+        ],
+        "id": "mode",
+        "name": "Session Mode",
+        "category": "mode",
+        "type": "select"
+      }
+    ]
+  },
+  "session_id": "ses_0b6f90523ffefZCe0LhFdb8jMJ",
+  "model_selection": {
+    "via": "set_config_option",
+    "ok": true,
+    "resp": {
+      "configOptions": [
+        {
+          "currentValue": "local/coder-30b",
+          "options": [
+            {
+              "value": "opencode/big-pickle",
+              "name": "OpenCode Zen/Big Pickle"
+            },
+            {
+              "value": "opencode/deepseek-v4-flash-free",
+              "name": "OpenCode Zen/DeepSeek V4 Flash Free"
+            },
+            {
+              "value": "opencode/hy3-free",
+              "name": "OpenCode Zen/Hy3 Free"
+            },
+            {
+              "value": "opencode/mimo-v2.5-free",
+              "name": "OpenCode Zen/MiMo V2.5 Free"
+            },
+            {
+              "value": "opencode/nemotron-3-ultra-free",
+              "name": "OpenCode Zen/Nemotron 3 Ultra Free"
+            },
+            {
+              "value": "opencode/north-mini-code-free",
+              "name": "OpenCode Zen/North Mini Code Free"
+            },
+            {
+              "value": "local/qwen3-14b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-14B INT4 — everyday/fleet tier"
+            },
+            {
+              "value": "local/coder-30b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-Coder-30B-A3B INT4 — power tier (lean profile!)"
+            },
+            {
+              "value": "local/qwen3-vl-8b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-VL-8B INT4 — vision/screenshots"
+            }
+          ],
+          "id": "model",
+          "name": "Model",
+          "category": "model",
+          "type": "select"
+        },
+        {
+          "currentValue": "build",
+          "options": [
+            {
+              "value": "build",
+              "name": "build",
+              "description": "The default agent. Executes tools based on configured permissions."
+            },
+            {
+              "value": "critic",
+              "name": "critic",
+              "description": "Cross-model pre-merge code critic - finds ONLY real, test-checkable blockers; read-only, never edits, never runs tests or servers"
+            },
+            {
+              "value": "debug",
+              "name": "debug",
+              "description": "Evidence-first debugging - observe, hypothesize, smallest fix, verify"
+            },
+            {
+              "value": "plan",
+              "name": "plan",
+              "description": "Plan mode. Disallows all edit tools."
+            },
+            {
+              "value": "review",
+              "name": "review",
+              "description": "Read-only code reviewer - finds problems, never edits"
+            }
+          ],
+          "id": "mode",
+          "name": "Session Mode",
+          "category": "mode",
+          "type": "select"
+        }
+      ]
+    }
+  },
+  "cancel_sent_t_rel_s": 152.01,
+  "prompt_response": {
+    "stopReason": "end_turn",
+    "usage": {
+      "totalTokens": 0,
+      "inputTokens": 0,
+      "outputTokens": 0
+    },
+    "_meta": {}
+  },
+  "wall_clock_s": 152.574,
+  "stop_reason": "end_turn",
+  "event_count": 32,
+  "tool_call_event_count": 24,
+  "distinct_tool_calls": 6,
+  "tool_status_transitions": 24,
+  "permission_grants": 0,
+  "tool_call_summary": [
+    {
+      "id": "YD0XqcOIP",
+      "kind": "search",
+      "title": "glob",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    },
+    {
+      "id": "jOhxDFZlx",
+      "kind": "edit",
+      "title": "rpn.py",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    },
+    {
+      "id": "axXzDuY5Y",
+      "kind": "edit",
+      "title": "test_rpn.py",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    },
+    {
+      "id": "PA0Hsd3os",
+      "kind": "execute",
+      "title": "cd C:/Users/mrbla/projects/acp-spike-cancel2 && python -m pytest -q",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "in_progress",
+        "in_progress",
+        "in_progress",
+        "in_progress",
+        "completed"
+      ]
+    },
+    {
+      "id": "FFPfO26bQ",
+      "kind": "execute",
+      "title": "cd C:/Users/mrbla/projects/acp-spike-cancel2 && python -c \"from rpn import rpn_eval; print(rpn_eval('3 4 + 2 *'))\"",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "in_progress",
+        "in_progress",
+        "completed"
+      ]
+    },
+    {
+      "id": "OEKINJ1vc",
+      "kind": "other",
+      "title": "0 todos",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    }
+  ],
+  "stderr_log": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\run-20260709T223700Z.opencode-stderr.log"
+}

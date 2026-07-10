@@ -18,7 +18,11 @@
 param(
     [Parameter(Mandatory)][string]$AppDir,
     [Parameter(Mandatory)][string]$BaseBranch,
-    [string]$Model = 'qwen3-14b'
+    [string]$Model = 'qwen3-14b',
+    # #693: main's pre-dispatch HEAD SHA (recorded by swap_driver before the first task).
+    # Non-empty -> the diff range is "<sha>..HEAD" = ALL merged work, robust to a
+    # multi-commit fast-forward; empty -> the legacy Resolve-CriticRange chain.
+    [string]$BaseRef = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +34,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # critic.md has bash:deny; the agent cannot run git. We run it here and embed the output.
 # Resolve-CriticRange (fleet-lib.ps1) handles the #687 #9 empty-diff bug: post-merge on the base
 # branch "<base>...HEAD" is EMPTY (HEAD == base), so it falls back to the merged work's range.
-$criticRange = Resolve-CriticRange -Repo $AppDir -Base $BaseBranch
+$criticRange = Resolve-CriticRange -Repo $AppDir -Base $BaseBranch -BaseRef $BaseRef
 $diffStat = if ($criticRange) { (git -C $AppDir diff $criticRange --stat 2>$null) -join "`n" } else { '' }
 $diffFull = if ($criticRange) { (git -C $AppDir diff $criticRange 2>$null) -join "`n" } else { '' }
 # Truncate very large diffs; the critic can Read individual files for more context.

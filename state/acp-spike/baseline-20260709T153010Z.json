@@ -1,0 +1,21 @@
+{
+  "phase": "baseline",
+  "t_iso": "2026-07-09T22:32:07.6656524Z",
+  "cwd": "C:/Users/mrbla/projects/acp-spike-baseline",
+  "model": "local/coder-30b",
+  "prompt_chars": 1088,
+  "wall_clock_s": 117.343,
+  "timed_out": false,
+  "timeout_reason": "",
+  "capped": false,
+  "capped_reason": "",
+  "exit_code": 0,
+  "pin_refused": false,
+  "transcript": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\baseline-20260709T153010Z.transcript.json",
+  "transcript_bytes": 12215,
+  "step_finish_count": 5,
+  "tool_write_count": 2,
+  "any_tool_marks": 4,
+  "git_status_porcelain": "?? __pycache__/\n?? rpn.py\n?? test_rpn.py",
+  "git_diff_stat": ""
+}

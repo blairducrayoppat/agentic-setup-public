@@ -1,4 +1,4 @@
-﻿# Start the local AI model server with ONE resident model (the swap mechanism).
+# Start the local AI model server with ONE resident model (the swap mechanism).
 # Novice-friendly: checks memory first; if there isn't enough, it shows what is
 # using RAM and OFFERS to close things (always asks, closes gracefully so apps
 # can prompt you to save). Nothing is ever closed without your y/n.
@@ -21,6 +21,11 @@ $Ovms     = 'C:\ovms\ovms.exe'
 $Setup    = 'C:\Users\mrbla\agentic-setup'
 $StateDir = Join-Path $Setup 'state'
 $LogDir   = Join-Path $StateDir 'logs'
+# NOTE (#747): a #740/W7 attempt to add OVMS `--cache_dir` (compiled-model cache) was REVERTED
+# 2026-07-05 — on the continuous-batching LLM servable OVMS folds it into the plugin_config JSON as
+# CACHE_DIR, and the Windows backslash path made that JSON invalid ("Plugin config is in wrong
+# format"), so the 30B refused to load in the live-verify. The compile-cache optimisation is re-scoped
+# to #747 (correct mechanism + forward-slash/escaped path, tested against a live OVMS start first).
 $StoppedVms = Join-Path $StateDir 'stopped-vms.txt'
 New-Item -ItemType Directory -Force $StateDir, $LogDir | Out-Null
 if (-not (Test-Path $Ovms)) { throw "OVMS not found at $Ovms - run 02-install-ovms-and-models.ps1 first." }
@@ -72,7 +77,7 @@ switch ($Model) {
         # ENV var, not a CLI flag, so the inherited OVMS process below picks it up.
         # Added 2026-06-29 (BlarAI OpenVINO 2026.2 upgrade, §5 candidate A4). Measure the TTFT delta.
         $env:MOE_USE_MICRO_GEMM_PREFILL = '0'
-        $needGB = 21
+        $needGB = 20   # was 21; #777 measured 2026-07-09 — clean READY from 19.85 GiB, no storm (see blarai PERFORMANCE_LOG)
     }
     'qwen3-14b' {
         $path  = Find-OvDir @('C:\models\qwen3-14b', 'C:\Users\mrbla\BlarAI\models\qwen3-14b')
@@ -219,8 +224,21 @@ Start-Sleep -Seconds 2
 #   --model_path <dir>    local OpenVINO IR model (--source_model is HF-pull mode ONLY)
 #   --model_name          served name (= model id in opencode.json / openclaw.json)
 #   --rest_bind_address 127.0.0.1  REQUIRED - OVMS defaults to 0.0.0.0 (all interfaces)!
+#   --cache_size 4        KV-cache POOL size in GB (runtime attention cache) -- NOT the compile cache.
+#   --cache_dir <dir>     COMPILED-MODEL on-disk cache (#747). OVMS folds this into the CB LLM node's
+#                         plugin_config JSON as CACHE_DIR. The #740/W7 revert was a PATH-FORMAT bug, not
+#                         a mechanism bug: a Windows BACKSLASH path (C:\Users\...) makes the folded JSON
+#                         invalid (\U is not a valid JSON escape -> "Plugin config is in wrong format").
+#                         A FORWARD-SLASH path folds into valid JSON (docs example: --cache_dir
+#                         /models/.ov_cache). On GPU the cache is compiled kernels (.cl_cache), reused
+#                         across restarts for the same OVMS version/device/model/shape -> ~30-90s saved
+#                         per swap. Shared dir is safe (files are keyed per model). Live-tested against a
+#                         coder-30b start before merge (#747 non-negotiable).
+$ModelCacheDir = ((Join-Path $StateDir 'ovms-model-cache') -replace '\\','/')
+New-Item -ItemType Directory -Force $ModelCacheDir | Out-Null
 $args2 = @('--rest_port','8000','--rest_bind_address','127.0.0.1','--model_path',$path,'--model_name',$name,
-           '--task','text_generation','--target_device','GPU','--cache_size','4') + $extra
+           '--task','text_generation','--target_device','GPU','--cache_size','4',
+           '--cache_dir',$ModelCacheDir) + $extra
 
 # Dated server logs (rotated, keep newest 20) - these ARE the diagnostics when something dies later
 Get-ChildItem $LogDir -Filter 'ovms-*.log' -ErrorAction SilentlyContinue |
@@ -231,8 +249,13 @@ $OutLog = Join-Path $LogDir "ovms-$Model-$stamp.out.log"
 $ErrLog = Join-Path $LogDir "ovms-$Model-$stamp.err.log"
 
 Write-Host ""
-Write-Host "Starting $label ... (loading takes 30-90 seconds, this is normal)" -ForegroundColor Cyan
-$proc = Start-Process -FilePath $Ovms -ArgumentList $args2 -PassThru -WindowStyle Minimized `
+Write-Host "Starting $label ... (~15s on a warm compile cache; up to ~5 min COLD — the first load after install or an OVMS upgrade compiles + writes the .cl_cache, #747)" -ForegroundColor Cyan
+# -WindowStyle Hidden (2026-07-08, LA-requested; the #761/lesson-219 sweep's
+# console-children rule): OVMS is a non-interactive console server with stdout+
+# stderr fully file-redirected — its window carried nothing and was one
+# accidental click from killing a live dispatch. Hidden ONLY because it is not
+# a TUI: NEVER hide the BlarAI launcher (Textual crashes on a hidden console).
+$proc = Start-Process -FilePath $Ovms -ArgumentList $args2 -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog
 
 function Show-LogTail {
@@ -242,7 +265,10 @@ function Show-LogTail {
     Write-Host "Full log: $tailFile" -ForegroundColor Yellow
 }
 
-$deadline = (Get-Date).AddSeconds(240)
+# 480s (not 240): a COLD compile-cache load measured ~289s live (#747 — first compile +
+# writing ~15 GB of .cl_cache); 240 threw on it even though the model loaded fine. A WARM
+# load is ~12s, far under this. The ceiling only matters cold (first install / OVMS upgrade).
+$deadline = (Get-Date).AddSeconds(480)
 do {
     Start-Sleep -Seconds 3
     try {
@@ -269,7 +295,7 @@ do {
                     if ($py) {
                         try {
                             Start-Process -FilePath $py -ArgumentList $proxyPy `
-                                -WorkingDirectory (Join-Path $Setup 'tools') -WindowStyle Minimized | Out-Null
+                                -WorkingDirectory (Join-Path $Setup 'tools') -WindowStyle Hidden | Out-Null
                             Write-Host "Tool-call fixer started on http://127.0.0.1:8099 (the coding agent talks to it)." -ForegroundColor Green
                         } catch {
                             Write-Host "Could not auto-start the tool-call fixer ($($_.Exception.Message)); double-click tools\start-coding-proxy.cmd." -ForegroundColor Yellow
@@ -308,4 +334,4 @@ do {
     }
 } while ((Get-Date) -lt $deadline)
 Show-LogTail
-throw "The model server did not become ready in 240s. NOTE: your previous model was already stopped - double-click a model launcher to retry."
+throw "The model server did not become ready in 480s. NOTE: your previous model was already stopped - double-click a model launcher to retry."

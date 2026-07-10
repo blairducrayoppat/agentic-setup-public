@@ -310,6 +310,76 @@ Assert-True ([regex]::IsMatch($appXamlCs, '--test'))                 'WI18 [regr
 Assert-True ([regex]::IsMatch($appXamlCs, 'CalculatorTests'))        'WI19 [regression] App.xaml.cs still references CalculatorTests (--test wiring not removed)'
 
 # =============================================================================
+Section 'WC* -- web capture is HEADLESS + unattended-safe (#688 web tier, M2 B3/B5)'
+# The web design-loop capture (Tier WEB) is what the battery's node-web cards (B3 budget,
+# B5 habit) hit -- a web project has NO App.exe, so Tiers 1/2 skip and the headless Edge
+# tier renders the page OFF-SCREEN. These assertions LOCK that a battery web dispatch can
+# NEVER open a foreground window / full-desktop-grab (the overnight-unattended contract):
+#   - the web tier uses --headless=new (no visible window, no screen grab), and
+#   - Find-AppExe excludes node_modules so a stray dependency App.exe cannot mis-route a web
+#     project into Tier 2 (which LAUNCHES + SetForegroundWindow's the exe -- the screen-take).
+# $capSrc was read in the DC* section above.
+Assert-True ([regex]::IsMatch($capSrc, '(?ms)TIER WEB'))                'WC1 capture-app.ps1 has a headless web-render tier (TIER WEB)'
+Assert-Match $capSrc '--headless=new'                                  'WC2 [kill] the web tier launches Edge with --headless=new (no visible window / no full-desktop grab)'
+# The web tier ONLY fires when NO App.exe was resolved -> a web project routes here deterministically.
+Assert-True ([regex]::IsMatch($capSrc, '(?ms)TIER WEB.*?if \(-not \$resolvedExe\)')) 'WC3 [kill] the web tier is gated on -not $resolvedExe (only a project with no App.exe reaches it)'
+# THE MIS-ROUTE FIX (found live 2026-07-06): Find-AppExe must exclude node_modules, else a
+# stray node_modules\...\App.exe skips the headless web tier AND drives Tier 2 to launch +
+# foreground that arbitrary binary (an unattended screen-take + arbitrary-exec).
+$iFindApp = $capSrc.IndexOf('function Find-AppExe')
+$iFindWeb = $capSrc.IndexOf('function Find-WebEntry')
+$findAppBody = $capSrc.Substring($iFindApp, $iFindWeb - $iFindApp)
+Assert-Match $findAppBody 'node_modules'                               'WC4 [kill] Find-AppExe EXCLUDES node_modules (a stray dependency App.exe cannot mis-route a web job into the foreground Tier 2)'
+Assert-Match $capSrc "Find-WebEntry[\s\S]*?node_modules"               'WC5 Find-WebEntry also excludes node_modules (the web-entry search stays inside the project source)'
+# Tier 2 (capture-app-foreground.ps1) is the ONLY screen-taking tier; it requires an App.exe.
+Assert-True ($capSrc.IndexOf('capture-app-foreground.ps1') -lt $capSrc.IndexOf('TIER WEB')) 'WC6 the (screen-taking) foreground Tier 2 sits ABOVE the web tier and is App.exe-gated -- unreachable for a web project'
+
+Section 'WC* -- the coder browser (opencode playwright-mcp) is headless too'
+# During a web CODE task the coder drives a browser via playwright-mcp; it must run --headless
+# so a coding step never pops a visible browser window on the operator's screen either.
+$openCodeJsonPath = Join-Path (Split-Path $ScriptDir -Parent) 'configs\opencode.json'
+if (Test-Path $openCodeJsonPath) {
+    $ocSrc = Get-Content $openCodeJsonPath -Raw
+    Assert-Match $ocSrc 'playwright-mcp'                               'WC7 opencode.json wires the playwright-mcp browser tool'
+    # The browser command array must contain --headless (assert within the same command line as playwright-mcp).
+    Assert-True ([regex]::IsMatch($ocSrc, 'playwright-mcp[^\]]*--headless')) 'WC8 [kill] the coder browser command carries --headless (no visible browser window during a web CODE task)'
+} else {
+    _skip "WC7/WC8 opencode.json not found at $openCodeJsonPath (config-only; skipped)"
+}
+
+Section 'WC* -- end-to-end: a web project (even WITH a stray node_modules App.exe) captures HEADLESS tier=web'
+# The behavioural proof of WC2-WC4: build a throwaway web project that ALSO carries a stray
+# node_modules\...\App.exe (the exact mis-route trigger), run the REAL capture-app.ps1, and
+# assert it produced CAPTURE-OK tier=web -- i.e. it ignored the stray exe, skipped the
+# foreground tiers, and rendered headless. Needs a real msedge; skipped (never failed) if absent.
+$edgeCmd = Get-Command msedge -ErrorAction SilentlyContinue
+$edgeExe = if ($edgeCmd) { $edgeCmd.Source } elseif (Test-Path (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe')) { 'found' } elseif (Test-Path (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe')) { 'found' } else { $null }
+if ($edgeExe) {
+    $wcDir = Join-Path ([System.IO.Path]::GetTempPath()) ("fleet-webcap-{0}" -f ([guid]::NewGuid().ToString('N')))
+    $wcPng = Join-Path ([System.IO.Path]::GetTempPath()) ("fleet-webcap-{0}.png" -f ([guid]::NewGuid().ToString('N')))
+    try {
+        New-Item -ItemType Directory -Force (Join-Path $wcDir 'public') | Out-Null
+        Set-Content (Join-Path $wcDir 'public\index.html') '<!doctype html><html><head><title>t</title></head><body style="background:#123;color:#fff"><h1>web card</h1><button>add</button></body></html>' -Encoding UTF8
+        New-Item -ItemType Directory -Force (Join-Path $wcDir 'node_modules\pkg') | Out-Null
+        Set-Content (Join-Path $wcDir 'node_modules\pkg\App.exe') 'stray' -Encoding ASCII   # the mis-route trigger
+        $wcLines = @(& "$ScriptDir\capture-app.ps1" -AppDir $wcDir -OutPng $wcPng 2>&1)
+        $wcExit  = $LASTEXITCODE
+        $wcOk    = ($wcLines | Where-Object { $_ -match '^CAPTURE-OK:.*tier=web' } | Select-Object -Last 1)
+        $wcTier2 = ($wcLines | Where-Object { $_ -match 'tier=2' } | Select-Object -Last 1)
+        Assert-Eq 0 $wcExit 'WC9 [end-to-end] capture-app.ps1 exits 0 on a web project'
+        Assert-True ([bool]$wcOk)     'WC10 [kill][end-to-end] a web project WITH a stray node_modules App.exe still captures CAPTURE-OK tier=web (headless; the stray exe was ignored)'
+        Assert-False ([bool]$wcTier2) 'WC11 [kill][end-to-end] the run NEVER used the foreground Tier 2 (no tier=2 in output)'
+        Assert-True (Test-Path $wcPng) 'WC12 [end-to-end] a real PNG was written by the headless web tier'
+    } finally {
+        Remove-Item $wcDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $wcPng -Force -ErrorAction SilentlyContinue
+        Remove-Item "$wcPng.json" -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    _skip 'WC9-WC12 msedge not found -- end-to-end headless web capture is an on-hardware step (skipped, never failed)'
+}
+
+# =============================================================================
 Section 'Result'
 Write-Host ("  Passed:  {0}" -f $script:Pass) -ForegroundColor Green
 if ($script:Skip) { Write-Host ("  Skipped: {0}" -f $script:Skip) -ForegroundColor Yellow }

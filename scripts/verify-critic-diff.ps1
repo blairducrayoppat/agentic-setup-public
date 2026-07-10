@@ -13,6 +13,9 @@
     S2 non-FF merge commit-> "HEAD~1..HEAD", agent's work only, excludes main's own commit
     S3 FF single commit   -> "HEAD~1..HEAD"   (drop the fallback -> S2/S3 flip to "")
     S4 nothing to review  -> ""               (return non-empty when nothing resolves -> S4 flips)
+    S5 FF MULTI-commit + -BaseRef -> "<sha>..HEAD" shows ALL commits (#693; without the base
+       the legacy fallback shows only the LAST commit -- asserted as the documented gap)
+    S6 -BaseRef invalid/unchanged -> falls through to the legacy chain (fallback preserved)
 #>
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\fleet-lib.ps1"
@@ -68,6 +71,31 @@ try {
     $r = New-Repo r4; Add-Commit $r a.txt A A
     $rng = Resolve-CriticRange -Repo $r -Base main
     Assert ($rng -eq '') "S4 single commit / no diff -> '' (got '$rng')"
+
+    # S5 (#693): FF MULTI-commit merge -- the gap the base SHA closes. Record main's
+    # pre-dispatch HEAD, merge a 2-commit agent branch fast-forward, then:
+    #   with -BaseRef -> "<sha>..HEAD" and the diff shows BOTH commits' files;
+    #   without      -> the legacy HEAD~1..HEAD shows ONLY the last (the documented gap).
+    $r = New-Repo r5; Add-Commit $r a.txt A A
+    $preSha = (git -C $r rev-parse HEAD 2>$null)
+    & git -C $r checkout -q -b agent/multi 2>$null
+    Add-Commit $r f1.txt F1 'commit 1'; Add-Commit $r f2.txt F2 'commit 2'
+    & git -C $r checkout -q main 2>$null
+    $ErrorActionPreference = 'Continue'; git -C $r merge agent/multi --ff-only -q 2>$null; $ErrorActionPreference = 'Stop'
+    $rng = Resolve-CriticRange -Repo $r -Base main -BaseRef $preSha
+    Assert ($rng -eq "$preSha..HEAD") "S5 FF multi-commit + BaseRef -> '<sha>..HEAD' (got '$rng')"
+    $names = Names $r $rng
+    Assert (($names -match 'f1\.txt') -and ($names -match 'f2\.txt')) "S5 BaseRef range shows BOTH f1.txt and f2.txt"
+    $legacy = Resolve-CriticRange -Repo $r -Base main
+    Assert (($legacy -eq 'HEAD~1..HEAD') -and -not ((Names $r $legacy) -match 'f1\.txt')) `
+        "S5 legacy fallback (no BaseRef) misses f1.txt -- the documented gap BaseRef closes"
+
+    # S6 (#693): an invalid or diff-less BaseRef falls through to the legacy chain.
+    $rng = Resolve-CriticRange -Repo $r -Base main -BaseRef 'deadbeef0000'
+    Assert ($rng -eq 'HEAD~1..HEAD') "S6 invalid BaseRef falls through to legacy (got '$rng')"
+    $headSha = (git -C $r rev-parse HEAD 2>$null)
+    $rng = Resolve-CriticRange -Repo $r -Base main -BaseRef $headSha
+    Assert ($rng -eq 'HEAD~1..HEAD') "S6 BaseRef==HEAD (empty diff) falls through to legacy (got '$rng')"
 }
 finally {
     $ErrorActionPreference = 'Continue'

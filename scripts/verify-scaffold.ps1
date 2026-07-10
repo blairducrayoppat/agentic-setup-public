@@ -128,6 +128,12 @@ try {
     Assert-True ($seededWeb -contains 'package.json') 'C8 web: seeds package.json'
     Assert-True (Test-Path (Join-Path $tmp 'src\server.js')) 'C8 web: nested src/server.js lands'
     Assert-True (Test-Path (Join-Path $tmp 'public\index.html')) 'C8 web: nested public/index.html lands'
+    $seededNcli = @(Copy-ScaffoldInto -Scaffold 'node-cli' -Worktree $tmp)
+    Assert-True ($seededNcli -contains 'package.json') 'C8b node-cli: seeds package.json'
+    Assert-True (Test-Path (Join-Path $tmp 'src\core.mjs')) 'C8b node-cli: nested src/core.mjs lands (the testable helper)'
+    Assert-True (Test-Path (Join-Path $tmp 'bin\cli.mjs')) 'C8b node-cli: nested bin/cli.mjs lands (the thin argv entry)'
+    Assert-True (Test-Path (Join-Path $tmp 'test\core.test.mjs')) 'C8b node-cli: nested test/core.test.mjs lands (node:test, offline)'
+    Assert-True (-not ($seededNcli -contains 'server.js')) 'C8b [kill] node-cli is a CLI, NOT a web server -> its seed carries no server.js'
     $seededDn = @(Copy-ScaffoldInto -Scaffold 'dotnet-console' -Worktree $tmp)
     Assert-True ($seededDn -contains 'app.csproj') 'C9 dotnet-console: seeds app.csproj'
     Assert-True ($seededDn -contains 'Program.cs')  'C9 dotnet-console: seeds Program.cs (thin entry point)'

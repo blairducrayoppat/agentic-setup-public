@@ -1,0 +1,13 @@
+{
+  "name": "app",
+  "version": "0.1.0",
+  "description": "Node.js command-line skeleton: pure helper modules under src/, a thin argv entry under bin/, tests via the built-in node:test runner. Zero dependencies (builds + tests offline). Extend this — add helper modules under src/ and matching tests under test/; do NOT author loose top-level scripts.",
+  "type": "module",
+  "bin": {
+    "app": "bin/cli.mjs"
+  },
+  "scripts": {
+    "start": "node bin/cli.mjs",
+    "test": "node --test"
+  }
+}

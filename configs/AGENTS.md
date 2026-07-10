@@ -17,7 +17,7 @@
 - Keep replies short: what changed, where, how it was verified. No recaps of unchanged code.
 - Ask before anything destructive (delete, push, reset).
 - When a task is complete and verified, save a snapshot: `git add -A` then `git commit -m "<one line: what changed>"`. Never push. The user does not use git — handle version control for them, silently.
-- Never touch C:\Users\mrbla\BlarAI or anything under \~/.openclaw or \~/.ssh.
+- Never touch C:\Users\mrbla\BlarAI or anything under ~/.openclaw or ~/.ssh.
 - Ports 8000 (the local AI model server) and 8099 (its proxy) are YOUR OWN runtime — never kill, restart, or bind to them. Any server you start must use port 8081 or higher.
 - Never run a blocking server command in the foreground and wait for it — it will hang. Tell the user the command to run instead.
 - **The `bash` tool here runs git-bash (Unix-style bash), NOT PowerShell.** To READ or SEARCH files, use the dedicated `read` and `grep` tools instead of shell commands. When you genuinely need the shell, use Unix commands (`ls`, `cat`, `mkdir -p`, `rm`, `cp`, `grep`) — PowerShell cmdlets (`Get-ChildItem`, `Copy-Item`, …) are NOT available here and will error.

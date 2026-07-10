@@ -1,0 +1,17 @@
+{
+  "phase": "recon",
+  "t_iso": "2026-07-09T21:35:05.697262+00:00",
+  "cwd": "C:/Users/mrbla/projects/acp-spike-sandbox",
+  "sdk_protocol_version": 1,
+  "records": {},
+  "error": "FileNotFoundError: [WinError 2] The system cannot find the file specified",
+  "plugin_parity": {
+    "markers": {
+      "command-timeout": false,
+      "path-normalize": false
+    },
+    "loader_errors": [],
+    "stderr_log": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\recon-20260709T213505Z.opencode-stderr.log",
+    "stderr_bytes": 0
+  }
+}

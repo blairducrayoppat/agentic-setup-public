@@ -62,6 +62,9 @@ $RunBatchFromPlan = {
         $out += @{
             Index = $k; VerifyResult = $p.Verify; TestResult = $p.Test; HasChanges = [bool]$p.Changes
             TimedOut = [bool]$p.TimedOut; SecretBlocked = [bool]$p.Secret; LoopSuspected = [bool]$p.Loop; Tag = "c$k"
+            # #740/W7: mirror the production candidate's nested circuit-breaker reason ('idle' | 'ceiling' | '')
+            # so the reason-aware StopSampling can distinguish an idle stall from a wall-clock ceiling.
+            Run = @{ TimeoutReason = "$($p.Reason)" }
         }
     }
     return $out
@@ -216,6 +219,98 @@ Assert-True  $r.Stopped       'a timeout in the batch stopped sampling'
 Assert-Eq  0 $r.SelectedIndex 'a timed-out candidate is NEVER selected over an earlier real attempt'
 
 # ============================================================================
+Section 'Invoke-BestOfNBatched - #740/W7: an IDLE timeout is RESAMPLE-eligible; CEILING/secret stay terminal (under batching)'
+# ============================================================================
+# The production wiring: the injected StopSampling delegates to Test-IsSamplingTerminal, reading the
+# candidate's nested .Run.TimeoutReason -- byte-identical to new-agent-task.ps1. The batch posture invariant
+# (#695 section 6) is PRESERVED: a batch holding a ceiling/secret candidate still terminates sampling; a
+# batch holding only idle candidates does NOT.
+$StopReasonAware = { param($r) Test-IsSamplingTerminal -SecretBlocked $r.SecretBlocked -TimedOut $r.TimedOut -TimeoutReason "$($r.Run.TimeoutReason)" }
+
+# (a) an IDLE candidate does NOT stop sampling -> the next batch launches (C=1 -> each candidate is its own batch).
+$script:Plan = @(
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },  # c1 idle (batch 1)
+    @{ Verify='pass'; Test='pass'; Changes=$true },                                   # c2 green (batch 2)
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                    # c3 never runs
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 3 -Concurrency 1 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-True  $r.WinnerFound           'idle c1 did not stop batching -> a fresh c2 batch reached green'
+Assert-False $r.Stopped               'an idle stall is not a terminal stop under batching'
+Assert-Eq  1 $r.SelectedIndex         'c2 (index 1) is the winner, not the idle c1'
+Assert-Eq  2 $script:batchCalls.Count 'the batch AFTER the idle stall launched (idle is resample-eligible; the 2026-07-03 no-op fix under concurrency)'
+
+# (b) a CEILING candidate STAYS terminal -> stop launching further batches.
+$script:Plan = @(
+    @{ Verify='fail'; Test='fail'; Changes=$true },                                    # c1 real fail (batch 1)
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='ceiling' }, # c2 ceiling (batch 2) -> terminal
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                     # c3 never runs
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 3 -Concurrency 1 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-True  $r.Stopped               'a ceiling timeout STAYS terminal under batching -> stop launching further batches'
+Assert-Eq  2 $script:batchCalls.Count 'stopped after the ceiling batch (the c3 batch never launched)'
+Assert-Eq  0 $r.SelectedIndex         'best-partial picks the real failing c1 over the ceiling c2'
+
+# (posture) a SINGLE batch holding BOTH an idle AND a ceiling candidate STILL terminates (ceiling wins; idle
+# alone would not have). The concurrent analogue of the section-6 secret/timeout-in-one-batch posture.
+$script:Plan = @(
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },    # c1 idle    (same batch)
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='ceiling' }, # c2 ceiling (same batch)
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                     # c3 never runs
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 3 -Concurrency 2 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-True  $r.Stopped               'a batch containing a CEILING candidate terminates sampling even though it also holds an idle candidate'
+Assert-Eq  1 $script:batchCalls.Count 'the ceiling stopped the batch loop (the second wave holding c3 never launched)'
+
+# (posture) a green winner alongside a co-batch idle candidate STILL wins (green is never terminal).
+$script:Plan = @(
+    @{ Verify='pass'; Test='pass'; Changes=$true },                                  # c1 GREEN
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' }    # c2 idle (same batch)
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 2 -Concurrency 2 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-True  $r.WinnerFound   'a clean green winner takes precedence over a co-batch idle candidate'
+Assert-Eq  0 $r.SelectedIndex 'the green c1 is selected, not the idle c2'
+Assert-False $r.Stopped       'a winning batch is not a stop'
+
+# (c) a SECRET stays terminal even alongside an idle reason (secret dominates -> surface to a human).
+$script:Plan = @(
+    @{ Verify='fail'; Test='fail'; Changes=$true },                                              # c1 real fail (batch 1)
+    @{ Verify='none'; Test='none'; Changes=$true; Secret=$true; TimedOut=$true; Reason='idle' }, # c2 secret + idle (batch 2)
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                               # c3 never runs
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 3 -Concurrency 1 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-True  $r.Stopped               'a secret-block stays terminal under batching even with an idle reason present'
+Assert-Eq  2 $script:batchCalls.Count 'stopped at the secret batch (the c3 batch never launched)'
+Assert-True (@($r.Candidates | Where-Object { $_.SecretBlocked }).Count -ge 1) 'the secret candidate is surfaced in Candidates for the caller to park'
+
+# (d) an empty/unknown reason is treated as CEILING (terminal) under batching too.
+$script:Plan = @(
+    @{ Verify='fail'; Test='fail'; Changes=$true },                            # c1 real fail (batch 1)
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='' }, # c2 unknown reason (batch 2) -> ceiling = terminal
+    @{ Verify='pass'; Test='pass'; Changes=$true }                             # c3 never runs
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 3 -Concurrency 1 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-True  $r.Stopped               'empty/unknown reason under batching -> terminal (safe default = ceiling)'
+Assert-Eq  2 $script:batchCalls.Count 'stopped at the unknown-reason batch (does not silently resample an unreadable reason)'
+
+# (e) an all-idle storm resamples across waves but is BOUNDED by MaxCandidates -> runs N, then parks.
+$script:Plan = @(
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' }
+)
+Reset-Rec
+$r = Invoke-BestOfNBatched -MaxCandidates 3 -Concurrency 2 -RunBatch $RunBatchFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnBatch $OnBatch
+Assert-False $r.WinnerFound  'an all-idle storm produces no winner'
+Assert-False $r.Stopped      'no terminal stop - every idle candidate is resample-eligible'
+Assert-Eq  3 $r.Count        'idle resamples BOUNDED by MaxCandidates (exactly N=3 ran across the waves) -> then park (no new budget)'
+
+# ============================================================================
 Section 'Invoke-BestOfNBatched - no winner across batches => best PARTIAL by gate rank'
 # ============================================================================
 $script:Plan = @(
@@ -334,6 +429,13 @@ Assert-True ([regex]::IsMatch($nat, 'Start-Job'))                            'ne
 Assert-True ([regex]::IsMatch($nat, 'Invoke-CandidateBuild'))                'new-agent-task runs each concurrent candidate through Invoke-CandidateBuild'
 Assert-True ([regex]::IsMatch($nat, '(?m)^\s*\$bon\s*=\s*Invoke-BestOfN\b')) 'the SEQUENTIAL best-of-N path (C=1) is preserved (Invoke-BestOfN still wired, byte-identical)'
 Assert-True ([regex]::IsMatch($runFleet, '\$params\.Concurrency'))           'run-fleet forwards a concurrency override to new-agent-task'
+
+# #740/W7 idle-resample wiring: the best-of-N terminal decision now delegates to the reason-aware SSOT so an
+# IDLE stall no longer collapses N=3 to N=1. These mutation-lock BOTH the helper's existence and the wiring.
+Assert-True ([regex]::IsMatch($lib, 'function Test-IsSamplingTerminal'))                       'fleet-lib defines Test-IsSamplingTerminal (the reason-aware terminal SSOT, #740/W7)'
+Assert-Eq 2 ([regex]::Matches($nat, 'StopSampling\s*\{[^}]*Test-IsSamplingTerminal').Count)    'BOTH best-of-N paths (sequential + concurrent) delegate StopSampling to Test-IsSamplingTerminal'
+Assert-True ([regex]::IsMatch($nat, 'StopSampling\s*\{[^}]*TimeoutReason'))                    'the StopSampling predicate reads the candidate timeout REASON (idle vs ceiling), not just TimedOut'
+Assert-False ([regex]::IsMatch($nat, '\(\[bool\]\$c\.SecretBlocked\)\s*-or\s*\(\[bool\]\$c\.TimedOut\)')) '[kill] the pre-change blanket "secret OR any timeout" StopSampling is GONE (an idle timeout no longer stops best-of-N)'
 
 # ============================================================================
 Section 'Wiring: #700 unification -- ONE per-candidate pipeline (Invoke-CandidateBuild), no duplicated gate body'

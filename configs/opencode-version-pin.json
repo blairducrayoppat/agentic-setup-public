@@ -1,0 +1,7 @@
+{
+  "version": "1.17.8",
+  "exe_path": "C:/Users/mrbla/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe",
+  "sha256": "5FA54E6DB7F546DE4F2E7720AE9060315CFDC54EAC3C6373E8A7A28F1E357BDC",
+  "pinned_at": "2026-07-08",
+  "note": "#762 version pin - the exact opencode release the fleet is validated against. autoupdate:false in opencode.json. A deliberate upgrade must update this manifest + re-run the canary before serving real dispatches."
+}

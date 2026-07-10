@@ -1,0 +1,31 @@
+timestamp=2026-07-09T21:36:15.535Z level=INFO run=0d801e96 message="creating instance" directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"
+timestamp=2026-07-09T21:36:15.536Z level=INFO run=0d801e96 message=fromDirectory directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"
+timestamp=2026-07-09T21:36:15.719Z level=INFO run=0d801e96 message=bootstrapping directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"
+timestamp=2026-07-09T21:36:15.723Z level=INFO run=0d801e96 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\config.json"
+timestamp=2026-07-09T21:36:15.724Z level=INFO run=0d801e96 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.json"
+timestamp=2026-07-09T21:36:15.731Z level=INFO run=0d801e96 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.jsonc"
+[path-normalize] loaded: Windows drive-path backslashes in bash commands -> forward slashes
+[command-timeout] loaded: bash/shell commands capped at 300000ms (server probe 10000ms)
+timestamp=2026-07-09T21:36:15.800Z level=INFO run=0d801e96 message="all LSPs are disabled"
+timestamp=2026-07-09T21:36:15.801Z level=INFO run=0d801e96 message="all formatters are disabled"
+timestamp=2026-07-09T21:36:15.801Z level=INFO run=0d801e96 message=init
+timestamp=2026-07-09T21:36:15.975Z level=INFO run=0d801e96 message="setup connection"
+timestamp=2026-07-09T21:36:16.016Z level=INFO run=0d801e96 message="global event connected"
+timestamp=2026-07-09T21:36:16.031Z level=INFO run=0d801e96 message="creating instance" directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"
+timestamp=2026-07-09T21:36:16.031Z level=INFO run=0d801e96 message=fromDirectory directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"
+timestamp=2026-07-09T21:36:16.168Z level=INFO run=0d801e96 message=bootstrapping directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"
+timestamp=2026-07-09T21:36:16.169Z level=INFO run=0d801e96 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\config.json"
+timestamp=2026-07-09T21:36:16.169Z level=INFO run=0d801e96 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.json"
+timestamp=2026-07-09T21:36:16.172Z level=INFO run=0d801e96 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.jsonc"
+[path-normalize] loaded: Windows drive-path backslashes in bash commands -> forward slashes
+[command-timeout] loaded: bash/shell commands capped at 300000ms (server probe 10000ms)
+timestamp=2026-07-09T21:36:16.186Z level=INFO run=0d801e96 message="all LSPs are disabled"
+timestamp=2026-07-09T21:36:16.187Z level=INFO run=0d801e96 message="all formatters are disabled"
+timestamp=2026-07-09T21:36:16.187Z level=INFO run=0d801e96 message=init
+timestamp=2026-07-09T21:36:16.375Z level=INFO run=0d801e96 message="booting location services" directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox" workspaceID=undefined
+timestamp=2026-07-09T21:36:16.380Z level=INFO run=0d801e96 message=init count=28
+timestamp=2026-07-09T21:36:16.658Z level=INFO run=0d801e96 message="watcher backend" directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox" platform=win32 backend=windows
+timestamp=2026-07-09T21:36:17.020Z level=INFO run=0d801e96 message="project copy refresh started" projectID=38f63ccbb0679d615d706a9aafb76204ab684311
+timestamp=2026-07-09T21:36:17.027Z level=INFO run=0d801e96 message=created id=ses_0b730a37cffe15Krl7noGQ5HrC slug=swift-panda version=1.17.8 projectID=38f63ccbb0679d615d706a9aafb76204ab684311 directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox" path="" workspaceID=undefined parentID=undefined title="New session - 2026-07-09T21:36:17.027Z" agent=build model.id=qwen3-14b model.providerID=local metadata=undefined permission=undefined cost=0 tokens.input=0 tokens.output=0 tokens.reasoning=0 tokens.cache.read=0 tokens.cache.write=0 time.created=1783632977027 time.updated=1783632977027
+timestamp=2026-07-09T21:36:17.179Z level=INFO run=0d801e96 message="project copy refresh done" projectID=38f63ccbb0679d615d706a9aafb76204ab684311 updated=[] removed=[]
+timestamp=2026-07-09T21:36:18.056Z level=INFO run=0d801e96 message="disposing instance" directory="C:\\Users\\mrbla\\projects\\acp-spike-sandbox"

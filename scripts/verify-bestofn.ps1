@@ -100,6 +100,9 @@ $RunFromPlan = {
         TimedOut     = [bool]$p.TimedOut
         SecretBlocked= [bool]$p.Secret
         LoopSuspected= [bool]$p.Loop
+        # #740/W7: the production candidate nests the circuit-breaker reason under .Run.TimeoutReason
+        # ('idle' | 'ceiling' | ''); mirror that so the reason-aware StopSampling can read it.
+        Run          = @{ TimeoutReason = "$($p.Reason)" }
         Tag          = "c$Index"
     }
 }
@@ -311,6 +314,88 @@ Reset-Recorders
 $r = Invoke-BestOfN -MaxCandidates 3 -RunCandidate $RunFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $Stop
 Assert-True  $r.WinnerFound 'green winner found even with StopSampling wired'
 Assert-False $r.Stopped     'a winner is not a stop'
+
+# ============================================================================
+Section 'Test-IsSamplingTerminal - reason-aware terminal classification (#740/W7)'
+# ============================================================================
+# The SSOT the production -StopSampling delegates to. An IDLE stall is a random per-build slip
+# (resample-eligible); a wall-clock CEILING, an empty/unknown reason (safe default), and a secret stay
+# terminal. Drives the REAL helper directly (mutation-resistant unit coverage).
+Assert-True  (Test-IsSamplingTerminal -TimedOut $true  -TimeoutReason 'ceiling' -SecretBlocked $false) 'ceiling timeout => terminal'
+Assert-False (Test-IsSamplingTerminal -TimedOut $true  -TimeoutReason 'idle'    -SecretBlocked $false) 'idle timeout => NOT terminal (resample-eligible)'
+Assert-True  (Test-IsSamplingTerminal -TimedOut $true  -TimeoutReason ''        -SecretBlocked $false) 'empty/unknown reason => terminal (safe default = ceiling)'
+Assert-True  (Test-IsSamplingTerminal -TimedOut $true  -TimeoutReason 'idle'    -SecretBlocked $true)  'secret DOMINATES: idle + secret => terminal (surface to a human)'
+Assert-True  (Test-IsSamplingTerminal -TimedOut $false -TimeoutReason ''        -SecretBlocked $true)  'secret (no timeout) => terminal'
+Assert-False (Test-IsSamplingTerminal -TimedOut $false -TimeoutReason ''        -SecretBlocked $false) 'no timeout + no secret => not terminal'
+Assert-False (Test-IsSamplingTerminal -TimedOut $true  -TimeoutReason 'IDLE'    -SecretBlocked $false) 'reason match is case-insensitive (IDLE => not terminal)'
+
+# ============================================================================
+Section 'Invoke-BestOfN - #740/W7: an IDLE timeout is RESAMPLE-eligible; CEILING/secret stay terminal'
+# ============================================================================
+# The production wiring: the injected StopSampling delegates to Test-IsSamplingTerminal, reading the
+# candidate's nested .Run.TimeoutReason -- byte-identical to new-agent-task.ps1.
+$StopReasonAware = { param($r) Test-IsSamplingTerminal -SecretBlocked $r.SecretBlocked -TimedOut $r.TimedOut -TimeoutReason "$($r.Run.TimeoutReason)" }
+
+# (a) idle-timeout candidate -> resample FIRES: a fresh candidate runs and can win (the 2026-07-03 no-op fix).
+$script:Plan = @(
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },   # c1 IDLE stall (read a couple files, went silent)
+    @{ Verify='pass'; Test='pass'; Changes=$true },                                    # c2 fresh independent sample lands green
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                     # c3 never runs (c2 won)
+)
+Reset-Recorders
+$r = Invoke-BestOfN -MaxCandidates 3 -RunCandidate $RunFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnCandidate $OnCand
+Assert-True  $r.WinnerFound          'idle-timeout c1 did NOT stop sampling -> a fresh c2 reached green'
+Assert-False $r.Stopped              'an idle stall is not a terminal stop'
+Assert-Eq  1 $r.SelectedIndex        'the fresh sample (c2) is the winner, not the idle c1'
+Assert-Eq  2 $script:runCalls.Count  'best-of-N resampled PAST the idle stall (c2 ran) - the N=3->N=1 collapse that no-op''d the 2026-07-03 dispatch is fixed'
+
+# (b) ceiling-timeout candidate -> STAYS terminal: stop sampling (the #689 expensive-runaway invariant).
+$script:Plan = @(
+    @{ Verify='fail'; Test='fail'; Changes=$true },                                    # c1 real failed build (outranks a timeout)
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='ceiling' }, # c2 CEILING wall-clock hit -> terminal
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                     # c3 never runs
+)
+Reset-Recorders
+$r = Invoke-BestOfN -MaxCandidates 3 -RunCandidate $RunFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnCandidate $OnCand
+Assert-False $r.WinnerFound          'a ceiling timeout is not a win'
+Assert-True  $r.Stopped              'a wall-clock CEILING timeout STAYS terminal -> stop sampling'
+Assert-Eq  2 $script:runCalls.Count  'stopped at the ceiling timeout (c3 never generated)'
+Assert-Eq  0 $r.SelectedIndex        'best-partial picks the earlier REAL attempt over the ceiling-timed-out one'
+
+# (c) secret-block -> STAYS terminal, even if the candidate ALSO idled (secret dominates -> surface to a human).
+$script:Plan = @(
+    @{ Verify='fail'; Test='fail'; Changes=$true },                                          # c1
+    @{ Verify='none'; Test='none'; Changes=$true; Secret=$true; TimedOut=$true; Reason='idle' }, # c2 SECRET + idle -> terminal (secret wins)
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                           # c3 never runs
+)
+Reset-Recorders
+$r = Invoke-BestOfN -MaxCandidates 3 -RunCandidate $RunFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnCandidate $OnCand
+Assert-True  $r.Stopped              'a secret-block STAYS terminal even with an idle reason present (secret is never sampled-away)'
+Assert-Eq  2 $script:runCalls.Count  'stopped at the secret (c3 never generated)'
+Assert-True (@($r.Candidates | Where-Object { $_.SecretBlocked }).Count -ge 1) 'the secret candidate is surfaced in Candidates for the caller to park'
+
+# (d) empty/unknown reason -> treated as CEILING (terminal) -- the safe default, never a silent resample.
+$script:Plan = @(
+    @{ Verify='fail'; Test='fail'; Changes=$true },                                # c1 real fail
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='' },     # c2 UNKNOWN reason -> safe default = ceiling = terminal
+    @{ Verify='pass'; Test='pass'; Changes=$true }                                 # c3 never runs
+)
+Reset-Recorders
+$r = Invoke-BestOfN -MaxCandidates 3 -RunCandidate $RunFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnCandidate $OnCand
+Assert-True  $r.Stopped              'an empty/unknown timeout reason is treated as CEILING (terminal) - the safe default'
+Assert-Eq  2 $script:runCalls.Count  'stopped at the unknown-reason timeout (does not silently resample an unreadable reason)'
+
+# (e) an all-idle storm resamples but is BOUNDED by the existing MaxCandidates budget -> runs N, then parks.
+$script:Plan = @(
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },  # c1 idle
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' },  # c2 idle
+    @{ Verify='none'; Test='none'; Changes=$false; TimedOut=$true; Reason='idle' }   # c3 idle
+)
+Reset-Recorders
+$r = Invoke-BestOfN -MaxCandidates 3 -RunCandidate $RunFromPlan -IsWinner $IsWinner -ScoreCandidate $Score -StopSampling $StopReasonAware -OnCandidate $OnCand
+Assert-False $r.WinnerFound          'an all-idle storm produces no winner'
+Assert-False $r.Stopped              'no terminal stop - every idle candidate is resample-eligible'
+Assert-Eq  3 $script:runCalls.Count  'idle resamples are BOUNDED by the existing MaxCandidates budget (exactly N=3, never unbounded) -> then park (no new budget added)'
 
 # ----------------------------------------------------------------------------
 # LIVE end-to-end (opt-in): a real dispatch through new-agent-task.ps1.

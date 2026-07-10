@@ -261,6 +261,14 @@ Assert-False (Test-ShouldResample -VerifyResult 'fail' -TestResult 'fail' -Timed
 Assert-False (Test-ShouldResample -VerifyResult 'fail' -TestResult 'none' -TimedOut $false -SecretBlocked $false -Attempt 3 -MaxAttempts 3) 'V7 verify FAIL but cap reached -> do NOT resample'
 Assert-True  (Test-ShouldResample -VerifyResult 'fail' -TestResult 'none' -TimedOut $false -SecretBlocked $false -Attempt 2 -MaxAttempts 3) 'V8 verify FAIL, attempt 2 of 3 -> resample'
 Assert-False (Test-ShouldResample -VerifyResult 'fail' -TestResult 'none' -TimedOut $false -SecretBlocked $false -Attempt 1 -MaxAttempts 1) 'V9 single-attempt cap (max 1) -> never resamples'
+# #740/W7: an IDLE-reason timeout is a random per-build slip -> resample-eligible (bounded by MaxAttempts); a
+# CEILING timeout, an empty/unknown reason (-> ceiling), and a secret stay terminal. $TimeoutReason defaults
+# to '' so V5 above (no reason passed) keeps the pre-change "any timeout is terminal" behaviour byte-identical.
+Assert-True  (Test-ShouldResample -VerifyResult 'none' -TestResult 'none' -TimedOut $true -SecretBlocked $false -Attempt 1 -MaxAttempts 3 -TimeoutReason 'idle')    'V9a IDLE timeout (no gate fail) -> RESAMPLE (routes around the stall)'
+Assert-False (Test-ShouldResample -VerifyResult 'none' -TestResult 'none' -TimedOut $true -SecretBlocked $false -Attempt 1 -MaxAttempts 3 -TimeoutReason 'ceiling') 'V9b CEILING timeout stays terminal -> do NOT resample'
+Assert-False (Test-ShouldResample -VerifyResult 'none' -TestResult 'none' -TimedOut $true -SecretBlocked $false -Attempt 1 -MaxAttempts 3 -TimeoutReason '')        'V9c empty/unknown reason -> treated as ceiling (terminal)'
+Assert-False (Test-ShouldResample -VerifyResult 'none' -TestResult 'none' -TimedOut $true -SecretBlocked $false -Attempt 3 -MaxAttempts 3 -TimeoutReason 'idle')    'V9d IDLE timeout at the cap -> bounded, do NOT resample (no infinite idle loop)'
+Assert-False (Test-ShouldResample -VerifyResult 'none' -TestResult 'none' -TimedOut $true -SecretBlocked $true  -Attempt 1 -MaxAttempts 3 -TimeoutReason 'idle')    'V9e secret DOMINATES an idle reason -> terminal (surface to a human)'
 # V10 wiring (#689): the OUTER build loop is now BEST-OF-N -- up to N independent diverse candidates, the
 # deterministic gate selects the winner (or best partial). It REPLACED the serial Test-ShouldContinue
 # multi-pass loop (whose build dimension was the error-feedback re-fix the weak model is worst at). The

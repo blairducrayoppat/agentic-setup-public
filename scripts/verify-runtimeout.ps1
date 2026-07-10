@@ -177,6 +177,51 @@ Assert-True $r.Stop            'D3 disabling idle does NOT disable the ceiling'
 Assert-Eq  'ceiling' $r.Reason 'D3 ceiling still fires with idle disabled'
 
 # ============================================================================
+Section 'Honest timeout labelling (#740/W7 no-op diagnosis)'
+# ============================================================================
+# The idle circuit-breaker and the wall-clock ceiling BOTH set TimedOut, but they are
+# DIFFERENT failures. Pre-#740 the report + anomaly text called an idle stall a
+# "wall-clock timeout" -- the mis-label that sent the M2 no-op diagnosis chasing a
+# phantom retry-budget bug (2 of 3 landing-site runs no-op'd this way, 2026-07-03).
+# These lock the honest phrasing. Both functions are PURE (no model / no OVMS).
+
+# --- Get-TimeoutStopText (the report's BUILD: line) ---
+$idleTxt = Get-TimeoutStopText -Reason 'idle' -MaxRunMinutes 60 -IdleTimeoutSec 240
+Assert-True  ($idleTxt -match 'idle')    'T1 idle stop text names the idle stall'
+Assert-True  ($idleTxt -match '240')     'T1 idle stop text carries IdleTimeoutSec, not the ceiling'
+Assert-False ($idleTxt -match '60-min')  'T1 idle stop text does NOT claim the 60-min wall-clock kill'
+
+$ceilTxt = Get-TimeoutStopText -Reason 'ceiling' -MaxRunMinutes 60 -IdleTimeoutSec 240
+Assert-True  ($ceilTxt -match '60-min')  'T2 ceiling stop text names the hard ceiling in minutes'
+Assert-False ($ceilTxt -match 'idle')    'T2 ceiling stop text does NOT say idle'
+
+$emptyTxt = Get-TimeoutStopText -Reason '' -MaxRunMinutes 45 -IdleTimeoutSec 200
+Assert-True  ($emptyTxt -match '45-min') 'T3 empty/unknown reason falls back to the ceiling phrasing (back-compat)'
+Assert-False ($emptyTxt -match 'idle')   'T3 back-compat fallback is not the idle text'
+
+$custom = Get-TimeoutStopText -Reason 'idle' -MaxRunMinutes 30 -IdleTimeoutSec 123
+Assert-True  ($custom -match '123')      'T4 idle text interpolates the ACTUAL IdleTimeoutSec (kills a hard-coded-string mutant)'
+
+# --- Get-RunAnomalies (the report's ANOMALIES: line) ---
+# A non-existent log path exercises the TimedOut branch in isolation (Test-Path false -> no line scan).
+$noLog = Join-Path $env:TEMP ("verify-runtimeout-nolog-{0}.log" -f ([guid]::NewGuid()))
+$aIdle = Get-RunAnomalies -LogPath $noLog -TimedOut $true -TimeoutReason 'idle'
+Assert-True  (($aIdle.Anomalies -join '; ') -match 'idle')       'T5 idle anomaly text names the idle stall'
+Assert-False (($aIdle.Anomalies -join '; ') -match 'wall-clock') 'T5 idle anomaly text does NOT say wall-clock timeout'
+Assert-True  $aIdle.LoopSuspected                                'T5 idle stop still sets LoopSuspected (merge-gate soft-signal unchanged)'
+
+$aCeil = Get-RunAnomalies -LogPath $noLog -TimedOut $true -TimeoutReason 'ceiling'
+Assert-True  (($aCeil.Anomalies -join '; ') -match 'wall-clock') 'T6 ceiling anomaly text keeps the wall-clock wording'
+Assert-True  $aCeil.LoopSuspected                                'T6 ceiling stop sets LoopSuspected'
+
+$aLegacy = Get-RunAnomalies -LogPath $noLog -TimedOut $true
+Assert-True  (($aLegacy.Anomalies -join '; ') -match 'wall-clock') 'T7 back-compat: no -TimeoutReason arg -> wall-clock wording (existing callers safe)'
+
+$aNone = Get-RunAnomalies -LogPath $noLog -TimedOut $false
+Assert-False (($aNone.Anomalies -join '; ') -match 'wall-clock|idle') 'T8 a run that did NOT time out reports no timeout anomaly'
+Assert-False $aNone.LoopSuspected                                     'T8 no timeout -> no LoopSuspected from the timeout branch'
+
+# ============================================================================
 # RESULT banner
 # ============================================================================
 Write-Host ''

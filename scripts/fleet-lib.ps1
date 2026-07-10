@@ -127,6 +127,183 @@ function ConvertTo-Win32Arg {
     return $r
 }
 
+function Test-PluginLoadLines {
+    # #762 load-line canary (the lesson-46 third-instance control, 2026-07-08).
+    # Both fleet plugins print a designed-in stderr load-line at every opencode
+    # boot precisely "so the fleet can VERIFY the plugin actually wired in" -- and
+    # nothing ever read them, so both plugins ran silently DEAD in production from
+    # 2026-06-30 until the #759 recon tripped over the loader errors a week and a
+    # battery campaign later (#764). This is the reader those lines never had:
+    # a PURE check over a completed run's transcript (stderr is folded into the
+    # transcript at run end). Returns @{ Ok; Missing; LoaderErrors }.
+    #
+    # COUPLING: the literals below are pinned against the plugin sources in
+    # configs/opencode-plugins/ by verify-plugin-canary.ps1 -- reword a plugin's
+    # load-line and that verify names the drift before the canary goes blind.
+    param([string]$TranscriptContent)
+    $required = @(
+        @{ Name = 'command-timeout'; Marker = '[command-timeout] loaded' },
+        @{ Name = 'path-normalize';  Marker = '[path-normalize] loaded' }
+    )
+    $missing = @()
+    foreach ($plugin in $required) {
+        if ($TranscriptContent.IndexOf($plugin.Marker, [System.StringComparison]::Ordinal) -lt 0) {
+            $missing += $plugin.Name
+        }
+    }
+    $loaderErrors = @()
+    if ($TranscriptContent) {
+        $loaderErrors = @(
+            $TranscriptContent -split "`n" |
+                Where-Object { $_ -match 'failed to load plugin|Plugin export is not a function' } |
+                ForEach-Object { $_.Trim() } | Select-Object -First 5
+        )
+    }
+    return @{
+        Ok           = (($missing.Count -eq 0) -and ($loaderErrors.Count -eq 0))
+        Missing      = $missing
+        LoaderErrors = $loaderErrors
+    }
+}
+
+function Write-PluginCanaryVerdict {
+    # Side-effecting half of the #762 canary: on a failed check, append a LOUD
+    # line to the run transcript (the surface humans and the battery report read)
+    # and a timestamped record to state/plugin-canary-failed.txt (a stable probe
+    # for machines: the morning report, the battery runner, the #762 canary run).
+    # NEVER fails the run -- a canary is visibility, not a gate; and NEVER throws
+    # (it runs on the tail of every agent run, including mid-battery).
+    param(
+        [Parameter(Mandatory)][hashtable]$Verdict,
+        [Parameter(Mandatory)][string]$LogPath,
+        [string]$StateDir = ''
+    )
+    if ($Verdict.Ok) { return }
+    try {
+        $detail = 'PLUGIN-CANARY: FAILED'
+        if ($Verdict.Missing.Count -gt 0) { $detail += (' -- load-line missing: ' + ($Verdict.Missing -join ', ')) }
+        if ($Verdict.LoaderErrors.Count -gt 0) { $detail += (' -- loader errors: ' + ($Verdict.LoaderErrors -join ' | ')) }
+        Add-Content -Path $LogPath -Value $detail -ErrorAction SilentlyContinue
+        if (-not $StateDir) { $StateDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'state' }
+        if (Test-Path $StateDir) {
+            $marker = Join-Path $StateDir 'plugin-canary-failed.txt'
+            $line = '{0} | {1} | {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $LogPath, $detail
+            Add-Content -Path $marker -Value $line -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Test-DispatchCancelled {
+    # #771 STOP-CONTRACT consumer. The dispatch monitor's `/dispatch stop` writes a cancel sentinel at
+    # state/fleet-swap/cancel (blarai shared/fleet/swap_ops.cancel_path -- the SAME file run-battery-night.ps1
+    # clears stale at launch and the swap driver clears at handoff). The Python swap DRIVER already honours it
+    # at each TASK boundary, but WITHIN a task the PowerShell best-of-N candidate loop never read it -- so after
+    # a stop landed, candidate N's gate timed out and the loop went on to BUILD candidate N+1 (a fresh ~hour of
+    # GPU with OVMS still holding the card) until the run-budget watchdog tore down an hour later (the #771
+    # defect, run 2026-07-08). This is the READ-ONLY consumer that loop needed: a cheap Test-Path checked
+    # BETWEEN candidates and BETWEEN gate steps. It NEVER writes or clears the sentinel -- ownership stays with
+    # the writer (the monitor) and the stale-clearers (the launcher at start + the driver at handoff), so it
+    # cannot race them. This is the ALIVE loop acting on its OWN stop, never a reconciler presuming death (the
+    # #758 invariant). ScriptRoot defaults to fleet-lib's own dir (Split-Path -Parent == the agentic root, the
+    # same anchor run-battery-night.ps1 and Write-PluginCanaryVerdict use); tests point it at a temp dir.
+    # Cheap + side-effect-free; unit-tested without a model (verify-stop-contract.ps1).
+    param([string]$ScriptRoot = $PSScriptRoot)
+    $cancel = Join-Path (Split-Path $ScriptRoot -Parent) 'state\fleet-swap\cancel'
+    return [bool](Test-Path -LiteralPath $cancel)
+}
+
+function Get-OpencodePinVerdict {
+    # #762 version-pin verdict -- the PURE half of the fail-closed spawn tripwire (mirrors Test-PluginLoadLines:
+    # pure + injectable + unit-tested; the impure probing lives in the caller). opencode ships as an UNPINNED
+    # global npm package (autoupdate:false is the only brake), so a silent npm upgrade -- or a tampered binary --
+    # could swap the exact release the fleet was validated against out from under a live dispatch.
+    # configs/opencode-version-pin.json records that release (version + sha256 + exe_path); this compares the
+    # LIVE probe against it. FAIL-CLOSED: a null/unreadable manifest, an unresolved binary, a probe that read
+    # NEITHER a version nor a hash, or ANY mismatch => Ok=$false with a cause-carrying Reason (never a vacuous
+    # pass). Callers do the impure Get-Command / `opencode --version` / Get-FileHash and pass the results in.
+    # Never throws. Pure; unit-tested without opencode installed (verify-opencode-pin-wiring.ps1).
+    param(
+        $Manifest,                       # parsed opencode-version-pin.json (or $null if missing/unparseable)
+        [string]$LiveExePath = '',       # resolved live opencode.exe path (or '' if unresolved)
+        [string]$LiveVersion = '',       # `opencode --version` output (or '' if unread)
+        [string]$LiveHash = ''           # SHA-256 of the live exe (or '' if not computed)
+    )
+    if ($null -eq $Manifest) {
+        return @{ Ok = $false; Reason = 'pin manifest missing or unreadable (configs/opencode-version-pin.json) -- cannot verify the opencode release; refusing fail-closed'; LiveVersion = $LiveVersion; PinVersion = '' }
+    }
+    $pinVersion = [string]$Manifest.version
+    $pinSha     = [string]$Manifest.sha256
+    $pinExe     = [string]$Manifest.exe_path
+    if (-not $pinVersion -or -not $pinSha) {
+        return @{ Ok = $false; Reason = "pin manifest incomplete (version='$pinVersion', has-sha256=$([bool]$pinSha)) -- refusing fail-closed"; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+    }
+    if (-not $LiveExePath) {
+        return @{ Ok = $false; Reason = 'live opencode binary could not be resolved on PATH -- refusing fail-closed'; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+    }
+    if (-not $LiveVersion -and -not $LiveHash) {
+        # Could not probe the live binary AT ALL (neither `--version` nor the hash) -- a vacuous "path matched"
+        # is not a validation, so refuse rather than let an unverified binary spawn.
+        return @{ Ok = $false; Reason = 'could not probe the live opencode (no version, no hash) -- refusing fail-closed'; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+    }
+    if ($pinExe) {
+        $liveNorm = ($LiveExePath -replace '\\', '/')
+        $pinNorm  = ($pinExe -replace '\\', '/')
+        if ($liveNorm -ine $pinNorm) {
+            return @{ Ok = $false; Reason = "opencode PATH drift: live '$liveNorm' != pin '$pinNorm' -- refusing fail-closed"; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+        }
+    }
+    if ($LiveVersion -and ($LiveVersion -ne $pinVersion)) {
+        return @{ Ok = $false; Reason = "opencode VERSION drift: live '$LiveVersion' != pin '$pinVersion' (a silent npm upgrade?) -- refusing fail-closed"; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+    }
+    if ($LiveHash -and ($LiveHash -ine $pinSha)) {
+        return @{ Ok = $false; Reason = "opencode BINARY drift: live sha256 '$LiveHash' != pin '$pinSha' (tampered or replaced binary) -- refusing fail-closed"; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+    }
+    return @{ Ok = $true; Reason = "opencode $pinVersion matches the pin"; LiveVersion = $LiveVersion; PinVersion = $pinVersion }
+}
+
+function Invoke-OpencodePinProbe {
+    # #762 impure probe + per-process memo around the PURE Get-OpencodePinVerdict. Resolves the live opencode
+    # binary, reads its `--version` + SHA-256 + the pin manifest, and returns the fail-closed verdict.
+    # MEMOISED per process by the exe's path+size+mtime fingerprint: the SHA-256 of the ~165 MB binary is ~1.5s,
+    # and the sequential best-of-N loop calls Invoke-AgentRun many times per process (each candidate + each
+    # review pass), so without the memo every call would re-hash. A silent npm upgrade changes the file
+    # (size/mtime) => fingerprint miss => re-probed, so the memo can never HIDE drift. Never throws (any probe
+    # error becomes a fail-closed verdict, not an exception that could crash the run). Impure by nature (spawns
+    # + hashes), so the UNIT coverage is on Get-OpencodePinVerdict; this is the thin live shim.
+    param([string]$ExePath = '', [switch]$NoMemo)
+    try {
+        if (-not $ExePath) {
+            $src = (Get-Command opencode -ErrorAction SilentlyContinue).Source
+            if ($src) { $ExePath = Join-Path (Split-Path $src -Parent) 'node_modules\opencode-ai\bin\opencode.exe' }
+        }
+        $fileInfo = if ($ExePath -and (Test-Path -LiteralPath $ExePath)) { Get-Item -LiteralPath $ExePath -ErrorAction SilentlyContinue } else { $null }
+        $fingerprint = if ($fileInfo) { '{0}|{1}|{2}' -f $fileInfo.FullName, $fileInfo.Length, $fileInfo.LastWriteTimeUtc.Ticks } else { "unresolved:$ExePath" }
+        if (-not $NoMemo -and $script:__OcPinMemo -and ($script:__OcPinMemo.Fingerprint -eq $fingerprint)) {
+            return $script:__OcPinMemo.Verdict
+        }
+        # Manifest lives beside the scripts dir: <agentic-root>/configs/opencode-version-pin.json.
+        $manifestPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'configs\opencode-version-pin.json'
+        $manifest = $null
+        if (Test-Path -LiteralPath $manifestPath) {
+            try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch { $manifest = $null }
+        }
+        $liveVersion = ''
+        if ($fileInfo) {
+            try { $liveVersion = ("$(& $ExePath --version 2>$null | Select-Object -First 1)").Trim() } catch { $liveVersion = '' }
+        }
+        $liveHash = ''
+        if ($fileInfo) {
+            try { $liveHash = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256 -ErrorAction Stop).Hash } catch { $liveHash = '' }
+        }
+        $verdict = Get-OpencodePinVerdict -Manifest $manifest -LiveExePath ($(if ($fileInfo) { $fileInfo.FullName } else { '' })) -LiveVersion $liveVersion -LiveHash $liveHash
+        if (-not $NoMemo) { $script:__OcPinMemo = @{ Fingerprint = $fingerprint; Verdict = $verdict } }
+        return $verdict
+    } catch {
+        # A probe crash must never crash the caller; treat it as a fail-closed refusal with the cause.
+        return @{ Ok = $false; Reason = "opencode pin probe error: $($_.Exception.Message) -- refusing fail-closed"; LiveVersion = ''; PinVersion = '' }
+    }
+}
+
 function Invoke-AgentRun {
     # Run `opencode run` under a PROGRESS-AWARE circuit breaker, capturing the transcript
     # to a log for anomaly analysis. On a stop the whole process tree is killed so a
@@ -177,6 +354,21 @@ function Invoke-AgentRun {
     # (opencode.cmd / .ps1) just exec this same exe with %*, so this is equivalent but safe.
     $ocExe = Join-Path (Split-Path $ocSrc -Parent) 'node_modules\opencode-ai\bin\opencode.exe'
     $useExe = Test-Path $ocExe
+    # #762 FAIL-CLOSED spawn tripwire (mirrors the tail canary, but at the HEAD -- BEFORE any agent spawns).
+    # opencode is an unpinned global npm package, so a silent autoupgrade or a tampered binary would run a
+    # DIFFERENT release than the fleet was validated against. Verify the live binary against the committed pin
+    # (configs/opencode-version-pin.json) and REFUSE the run on any drift -- never silently proceed. The
+    # verdict is memoised per process, so this costs the ~1.5s SHA-256 once per dispatch, not once per
+    # candidate. `opencode --version` merely prints a version (no agent, no repo, no model), so probing a
+    # drifted binary is benign. On refusal we write a loud, cause-carrying line to the transcript and return a
+    # no-op result (ExitCode=$null, PinRefused) so the dispatch parks with the reason -- fail-closed by design.
+    $pinVerdict = Invoke-OpencodePinProbe -ExePath $(if ($useExe) { $ocExe } else { '' })
+    if (-not $pinVerdict.Ok) {
+        $line = "OPENCODE-PIN REFUSED: $($pinVerdict.Reason)"
+        Set-Content -Path $LogPath -Value $line -ErrorAction SilentlyContinue
+        Write-Host "  $line" -ForegroundColor Red
+        return @{ TimedOut = $false; TimeoutReason = ''; Capped = $false; CappedReason = ''; ExitCode = $null; LogPath = $LogPath; Seconds = 0; Error = $line; PinRefused = $true }
+    }
     $errPath = "$LogPath.err"
     # CRITICAL (verified 2026-06-18): headless `opencode run` BLOCKS at "init" reading an
     # inherited non-TTY stdin that never EOFs. Start-Process -NoNewWindow gives the child
@@ -275,31 +467,87 @@ function Invoke-AgentRun {
         Get-Content $errPath -ErrorAction SilentlyContinue | Add-Content $LogPath -ErrorAction SilentlyContinue
         Remove-Item $errPath -ErrorAction SilentlyContinue
     }
+    # #762 load-line canary: verify both plugins actually wired into THIS run
+    # (their stderr load-lines are now in the folded transcript). Visibility only
+    # -- a failed canary writes a loud transcript line + the state marker, never
+    # a run failure; wholly try-guarded so it can NEVER break an agent run.
+    try {
+        if (Test-Path $LogPath) {
+            $canary = Test-PluginLoadLines -TranscriptContent ([System.IO.File]::ReadAllText($LogPath))
+            Write-PluginCanaryVerdict -Verdict $canary -LogPath $LogPath
+        }
+    } catch { }
+    # #762 per-run version LOG: record the exact opencode release THIS run used, into the transcript the
+    # battery/morning report reads. The pre-spawn tripwire already validated it against the pin, so this is
+    # the durable provenance line ("which binary produced this run"). Try-guarded -- never fails a run.
+    try {
+        Add-Content -Path $LogPath -Value ("[opencode-pin] run used opencode $($pinVerdict.LiveVersion) (pin $($pinVerdict.PinVersion); validated)") -ErrorAction SilentlyContinue
+    } catch { }
     # A step-cap means the agent DID the work then looped; treat it as completed (exit 0), not a
     # failure, so the gate runs + the auto-merge can fire (#670 run-3).
     $exit = if ($timedOut) { $null } elseif ($capped) { 0 } else { $p.ExitCode }
     return @{ TimedOut = $timedOut; TimeoutReason = $timeoutReason; Capped = $capped; CappedReason = $cappedReason; ExitCode = $exit; LogPath = $LogPath; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Error = '' }
 }
 
+function Test-IsSamplingTerminal {
+    # BEST-OF-N terminal classification (#740/W7): does THIS candidate's stop END sampling (terminal --
+    # never resampled), or is it a random per-build slip that best-of-N should route AROUND with a fresh
+    # independent candidate? This is the SINGLE SOURCE OF TRUTH the injected -StopSampling predicate
+    # delegates to (new-agent-task.ps1, both the sequential + concurrent paths) AND the reason
+    # Test-ShouldResample honours, so the two layers agree. TERMINAL when:
+    #   - SecretBlocked      : a potential leak must be SURFACED to a human, never sampled-away (unchanged).
+    #   - a NON-idle timeout : a wall-clock CEILING hit is a genuine runaway (a productive-but-too-slow or
+    #                          wedged coder; expensive to retry). An EMPTY/UNKNOWN reason is treated as
+    #                          ceiling -- the SAFE default (a pre-#740 Run object, or a reason we cannot read,
+    #                          must NOT silently become resample-eligible).
+    # NOT terminal (resample-eligible):
+    #   - an IDLE-reason timeout : the coder read a couple files then went silent, making ZERO changes before
+    #                          the progress-aware idle breaker (#682) killed it FAST. That is a RANDOM slip --
+    #                          precisely what best-of-N's fresh, independent samples exist to route around
+    #                          (the 2026-07-03 no-op dispatches: candidate 1 idle-stalled, collapsing N=3 to
+    #                          N=1 and no-op'ing the whole run, while a re-queued fresh attempt merged --
+    #                          docs/no-op-diagnosis-2026-07.md). Bounded by the EXISTING MaxCandidates budget
+    #                          (no new budget): worst case is N x idle_timeout, then the run parks.
+    # Pure + ASCII; unit-tested without a model (verify-bestofn.ps1 / verify-bestofn-concurrent.ps1).
+    param(
+        [bool]$TimedOut,
+        [string]$TimeoutReason = '',
+        [bool]$SecretBlocked
+    )
+    if ($SecretBlocked) { return $true }
+    if ($TimedOut) { return ("$TimeoutReason".Trim().ToLower() -ne 'idle') }
+    return $false
+}
+
 function Test-ShouldResample {
     # POLICY: should the build be RESAMPLED (re-run from a CLEAN worktree) because the
-    # verify gate FAILED? Retry ONLY a real test/verify FAILURE, and only while attempts
-    # remain. NEVER resample a timeout (the model is genuinely stuck, not slipping) or a
-    # secret-block (a potential leak must be surfaced to a human, never retried away).
-    # A high-variance small model makes ~1 random slip per full implementation, so
-    # resampling a fresh attempt converges it toward a passing build. Pure + injectable
-    # so it is unit-tested without a model (see scripts\verify-retry.ps1).
+    # verify gate FAILED? Retry ONLY a real test/verify FAILURE (or a #740/W7 idle stall -- see below),
+    # and only while attempts remain. NEVER resample a wall-clock CEILING timeout (the model is genuinely
+    # too slow / wedged, not slipping) or a secret-block (a potential leak must be surfaced to a human,
+    # never retried away). A high-variance small model makes ~1 random slip per full implementation, so
+    # resampling a fresh attempt converges it toward a passing build. Pure + injectable so it is
+    # unit-tested without a model (see scripts\verify-retry.ps1).
+    #
+    # #740/W7: an IDLE-reason timeout is NOT terminal -- it is a random per-build slip (the coder went silent
+    # before making a change) treated like a build/test FAILURE: resample-eligible, bounded by the SAME
+    # $MaxAttempts budget. A CEILING timeout, an empty/unknown reason (-> ceiling, the safe default), and a
+    # secret-block stay terminal. The terminal call is the shared Test-IsSamplingTerminal so this inner
+    # retry and the best-of-N -StopSampling classification never diverge. $TimeoutReason defaults to '' so
+    # every existing caller (which passes none) keeps the pre-change "any timeout is terminal" behaviour
+    # byte-identical -- the idle carve-out only fires when a caller EXPLICITLY passes -TimeoutReason 'idle'.
     param(
         [string]$VerifyResult,
         [string]$TestResult,
         [bool]$TimedOut,
         [bool]$SecretBlocked,
         [int]$Attempt,
-        [int]$MaxAttempts
+        [int]$MaxAttempts,
+        [string]$TimeoutReason = ''
     )
-    if ($TimedOut -or $SecretBlocked) { return $false }
+    if (Test-IsSamplingTerminal -TimedOut $TimedOut -TimeoutReason $TimeoutReason -SecretBlocked $SecretBlocked) { return $false }
     if ($Attempt -ge $MaxAttempts) { return $false }
-    return (($VerifyResult -eq 'fail') -or ($TestResult -eq 'fail'))
+    $idleStall = $TimedOut -and ("$TimeoutReason".Trim().ToLower() -eq 'idle')
+    return ($idleStall -or ($VerifyResult -eq 'fail') -or ($TestResult -eq 'fail'))
 }
 
 function Resolve-RunStopDecision {
@@ -443,14 +691,17 @@ function Resolve-CriticRange {
     #                         merge commit's merged changes EXCLUDING main's own concurrent commits.
     #                         (merge-base(main,agent)..agent does NOT work here: post-merge the agent
     #                         tip is an ancestor of main, so that range is always empty.)
-    # KNOWN GAP (tracked #687 follow-up): a MULTI-commit agent branch FAST-FORWARDED onto an unchanged
-    # main collapses to linear history, so HEAD~1..HEAD sees only the LAST commit. The robust fix
-    # records main's pre-dispatch SHA in swap_driver and diffs <base-sha>..HEAD.
+    # #693 (closes the #687 follow-up gap): a MULTI-commit agent branch FAST-FORWARDED onto an
+    # unchanged main collapses to linear history, so HEAD~1..HEAD sees only the LAST commit. The
+    # robust path: swap_driver records main's pre-dispatch SHA and threads it here as -BaseRef;
+    # "<base-sha>..HEAD" is ALL the merged work regardless of FF/commit-count. Checked FIRST; an
+    # empty/invalid/unchanged BaseRef falls through to the legacy chain (fallback preserved).
     # Returns a git range string, or "" if nothing resolves. ASCII; PS 5.1 + 7 safe (EAP=Continue so
     # git's informational stderr -- e.g. HEAD~1 on a 1-commit repo -- never throws a NativeCommandError).
     # Only reads git; never mutates.
-    param([Parameter(Mandatory)][string]$Repo, [string]$Base = 'main')
+    param([Parameter(Mandatory)][string]$Repo, [string]$Base = 'main', [string]$BaseRef = '')
     $ErrorActionPreference = 'Continue'
+    if ($BaseRef -and (((git -C $Repo diff "$BaseRef..HEAD" --name-only 2>$null) -join "`n"))) { return "$BaseRef..HEAD" }
     if (((git -C $Repo diff "$Base...HEAD" --name-only 2>$null) -join "`n")) { return "$Base...HEAD" }
     if (((git -C $Repo diff "HEAD~1..HEAD" --name-only 2>$null) -join "`n")) { return "HEAD~1..HEAD" }
     return ""
@@ -632,15 +883,22 @@ function Resolve-BuildProfile {
     }
 
     # command-line / library are language-ambiguous: refine by the hint, else a per-surface house default.
-    $byHint = @{ python = 'python'; dotnet = 'dotnet-console'; node = 'web'; cpp = 'cpp'; powershell = 'powershell' }
-    $libByHint = @{ python = 'python'; dotnet = 'dotnet-console'; node = 'web'; cpp = 'cpp'; powershell = 'powershell' }
+    $byHint = @{ python = 'python'; dotnet = 'dotnet-console'; node = 'node-cli'; cpp = 'cpp'; powershell = 'powershell' }
+    $libByHint = @{ python = 'python'; dotnet = 'dotnet-console'; node = 'node-cli'; cpp = 'cpp'; powershell = 'powershell' }
 
     switch ($s) {
         'desktop-gui'  { return @{ scaffold = 'winui';   structural_contract = $winuiContract; staged = $true } }
         'web'          { return @{ scaffold = 'web';      structural_contract = $null;          staged = $false } }
         'mobile'       { return @{ scaffold = 'android';  structural_contract = $null;          staged = $false } }
         'command-line' {
-            $sc = if ($h -and $byHint.ContainsKey($h)) { $byHint[$h] } else { 'dotnet-console' }
+            # House default is PYTHON, consistent with `library` below: a Python-centric local
+            # AI whose acceptance oracles are Python (tests/test_job_acceptance.py) defaults an
+            # ambiguous CLI (no language_hint) to Python, NOT .NET. An explicit hint still wins
+            # ($byHint: dotnet -> dotnet-console, node -> web, ...), and an explicit "C#/console
+            # app" prompt is caught upstream by Resolve-TaskScaffold's keyword heuristic. (#740:
+            # under the old .NET default both battery arms B1/B2 built C# for Python-oracle jobs
+            # -> guaranteed park; the default was measuring a language mismatch, not capability.)
+            $sc = if ($h -and $byHint.ContainsKey($h)) { $byHint[$h] } else { 'python' }
             return @{ scaffold = $sc; structural_contract = $null; staged = $false }
         }
         'automation'   { return @{ scaffold = 'powershell'; structural_contract = $null;        staged = $false } }
@@ -1252,14 +1510,22 @@ function Invoke-BestOfN {
         [scriptblock]$ScoreCandidate = { param($r) 0 },
         [scriptblock]$StopSampling = { param($r) $false },
         [scriptblock]$OnCandidate = {},
+        # #771 STOP-CONTRACT: checked BEFORE each candidate. Production passes { Test-DispatchCancelled } so a
+        # `/dispatch stop` (the monitor's cancel sentinel) prevents starting a FRESH candidate -- the exact
+        # #771 defect (candidate N+1 built 9 min after a stop). Default { $false } keeps the unit tests pure.
+        [scriptblock]$ShouldCancel = { $false },
         [int]$MaxCandidates = 3
     )
-    if ($MaxCandidates -lt 1) { return @{ Selected = $null; SelectedIndex = -1; WinnerFound = $false; Stopped = $false; Count = 0; Candidates = @() } }
+    if ($MaxCandidates -lt 1) { return @{ Selected = $null; SelectedIndex = -1; WinnerFound = $false; Stopped = $false; Cancelled = $false; Count = 0; Candidates = @() } }
     $candidates = New-Object System.Collections.ArrayList
     $ranks = New-Object System.Collections.ArrayList
     $winnerIdx = -1
     $stopped = $false
+    $cancelled = $false
     for ($k = 1; $k -le $MaxCandidates; $k++) {
+        # #771: a stop that landed before this candidate must NOT start it. Honour the cancel BETWEEN
+        # candidates (never mid-generation -- a running candidate finishes under its own circuit breaker).
+        if ([bool](@(& $ShouldCancel)[-1])) { $cancelled = $true; break }
         & $OnCandidate $k $MaxCandidates
         # Normalise: take the LAST emitted object so a stray Write-Output cannot make the result an
         # array, and guarantee a hashtable so the caller's gate-signal reads stay real scalars.
@@ -1274,11 +1540,11 @@ function Invoke-BestOfN {
     }
     $arr = @($candidates)
     if ($winnerIdx -ge 0) {
-        return @{ Selected = $arr[$winnerIdx]; SelectedIndex = $winnerIdx; WinnerFound = $true; Stopped = $false; Count = $arr.Count; Candidates = $arr }
+        return @{ Selected = $arr[$winnerIdx]; SelectedIndex = $winnerIdx; WinnerFound = $true; Stopped = $false; Cancelled = $cancelled; Count = $arr.Count; Candidates = $arr }
     }
     $bestIdx = Select-BestCandidateIndex -Ranks @($ranks)
     $selected = if ($bestIdx -ge 0) { $arr[$bestIdx] } else { $null }
-    return @{ Selected = $selected; SelectedIndex = $bestIdx; WinnerFound = $false; Stopped = $stopped; Count = $arr.Count; Candidates = $arr }
+    return @{ Selected = $selected; SelectedIndex = $bestIdx; WinnerFound = $false; Stopped = $stopped; Cancelled = $cancelled; Count = $arr.Count; Candidates = $arr }
 }
 
 function Resolve-DispatchConcurrency {
@@ -1377,17 +1643,23 @@ function Invoke-BestOfNBatched {
         [scriptblock]$ScoreCandidate = { param($r) 0 },
         [scriptblock]$StopSampling = { param($r) $false },
         [scriptblock]$OnBatch = {},
+        # #771 STOP-CONTRACT: checked BEFORE each concurrent BATCH (the batch analogue of Invoke-BestOfN's
+        # between-candidate check). Production passes { Test-DispatchCancelled }; default { $false } is pure.
+        [scriptblock]$ShouldCancel = { $false },
         [int]$MaxCandidates = 3,
         [int]$Concurrency = 2
     )
-    if ($MaxCandidates -lt 1) { return @{ Selected = $null; SelectedIndex = -1; WinnerFound = $false; Stopped = $false; Count = 0; Candidates = @() } }
+    if ($MaxCandidates -lt 1) { return @{ Selected = $null; SelectedIndex = -1; WinnerFound = $false; Stopped = $false; Cancelled = $false; Count = 0; Candidates = @() } }
     $C = if ($Concurrency -lt 1) { 1 } else { $Concurrency }
     $candidates = New-Object System.Collections.ArrayList
     $ranks = New-Object System.Collections.ArrayList
     $winnerIdx = -1
     $stopped = $false
+    $cancelled = $false
     $next = 1
-    while (($next -le $MaxCandidates) -and ($winnerIdx -lt 0) -and (-not $stopped)) {
+    while (($next -le $MaxCandidates) -and ($winnerIdx -lt 0) -and (-not $stopped) -and (-not $cancelled)) {
+        # #771: a stop that landed before this batch must NOT launch it (no fresh candidates after a stop).
+        if ([bool](@(& $ShouldCancel)[-1])) { $cancelled = $true; break }
         $batchN = [Math]::Min($C, $MaxCandidates - $next + 1)
         $indices = @($next..($next + $batchN - 1))
         & $OnBatch $indices $MaxCandidates
@@ -1417,11 +1689,11 @@ function Invoke-BestOfNBatched {
     }
     $arr = @($candidates)
     if ($winnerIdx -ge 0) {
-        return @{ Selected = $arr[$winnerIdx]; SelectedIndex = $winnerIdx; WinnerFound = $true; Stopped = $false; Count = $arr.Count; Candidates = $arr }
+        return @{ Selected = $arr[$winnerIdx]; SelectedIndex = $winnerIdx; WinnerFound = $true; Stopped = $false; Cancelled = $cancelled; Count = $arr.Count; Candidates = $arr }
     }
     $bestIdx = Select-BestCandidateIndex -Ranks @($ranks)
     $selected = if ($bestIdx -ge 0) { $arr[$bestIdx] } else { $null }
-    return @{ Selected = $selected; SelectedIndex = $bestIdx; WinnerFound = $false; Stopped = $stopped; Count = $arr.Count; Candidates = $arr }
+    return @{ Selected = $selected; SelectedIndex = $bestIdx; WinnerFound = $false; Stopped = $stopped; Cancelled = $cancelled; Count = $arr.Count; Candidates = $arr }
 }
 
 function Invoke-CandidateBuild {
@@ -1455,9 +1727,16 @@ function Invoke-CandidateBuild {
         [string]$AcceptanceTestPath = '',
         [string]$Surface = '',
         [string]$LanguageHint = '',
+        # #771 STOP-CONTRACT: checked BEFORE each numbered gate step (tests, verify). Production passes
+        # { Test-DispatchCancelled } (works in the Start-Job child too -- it reads the same on-disk sentinel);
+        # default { $false } keeps this unit-testable. A stop mid-generation lets the CURRENT generation finish
+        # under its own circuit breaker (bounded), but a stopped candidate then SKIPS its gate and parks its
+        # committed work rather than auto-merging a validation we cut short.
+        [scriptblock]$ShouldCancel = { $false },
         [bool]$ResetToBase = $false
     )
     $wt = $Worktree
+    $cancelled = $false
     # #700: the sequential path reuses ONE worktree across candidates, so candidate k>1 resets it to the
     # shared baseline first (a FRESH independent start). The concurrent path gets a fresh worktree per
     # candidate already AT $CodeBase, so it leaves -ResetToBase $false. (Was $BuildTestVerify's `if
@@ -1484,7 +1763,7 @@ function Invoke-CandidateBuild {
     if ($run.Capped) { Write-Host "  TURN CAP: agent bounded ($($run.CappedReason)); work kept, the gate decides the merge." -ForegroundColor Yellow }
     if ($build.Attempts -gt 1) { Write-Host "  (build took $($build.Attempts) attempts$(if (-not $build.ProducedChanges) { '; still no changes' }))" -ForegroundColor DarkGray }
     Write-Host "  (agent transcript -> $LogPath)" -ForegroundColor DarkGray
-    $anomaly = Get-RunAnomalies -LogPath $LogPath -TimedOut $run.TimedOut -ExitCode $run.ExitCode
+    $anomaly = Get-RunAnomalies -LogPath $LogPath -TimedOut $run.TimedOut -ExitCode $run.ExitCode -TimeoutReason "$($run.TimeoutReason)"
     if ($anomaly.LoopSuspected) { Write-Host "  CIRCUIT BREAKER: possible loop/instability detected; this candidate cannot auto-merge." -ForegroundColor Yellow }
     # #690: RESTORE the protected acceptance oracle BEFORE staging + the gate, so a candidate that edited,
     # weakened, or deleted it is OVERWRITTEN -- judged by the BYTE-IDENTICAL scorecard, and the merged commit
@@ -1504,9 +1783,13 @@ function Invoke-CandidateBuild {
     }
     $hasChanges = (git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null) -gt 0
     $sha = if ($hasChanges) { "$(git -C $wt rev-parse HEAD 2>$null)".Trim() } else { '' }
+    # #771: a stop that landed during generation short-circuits the gate steps (tests + verify) -- the
+    # candidate's work is already committed to its branch (reflog-reachable), so it PARKS rather than
+    # auto-merging a gate we didn't finish. VerifyResult/TestResult stay 'none' => never a winner => park.
+    if ([bool](@(& $ShouldCancel)[-1])) { $cancelled = $true }
     # ---- [2/5] Tests (forgiving detection: absence of tests is not failure) ----
     $testResult = 'none'; $testOut = ''
-    if ($hasChanges) {
+    if ($hasChanges -and -not $cancelled) {
         if ((Test-Path (Join-Path $wt 'package.json')) -and
             (Select-String -Path (Join-Path $wt 'package.json') -Pattern '"test"\s*:' -Quiet) -and
             ((Test-Path (Join-Path $wt 'node_modules')) -or
@@ -1535,8 +1818,10 @@ function Invoke-CandidateBuild {
     $testError = if ($testResult -eq 'fail') { "The test step failed:`n" + ((($testOut -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 25) -join "`n") } else { '' }
     # ---- [3/5] Deterministic verify gate (build/typecheck/lint). Forgiving + offline: missing tools =
     # 'skip'; only a real non-zero (or a hang) = 'fail'. A 'fail' blocks the auto-merge. ----
+    # #771: re-check before the verify step (a stop may have landed during the test run above).
+    if (-not $cancelled -and [bool](@(& $ShouldCancel)[-1])) { $cancelled = $true }
     $verifyResult = 'none'; $verifyDetail = ''; $verifyError = ''
-    if ($hasChanges) {
+    if ($hasChanges -and -not $cancelled) {
         Write-Host "[3/5] Verifying (build/typecheck/lint)..." -ForegroundColor Cyan
         try {
             $__vpExtra = @{}
@@ -1559,9 +1844,11 @@ function Invoke-CandidateBuild {
             Write-Host "  verify gate could not run (treated as 'none'): $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
+    if ($cancelled) { Write-Host "  STOP: a dispatch cancel was observed; this candidate parked its committed work without finishing the gate (#771)." -ForegroundColor Yellow }
     return @{
         VerifyResult = $verifyResult; TestResult = $testResult; HasChanges = [bool]$hasChanges;
         TimedOut = [bool]$run.TimedOut; SecretBlocked = [bool]$secretBlocked; LoopSuspected = [bool]$anomaly.LoopSuspected;
+        Cancelled = [bool]$cancelled;
         SHA = $sha; Run = $run; Secret = $secret; Anomaly = $anomaly; BuildAttempts = $build.Attempts;
         TestError = $testError; VerifyDetail = $verifyDetail; VerifyError = $verifyError;
         AgentLog = $LogPath; LogPath = $LogPath   # AgentLog: the candidate shape; LogPath: the sequential ($BuildTestVerify) callers read this
@@ -1618,22 +1905,50 @@ function ConvertTo-CandidateResult {
     }
 }
 
+function Get-TimeoutStopText {
+    # #740/W7 (no-op-diagnosis): turn a coder-run circuit-breaker stop into an HONEST one-line BUILD
+    # status for the operator report. Invoke-AgentRun sets TimedOut for TWO distinct reasons
+    # (Resolve-RunStopDecision): 'idle' = no new step/edit for IdleTimeoutSec -> genuinely stuck, killed
+    # FAST (often in a few minutes, having made no changes); 'ceiling' = the generous absolute wall-clock
+    # backstop ($MaxRunMinutes). The old report printed "STOPPED ... after <MaxRunMinutes> min" for BOTH,
+    # so a ~4-min idle stall read as a 60-min wall-clock kill -- the exact mis-label that sent the M2 no-op
+    # diagnosis chasing a phantom retry-budget bug. Pure + unit-tested (verify-runtimeout.ps1). An
+    # unknown/empty reason falls back to the ceiling phrasing (back-compat with pre-#740 Run objects).
+    param(
+        [string]$Reason = '',
+        [int]$MaxRunMinutes = 60,
+        [int]$IdleTimeoutSec = 240
+    )
+    if ($Reason -eq 'idle') {
+        return "STOPPED early: the coder went idle for ${IdleTimeoutSec}s (no new step or edit -- genuinely stuck), so it was stopped"
+    }
+    return "STOPPED at the ${MaxRunMinutes}-min hard ceiling (a generous absolute backstop)"
+}
+
 function Get-RunAnomalies {
     # Detective circuit breaker: scan an agent transcript for trouble signatures a
-    # small model tends to produce - a wall-clock timeout, the same line repeated
-    # many times (doom-loop), opencode's own doom-loop flag, or a non-zero exit.
-    # Conservative thresholds keep false positives low. LoopSuspected -> the fleet
-    # withholds auto-merge and parks the task for human review.
+    # small model tends to produce - a circuit-breaker stop (idle stall or wall-clock
+    # ceiling), the same line repeated many times (doom-loop), opencode's own doom-loop
+    # flag, or a non-zero exit. Conservative thresholds keep false positives low.
+    # LoopSuspected -> the fleet withholds auto-merge and parks the task for human review.
     # Returns: @{ Anomalies=[string[]]; LoopSuspected=[bool] }
     param(
         [Parameter(Mandatory)][string]$LogPath,
         [bool]$TimedOut = $false,
         $ExitCode = $null,
-        [int]$LoopThreshold = 12
+        [int]$LoopThreshold = 12,
+        [string]$TimeoutReason = ''   # #740/W7: 'idle' | 'ceiling' | '' -> honest label below
     )
     $anoms = New-Object System.Collections.ArrayList
     $loop = $false
-    if ($TimedOut) { [void]$anoms.Add('agent hit the wall-clock timeout and was stopped'); $loop = $true }
+    # #740/W7: an idle stall and a wall-clock kill BOTH set TimedOut, but they are different failures --
+    # calling an idle stall a "wall-clock timeout" misdiagnoses it (it misled the M2 plan's own no-op
+    # hypothesis). LoopSuspected stays TRUE either way (unchanged merge-gate soft-signal); only the text
+    # is made honest.
+    if ($TimedOut) {
+        $msg = if ($TimeoutReason -eq 'idle') { 'agent went idle (no new step or edit) and was stopped -- genuinely stuck' } else { 'agent hit the wall-clock timeout and was stopped' }
+        [void]$anoms.Add($msg); $loop = $true
+    }
     if (Test-Path $LogPath) {
         $lines = @(Get-Content $LogPath -ErrorAction SilentlyContinue)
         if ($lines.Count) {

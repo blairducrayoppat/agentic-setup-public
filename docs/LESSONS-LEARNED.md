@@ -7,7 +7,7 @@ Qwen3 assistant). BlarAI shares the hard parts — a local *quantized* model, an
 OpenVINO/OVMS-style server, Windows, a security-first bar, and a novice operator —
 so most of this transfers directly.
 
-**Status:** living journal - updated as new lessons surface. Last updated 2026-06-30.
+**Status:** living journal - updated as new lessons surface. Last updated 2026-07-05.
 New findings go in Part A (curated) and the dated Running Log at the bottom.
 
 Each lesson is tagged: ✅ worked · ❌ bit us (then fixed) · ⊘ dead end (tried, didn't
@@ -265,6 +265,7 @@ the model.**
 | E9 | On-wire proxy capture: dominant failure was **write-path truncation**, not format; temp/guided-gen are null levers | 🔬 |
 | E10 | OpenCode 1.17.3→**1.17.8**; extracted `Invoke-BuildWithRetry`; `verify-retry.ps1` suite; mutation-tested (6/6 mutants killed) | ✅ |
 | This session | Freed RAM for the 30B; **verify gate now runs pytest** (validated red/pass/fail); built the eligibility **dynamometer** (isolated, stdlib, authored acceptance tests); **found + fixed the `Start-Process` arg space-split bug** (`ConvertTo-Win32Arg`); retry-on-failure confirmed working in the field | ✅/❌→✅ |
+| 2026-07-05 (M2/W7) | **No-op diagnosis + honest timeout labelling.** Traced 2-of-3 landing-site no-op runs to a coder **read-then-stall** (idle-breaker kill, 0 changes) whose `TimedOut` flag also **stops best-of-N** so candidates 2–3 never sample. Found + fixed the report **mislabelling an idle stall as a 60-min wall-clock timeout** — the exact mis-label that misdirected the M2 plan's own hypothesis (`Get-TimeoutStopText` + `Get-RunAnomalies -TimeoutReason`, locked in `verify-runtimeout.ps1`, 45/45). Added OVMS `--cache_dir` (compile-cache reuse across swaps). Resample-on-idle left as an LA decision. | ❌→✅ |
 
 ---
 
@@ -276,6 +277,17 @@ the model.**
 - Read-deny case-evasion residual (above).
 - The 30B as an unattended **auto-merge reviewer** is unproven (the 14B reviewer is
   over-cautious and parks almost everything — the safe default).
+- **Coder "read-then-stall" no-op variance.** On some web tasks the 30B does a little
+  read-only exploration (a `glob` + a `read`) then stops emitting steps/edits *before
+  the first edit*; the idle breaker correctly kills it with zero changes. It is
+  non-deterministic (a re-queue of the same task succeeded). Two compounding facts:
+  (a) the stall is a model/serving reliability limit, same class as the tool-call tax;
+  (b) a timed-out candidate **stops best-of-N**, so one early idle stall no-ops the whole
+  dispatch instead of resampling. **Open decision:** make an *idle*-reason timeout
+  resample-eligible while keeping the wall-clock ceiling terminal (see
+  `docs/no-op-diagnosis-2026-07.md`). → BlarAI: a circuit-breaker report must name the
+  ACTUAL stop reason (idle vs wall-clock), or diagnosis chases phantom causes — this bit
+  the M2 plan itself.
 
 ---
 
@@ -1618,3 +1630,72 @@ BlarAI generates it, the fleet references it, all offline.
 elephant saying hello` at `-Concurrency 1` (F2's lever) — to watch a *generated* elephant PNG (not SVG)
 ride the 14B→30B swap, get referenced offline by the 30B via this hint, and auto-merge. Built on
 `feat/uc010-dispatch-asset-w4` off `#670`; LA gates both branches.
+
+## 2026-07-05 — Telling a stall apart from a runaway: idle timeouts become resample-eligible (#740/W7 follow-up)
+
+The #740/W7 sweep left one thing deliberately un-done: it made the *report* honest about idle-vs-ceiling
+timeouts but did **not** change what the fleet *does* with them — that was flagged as a DECISION for the LA
+(`docs/no-op-diagnosis-2026-07.md` §Recommendation). This is that decision, implemented and regression-locked.
+
+- 🔬 **The bug was a good rule applied too bluntly.** best-of-N (#689) treats a timed-out candidate as
+  TERMINAL — it stops sampling and never tries another candidate. That rule was written for the *expensive*
+  case: resampling a genuinely-too-slow coder 3× could burn 3×60 min. But the progress-aware idle breaker
+  (#682) folds a *second*, far cheaper failure into the same `TimedOut` flag — a coder that read a couple
+  files (~17 s) then went **silent before making a single edit**, killed fast as "genuinely stuck." On
+  2026-07-03 candidate 1 idle-stalled exactly that way, best-of-N called it terminal, N=3 collapsed to N=1,
+  and the whole dispatch **no-op'd** — while the operator's re-queued run (same task, fresh sample) merged.
+  An idle stall is precisely the random per-build slip best-of-N exists to route around; a wall-clock ceiling
+  hit is a genuine runaway that *should* stay terminal.
+- ✅ **The fix keys the terminal decision on the REASON — which was already captured, just unread.**
+  `Resolve-RunStopDecision` (#682) already tags every stop `'idle'` or `'ceiling'`, and #740/W7 already
+  threaded that reason onto the candidate's `Run` object. The classifier had the information all along; it
+  simply wasn't consulted at the best-of-N layer. New pure SSOT `Test-IsSamplingTerminal(TimedOut,
+  TimeoutReason, SecretBlocked)` — terminal on a secret or a **non-idle** timeout, **not** terminal on an idle
+  one. Both `-StopSampling` predicates (sequential + concurrent) delegate to it, and `Test-ShouldResample`
+  honours the same rule, so the two layers can't diverge. An idle candidate is now just a failed candidate:
+  best-of-N samples the next one, **bounded by the existing MaxCandidates budget** — no new budget, worst case
+  N × idle_timeout, then the run parks. Every other invariant is byte-identical: ceiling stays terminal,
+  secret stays terminal (it dominates even an idle reason), an empty/unknown reason falls back to ceiling (the
+  safe default — an unreadable reason must never silently become resample-eligible), and the concurrent batch
+  posture is unchanged (a batch holding a ceiling/secret candidate still terminates; an idle-only batch does
+  not).
+- 🔬 **The rejected alternative — keep idle terminal.** The path not taken was to leave the rule as-is and
+  attack the *coder* stall directly (harder act-first prompting, RESTART-AO robustness). Its appeal: a smaller
+  blast radius and no new time-cost. Rejected because it leaves the observed failure mode live — a single
+  early idle stall on candidate 1 **silently burns the entire dispatch cycle**, and the operator pays by
+  re-queuing by hand (twice, on 2026-07-03). The accepted downside is bounded and visible: an idle-prone or
+  *correlated* stall (OVMS wedged, model degraded) can now spend up to N idle timeouts before parking, where
+  before it spent one. That is a worse *cost* profile but a strictly better *outcome* profile — and the
+  correlated case is the one the RESTART-AO robustness line (R5) should catch, since it surfaces as "the
+  coder/backend stopped responding." We took the bounded-cost, no-silent-no-op path and **named** the
+  idle-storm cost rather than pretend it is zero.
+- 🔬 **Regression lock, mutation-checked.** `verify-bestofn` (68→**91/0**) and `verify-bestofn-concurrent`
+  (108→**132/0**) now drive the REAL orchestrators through the production reason-aware predicate: idle →
+  resample fires; ceiling / secret / empty → terminal; all-idle → bounded to N then park; plus wiring locks
+  that fail loudly if the delegation to `Test-IsSamplingTerminal` is ever reverted. `verify-retry` (47→**52**)
+  covers the same reason matrix on `Test-ShouldResample`. Proven to have teeth: reverting the helper to the
+  pre-change "any timeout is terminal" turned **exactly** the idle assertions RED (8 / 6 / 1) and nothing
+  else, then GREEN on restore. → BlarAI: when one flag folds two distinct failures together (cheap-stall vs
+  expensive-runaway), split the policy on the reason you *already record* before reaching for a new budget or
+  a coarser timeout.
+
+**Next:** the orchestrator reviews + merges `fix/idle-resample-eligible`; the on-hardware confirm is a live
+`/dispatch` where candidate 1 idle-stalls and best-of-N is watched to sample candidate 2 rather than no-op
+(the 2026-07-03 scenario, now expected to route around the stall). Pairs naturally with the RESTART-AO
+robustness line (R5) for the correlated-stall case this trade-off explicitly accepts.
+
+## 2026-07-09 — Design measurements to JOIN existing series, not stand alone (method)
+
+- 🔬 **When scoping a new benchmark/eval, first inventory the data series, knobs, and instruments the house
+  already holds — the new work should ride alongside them, not start a parallel universe.** Scoping the
+  llama.cpp-vs-OpenVINO A/B (blarai #769, the openvino#36270 lead), the LA specifically endorsed three
+  compounding moves: (1) the OV 35B-MoE leg exercises `MOE_USE_MICRO_GEMM_PREFILL` on/off because the house
+  already holds 30B-MoE data on that exact knob (blarai #708 `moe_flag` table) — one extra run turns a
+  standalone number into a two-model series; (2) the llama.cpp leg re-runs the existing #3937 thinking-toggle
+  probe, so a backend comparison doubles as a blocker-isolation experiment; (3) the GGUF chosen is the
+  upstream thread's exact artifact, so the local numbers join the public series too. Each addition cost
+  ~zero extra design and made the measurement worth strictly more. The LA named this the behavior he wants:
+  "compounding the lessons learned."
+- → **BlarAI:** the same rule the perf-log discipline already implies — every new measurement names its
+  comparable prior rows (same prompt set, same methodology tag) or explains why none exist. Before writing a
+  new harness, grep `docs/performance/` + `PERFORMANCE_LOG.md` for the series it should extend.

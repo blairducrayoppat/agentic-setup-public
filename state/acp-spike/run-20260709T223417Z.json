@@ -1,0 +1,246 @@
+{
+  "phase": "run",
+  "t_iso": "2026-07-09T22:34:17.981138+00:00",
+  "cwd": "C:/Users/mrbla/projects/acp-spike-cancel",
+  "model": "local/coder-30b",
+  "prompt_chars": 1088,
+  "cancel_after_s": 90.0,
+  "events_ndjson": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\run-20260709T223417Z.events.ndjson",
+  "opencode_pid": 17388,
+  "initialize": {
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": true,
+      "promptCapabilities": {
+        "image": true,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true,
+        "acp": false
+      },
+      "sessionCapabilities": {
+        "list": {},
+        "fork": {},
+        "resume": {},
+        "close": {}
+      },
+      "auth": {}
+    },
+    "authMethods": [
+      {
+        "id": "opencode-login",
+        "name": "Login with opencode",
+        "description": "Run `opencode auth login` in the terminal"
+      }
+    ],
+    "agentInfo": {
+      "name": "OpenCode",
+      "version": "1.17.8"
+    }
+  },
+  "new_session": {
+    "sessionId": "ses_0b6fb7e2affev2xB2g75GLz27X",
+    "configOptions": [
+      {
+        "currentValue": "local/qwen3-14b",
+        "options": [
+          {
+            "value": "opencode/big-pickle",
+            "name": "OpenCode Zen/Big Pickle"
+          },
+          {
+            "value": "opencode/deepseek-v4-flash-free",
+            "name": "OpenCode Zen/DeepSeek V4 Flash Free"
+          },
+          {
+            "value": "opencode/hy3-free",
+            "name": "OpenCode Zen/Hy3 Free"
+          },
+          {
+            "value": "opencode/mimo-v2.5-free",
+            "name": "OpenCode Zen/MiMo V2.5 Free"
+          },
+          {
+            "value": "opencode/nemotron-3-ultra-free",
+            "name": "OpenCode Zen/Nemotron 3 Ultra Free"
+          },
+          {
+            "value": "opencode/north-mini-code-free",
+            "name": "OpenCode Zen/North Mini Code Free"
+          },
+          {
+            "value": "local/qwen3-14b",
+            "name": "Local OVMS (Arc 140V)/Qwen3-14B INT4 — everyday/fleet tier"
+          },
+          {
+            "value": "local/coder-30b",
+            "name": "Local OVMS (Arc 140V)/Qwen3-Coder-30B-A3B INT4 — power tier (lean profile!)"
+          },
+          {
+            "value": "local/qwen3-vl-8b",
+            "name": "Local OVMS (Arc 140V)/Qwen3-VL-8B INT4 — vision/screenshots"
+          }
+        ],
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "type": "select"
+      },
+      {
+        "currentValue": "build",
+        "options": [
+          {
+            "value": "build",
+            "name": "build",
+            "description": "The default agent. Executes tools based on configured permissions."
+          },
+          {
+            "value": "critic",
+            "name": "critic",
+            "description": "Cross-model pre-merge code critic - finds ONLY real, test-checkable blockers; read-only, never edits, never runs tests or servers"
+          },
+          {
+            "value": "debug",
+            "name": "debug",
+            "description": "Evidence-first debugging - observe, hypothesize, smallest fix, verify"
+          },
+          {
+            "value": "plan",
+            "name": "plan",
+            "description": "Plan mode. Disallows all edit tools."
+          },
+          {
+            "value": "review",
+            "name": "review",
+            "description": "Read-only code reviewer - finds problems, never edits"
+          }
+        ],
+        "id": "mode",
+        "name": "Session Mode",
+        "category": "mode",
+        "type": "select"
+      }
+    ]
+  },
+  "session_id": "ses_0b6fb7e2affev2xB2g75GLz27X",
+  "model_selection": {
+    "via": "set_config_option",
+    "ok": true,
+    "resp": {
+      "configOptions": [
+        {
+          "currentValue": "local/coder-30b",
+          "options": [
+            {
+              "value": "opencode/big-pickle",
+              "name": "OpenCode Zen/Big Pickle"
+            },
+            {
+              "value": "opencode/deepseek-v4-flash-free",
+              "name": "OpenCode Zen/DeepSeek V4 Flash Free"
+            },
+            {
+              "value": "opencode/hy3-free",
+              "name": "OpenCode Zen/Hy3 Free"
+            },
+            {
+              "value": "opencode/mimo-v2.5-free",
+              "name": "OpenCode Zen/MiMo V2.5 Free"
+            },
+            {
+              "value": "opencode/nemotron-3-ultra-free",
+              "name": "OpenCode Zen/Nemotron 3 Ultra Free"
+            },
+            {
+              "value": "opencode/north-mini-code-free",
+              "name": "OpenCode Zen/North Mini Code Free"
+            },
+            {
+              "value": "local/qwen3-14b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-14B INT4 — everyday/fleet tier"
+            },
+            {
+              "value": "local/coder-30b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-Coder-30B-A3B INT4 — power tier (lean profile!)"
+            },
+            {
+              "value": "local/qwen3-vl-8b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-VL-8B INT4 — vision/screenshots"
+            }
+          ],
+          "id": "model",
+          "name": "Model",
+          "category": "model",
+          "type": "select"
+        },
+        {
+          "currentValue": "build",
+          "options": [
+            {
+              "value": "build",
+              "name": "build",
+              "description": "The default agent. Executes tools based on configured permissions."
+            },
+            {
+              "value": "critic",
+              "name": "critic",
+              "description": "Cross-model pre-merge code critic - finds ONLY real, test-checkable blockers; read-only, never edits, never runs tests or servers"
+            },
+            {
+              "value": "debug",
+              "name": "debug",
+              "description": "Evidence-first debugging - observe, hypothesize, smallest fix, verify"
+            },
+            {
+              "value": "plan",
+              "name": "plan",
+              "description": "Plan mode. Disallows all edit tools."
+            },
+            {
+              "value": "review",
+              "name": "review",
+              "description": "Read-only code reviewer - finds problems, never edits"
+            }
+          ],
+          "id": "mode",
+          "name": "Session Mode",
+          "category": "mode",
+          "type": "select"
+        }
+      ]
+    }
+  },
+  "cancel_sent_t_rel_s": 92.043,
+  "prompt_response": {
+    "stopReason": "end_turn",
+    "usage": {
+      "totalTokens": 0,
+      "inputTokens": 0,
+      "outputTokens": 0
+    },
+    "_meta": {}
+  },
+  "wall_clock_s": 92.513,
+  "stop_reason": "end_turn",
+  "event_count": 6,
+  "tool_call_event_count": 3,
+  "distinct_tool_calls": 1,
+  "tool_status_transitions": 3,
+  "permission_grants": 0,
+  "tool_call_summary": [
+    {
+      "id": "MEEEqRYvU",
+      "kind": "edit",
+      "title": "rpn.py",
+      "statuses": [
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    }
+  ],
+  "stderr_log": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\run-20260709T223417Z.opencode-stderr.log"
+}

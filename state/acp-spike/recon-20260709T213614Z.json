@@ -1,0 +1,136 @@
+{
+  "phase": "recon",
+  "t_iso": "2026-07-09T21:36:14.991144+00:00",
+  "cwd": "C:/Users/mrbla/projects/acp-spike-sandbox",
+  "sdk_protocol_version": 1,
+  "records": {
+    "initialize": {
+      "protocolVersion": 1,
+      "agentCapabilities": {
+        "loadSession": true,
+        "promptCapabilities": {
+          "image": true,
+          "audio": false,
+          "embeddedContext": true
+        },
+        "mcpCapabilities": {
+          "http": true,
+          "sse": true,
+          "acp": false
+        },
+        "sessionCapabilities": {
+          "list": {},
+          "fork": {},
+          "resume": {},
+          "close": {}
+        },
+        "auth": {}
+      },
+      "authMethods": [
+        {
+          "id": "opencode-login",
+          "name": "Login with opencode",
+          "description": "Run `opencode auth login` in the terminal"
+        }
+      ],
+      "agentInfo": {
+        "name": "OpenCode",
+        "version": "1.17.8"
+      }
+    },
+    "new_session": {
+      "sessionId": "ses_0b730a37cffe15Krl7noGQ5HrC",
+      "configOptions": [
+        {
+          "currentValue": "local/qwen3-14b",
+          "options": [
+            {
+              "value": "opencode/big-pickle",
+              "name": "OpenCode Zen/Big Pickle"
+            },
+            {
+              "value": "opencode/deepseek-v4-flash-free",
+              "name": "OpenCode Zen/DeepSeek V4 Flash Free"
+            },
+            {
+              "value": "opencode/hy3-free",
+              "name": "OpenCode Zen/Hy3 Free"
+            },
+            {
+              "value": "opencode/mimo-v2.5-free",
+              "name": "OpenCode Zen/MiMo V2.5 Free"
+            },
+            {
+              "value": "opencode/nemotron-3-ultra-free",
+              "name": "OpenCode Zen/Nemotron 3 Ultra Free"
+            },
+            {
+              "value": "opencode/north-mini-code-free",
+              "name": "OpenCode Zen/North Mini Code Free"
+            },
+            {
+              "value": "local/qwen3-14b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-14B INT4 — everyday/fleet tier"
+            },
+            {
+              "value": "local/coder-30b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-Coder-30B-A3B INT4 — power tier (lean profile!)"
+            },
+            {
+              "value": "local/qwen3-vl-8b",
+              "name": "Local OVMS (Arc 140V)/Qwen3-VL-8B INT4 — vision/screenshots"
+            }
+          ],
+          "id": "model",
+          "name": "Model",
+          "category": "model",
+          "type": "select"
+        },
+        {
+          "currentValue": "build",
+          "options": [
+            {
+              "value": "build",
+              "name": "build",
+              "description": "The default agent. Executes tools based on configured permissions."
+            },
+            {
+              "value": "critic",
+              "name": "critic",
+              "description": "Cross-model pre-merge code critic - finds ONLY real, test-checkable blockers; read-only, never edits, never runs tests or servers"
+            },
+            {
+              "value": "debug",
+              "name": "debug",
+              "description": "Evidence-first debugging - observe, hypothesize, smallest fix, verify"
+            },
+            {
+              "value": "plan",
+              "name": "plan",
+              "description": "Plan mode. Disallows all edit tools."
+            },
+            {
+              "value": "review",
+              "name": "review",
+              "description": "Read-only code reviewer - finds problems, never edits"
+            }
+          ],
+          "id": "mode",
+          "name": "Session Mode",
+          "category": "mode",
+          "type": "select"
+        }
+      ]
+    }
+  },
+  "opencode_pid": 18524,
+  "plugin_parity": {
+    "markers": {
+      "command-timeout": true,
+      "path-normalize": true
+    },
+    "loader_errors": [],
+    "stderr_log": "C:\\Users\\mrbla\\agentic-setup\\state\\acp-spike\\recon-20260709T213614Z.opencode-stderr.log",
+    "stderr_bytes": 4185
+  }
+}

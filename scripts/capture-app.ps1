@@ -88,10 +88,17 @@ function Write-Tier($n, $msg) { Write-Host "  [tier-$n] $msg" }
 # -- Resolve App.exe ----------------------------------------------------------
 function Find-AppExe {
     param([string]$Root)
-    # Search common build-output paths: bin/x64/<tfm>/win-x64/ and bin/x64/<tfm>/
+    # Search common build-output paths: bin/x64/<tfm>/win-x64/ and bin/x64/<tfm>/.
+    # EXCLUDE node_modules (mirrors Find-WebEntry below): a WEB surface has no WinUI App.exe of
+    # its own, but its dependency tree can ship a stray binary literally named App.exe. Found
+    # LIVE 2026-07-06: a node_modules\...\App.exe made this return a false positive, which
+    # SKIPPED the headless web tier AND drove Tier 2 to LAUNCH + SetForegroundWindow that
+    # arbitrary binary -- an unattended screen-take + arbitrary-exec of a dependency binary,
+    # then a blind structural floor. Excluding node_modules makes a web project route
+    # deterministically to the headless web tier (the unattended-safe path).
     $candidates = @(
         Get-ChildItem -Path $Root -Recurse -Filter 'App.exe' -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\\.git\\' } |
+            Where-Object { $_.FullName -notmatch '\\(node_modules|\.git)\\' } |
             Sort-Object LastWriteTime -Descending
     )
     if ($candidates.Count -gt 0) { return $candidates[0].FullName }
@@ -119,6 +126,26 @@ function Find-Edge {
     foreach ($p in "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                    "C:\Program Files\Microsoft\Edge\Application\msedge.exe") {
         if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+# -- Resolve the app's real server entry, if one exists (#772) -----------------------------
+function Find-WebServerEntry {
+    param([string]$Root, [string]$IndexHtml)
+    # The fleet web seed is src/server.js honoring $env:PORT (node built-ins
+    # only, no npm install). Walk up from index.html to the dir holding
+    # package.json (public/ lives beside src/), capped at the capture root.
+    $dir = Split-Path -Parent $IndexHtml
+    for ($i = 0; $i -lt 3 -and $dir -and ($dir.Length -ge $Root.Length); $i++) {
+        if (Test-Path (Join-Path $dir 'package.json')) {
+            foreach ($rel in 'src/server.js', 'server.js') {
+                $srv = Join-Path $dir $rel
+                if (Test-Path $srv) { return @{ Root = $dir; Server = (Resolve-Path $srv).Path } }
+            }
+            return $null   # package.json but no known server entry -> static fallback
+        }
+        $dir = Split-Path -Parent $dir
     }
     return $null
 }
@@ -255,8 +282,16 @@ if ($tier2Ok) {
 # web dispatch fell through to the structural floor and the VLM design critique was SKIPPED --
 # the design loop was blind on the primary surface. Render the entry page off-screen with
 # headless Edge (--headless=new needs its own --user-data-dir) into a PNG the VLM can judge.
-# file:// renders the static layout/theme/colours the critique cares about (server-fetched data
-# does not run, but the look does). Fails soft -> falls through to the structural floor.
+#
+# THE CAPTURE MUST SERVE THE APP, NOT file:// IT (#772, proven 2026-07-09): browsers block
+# <script type="module"> entirely over file:// (CORS, origin null) -- not just data fetches,
+# the whole client never executes. The fleet's own web seed is "type":"module", so under
+# file:// every module-JS app screenshots as a dead shell ("Loading...", flat pixels) and no
+# design fix the coder makes can ever become visible -- B5 attempt-4 STALLED [VERIFY] on
+# exactly this while the same merged code rendered fully over its real node server. So: start
+# the app's server on an ephemeral port, capture http://127.0.0.1:<port>/, ALWAYS kill the
+# server tree after (#773 class). file:// remains ONLY the fallback for genuinely static
+# pages (no server entry), where it renders fine. Fails soft -> structural floor.
 $webOk = $false
 if (-not $resolvedExe) {
     $indexHtml = Find-WebEntry -Root $AppDir
@@ -267,7 +302,50 @@ if (-not $resolvedExe) {
             Write-Tier web "SKIP: msedge.exe not found"
         } else {
             $edgeProfile = Join-Path ([System.IO.Path]::GetTempPath()) ("edge-capture-" + [guid]::NewGuid().ToString('N'))
-            $uri = "file:///" + ($indexHtml -replace '\\', '/')
+            $uri = "file:///" + ($indexHtml -replace '\\', '/')   # static-page fallback
+            $srvProc = $null
+            $serveInfo = Find-WebServerEntry -Root $AppDir -IndexHtml $indexHtml
+            if ($serveInfo) {
+                # Ephemeral port, never the seed default 3000 -- an orphaned job
+                # server may still hold it (#773) and would serve the WRONG app.
+                # The port must be VERIFIED FREE before the spawn: a standing
+                # listener in the range (Vikunja lives on 3456) would kill node
+                # on bind while the TCP probe happily connects to the squatter
+                # and the shot captures the WRONG app -- worse than no shot.
+                $port = 0
+                foreach ($cand in (Get-Random -Minimum 3400 -Maximum 3999 -Count 20)) {
+                    try {
+                        $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $cand)
+                        $l.Start(); $l.Stop(); $port = $cand; break
+                    } catch { }
+                }
+                try {
+                    if ($port -eq 0) { throw "no free port found in 3400-3999" }
+                    $srvProc = Start-Process node -ArgumentList ('"' + $serveInfo.Server + '"') `
+                        -WorkingDirectory $serveInfo.Root -WindowStyle Hidden -PassThru `
+                        -Environment @{ PORT = "$port" } -ErrorAction Stop
+                    $dlSrv = (Get-Date).AddSeconds(10)
+                    $srvUp = $false
+                    while ((Get-Date) -lt $dlSrv) {
+                        if ($srvProc.HasExited) { break }   # crashed (bad entry, bind fail) -> fallback
+                        try {
+                            $probe = [System.Net.Sockets.TcpClient]::new()
+                            $probe.Connect('127.0.0.1', $port); $probe.Close(); $srvUp = $true; break
+                        } catch { Start-Sleep -Milliseconds 300 }
+                    }
+                    # Belt over the pre-check's braces: the answering socket only
+                    # counts if OUR server is the thing still alive behind it.
+                    if ($srvUp -and $srvProc.HasExited) { $srvUp = $false }
+                    if ($srvUp) {
+                        $uri = "http://127.0.0.1:$port/"
+                        Write-Host "Tier web: serving $($serveInfo.Server) on :$port -- capturing the LIVE app"
+                    } else {
+                        Write-Tier web "app server did not come up in 10s -> file:// static fallback"
+                    }
+                } catch {
+                    Write-Tier web "app server spawn failed ($($_.Exception.Message)) -> file:// static fallback"
+                }
+            }
             try {
                 # ARG ORDER + FLAGS ARE LOAD-BEARING (pinned empirically 2026-06-26): msedge
                 # --screenshot SILENTLY no-ops (exit 0, NO PNG written) when --hide-scrollbars is
@@ -306,6 +384,12 @@ if (-not $resolvedExe) {
                 if (-not $webOk) { Write-Tier web "FAIL: no screenshot within ${WebTimeoutSec}s -> fall through to tier 3" }
             } catch {
                 Write-Tier web "FAIL: $($_.Exception.Message) -> fall through to tier 3"
+            } finally {
+                # The capture's OWN app server must never outlive the shot (#773):
+                # kill its whole tree, whatever branch got us here.
+                if ($srvProc -and -not $srvProc.HasExited) {
+                    try { & taskkill.exe /PID $srvProc.Id /T /F *> $null } catch {}
+                }
             }
         }
     }

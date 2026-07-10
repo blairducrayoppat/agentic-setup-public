@@ -20,11 +20,16 @@
 //
 // Auto-discovered from ~/.config/opencode/plugin/*.js (01-install-opencode.ps1 / sync-harness.ps1
 // deploy configs/opencode-plugins/*.js there); no opencode.json entry is needed.
+//
+// LOADER CONSTRAINT (#759 recon, 2026-07-07): opencode's plugin loader treats EVERY named export
+// as a plugin factory and rejects the whole file if one is not a function ("Plugin export is not
+// a function"). Export functions-intended-as-plugins ONLY — the regex and helper stay module-
+// private; the tests drive the hook through the factory instead of importing them.
 
 // A Windows drive-path token: a drive letter + ':' + at least one backslash, then run on through
 // any path characters (incl. further '\' and '/') until whitespace or a shell metacharacter ends it.
 // The leading `[A-Za-z]:\\` is the scope guard: a bare backslash escape (no drive prefix) never matches.
-export const WIN_DRIVE_PATH_RE = /[A-Za-z]:\\[^\s"'|&;<>(){}`]*/g;
+const WIN_DRIVE_PATH_RE = /[A-Za-z]:\\[^\s"'|&;<>(){}`]*/g;
 
 /**
  * Convert the backslashes inside Windows drive-path tokens to forward slashes, leaving the rest of
@@ -32,7 +37,7 @@ export const WIN_DRIVE_PATH_RE = /[A-Za-z]:\\[^\s"'|&;<>(){}`]*/g;
  * @param {string} command
  * @returns {string}
  */
-export function normalizeWindowsDrivePaths(command) {
+function normalizeWindowsDrivePaths(command) {
   if (typeof command !== "string" || command.length === 0) return command;
   return command.replace(WIN_DRIVE_PATH_RE, (token) => token.replace(/\\/g, "/"));
 }

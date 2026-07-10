@@ -61,9 +61,32 @@ public partial class App : Application
     private const uint SWP_NOACTIVATE = 0x0010;
     private const uint SWP_SHOWWINDOW = 0x0040;
 
+    // Console attach for the guard/test/render messages (#684): a WinExe has NO attached
+    // console, so System.Console writes go to a detached stream `dotnet run` never shows.
+    // The live effect: the headless-build guard's "do NOT launch the app" guidance was
+    // invisible to the coder, which retried `dotnet run` 7x in one build.
+    [DllImport("kernel32.dll")] private static extern bool AttachConsole(int dwProcessId);
+    private const int ATTACH_PARENT_PROCESS = -1;
+
+    /// <summary>
+    /// Attach to the parent process's console (if any) so Console.WriteLine reaches the
+    /// invoker (`dotnet run`, a coder's shell). MUST run before the FIRST System.Console
+    /// use: .NET binds Console.Out lazily, so attaching first makes the lazy init pick up
+    /// the attached console with no stream re-opening. Fail-soft by design: launched from
+    /// Explorer (no parent console) or already attached, the call fails and nothing
+    /// changes -- the GUI path is unaffected, and test-results.txt remains the durable
+    /// fallback channel for --test.
+    /// </summary>
+    static void TryAttachParentConsole()
+    {
+        try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { /* best-effort */ }
+    }
+
     [System.STAThread]
     static int Main(string[] args)
     {
+        TryAttachParentConsole();  // #684: before ANY Console use (see the helper's doc)
+
         // OFFLINE SELF-TEST MODE: run the dependency-free Calculator tests and exit. No GUI.
         if (System.Array.IndexOf(args, "--test") >= 0)
         {
@@ -126,9 +149,10 @@ public partial class App : Application
     // Exit code set by the render path on the UI thread; read after Application.Start returns.
     private static int _renderExitCode = 0;
 
-    // Surface the test outcome on the console AND in test-results.txt -- a WinExe has no
-    // attached console, so the file is the reliable channel the coder reads for the detail
-    // (the process EXIT CODE, 0 or 1, is always the source of truth for pass/fail).
+    // Surface the test outcome on the console AND in test-results.txt. With the #684
+    // parent-console attach the console line reaches `dotnet run` too, but the file stays
+    // the DURABLE channel (no parent console -> the attach no-ops) and the process EXIT
+    // CODE, 0 or 1, is always the source of truth for pass/fail.
     static void ReportTestResult(string text, bool isError)
     {
         if (isError) { System.Console.Error.WriteLine(text); } else { System.Console.WriteLine(text); }

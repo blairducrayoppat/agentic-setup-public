@@ -17,7 +17,14 @@
 // SMALLER timeout is left alone (tighter is fine). This is strictly a CAP — it never
 // loosens a model-chosen shorter timeout.
 //
-// Registered via the `plugin` array in opencode.json (absolute path to this file).
+// Auto-discovered from ~/.config/opencode/plugin/*.js (01-install-opencode.ps1 / sync-harness.ps1
+// deploy configs/opencode-plugins/*.js there); no opencode.json entry is needed.
+//
+// LOADER CONSTRAINT (#759 recon, 2026-07-07): opencode's plugin loader treats EVERY named export
+// as a plugin factory and rejects the whole file if one is not a function ("Plugin export is not
+// a function") — the regex exports added in the #687/#688 wave silently killed this plugin AND
+// path-normalize.js from 2026-06-30 onward. Export functions-intended-as-plugins ONLY; the
+// regexes stay module-private and the tests drive the hook through the factory.
 
 const MAX_COMMAND_MS = Number(process.env.OPENCODE_BASH_MAX_MS) || 300000; // 5 min hard cap
 
@@ -38,7 +45,7 @@ const SELF_BOUNDED_RE = /(^|[|&;]|\s)timeout\s+\d/i; // already wrapped in `time
 // `start http://localhost:3000` mid-build (it stole the operator's focus). AGENTS.md forbids a
 // foreground browser; this ENFORCES it. Matches only a real URL scheme, so `start notepad` / a
 // bare `start .` / `npm start` are untouched (npm start is handled by BLOCKING_RE separately).
-export const BROWSER_OPEN_RE = /(^|[|&;]|\s)(start|open|xdg-open|explorer(\.exe)?|sensible-browser)\s+[^|&;\n]*\bhttps?:\/\//i;
+const BROWSER_OPEN_RE = /(^|[|&;]|\s)(start|open|xdg-open|explorer(\.exe)?|sensible-browser)\s+[^|&;\n]*\bhttps?:\/\//i;
 
 /** @type {import("@opencode-ai/plugin").Plugin} */
 export const CommandTimeoutPlugin = async () => {

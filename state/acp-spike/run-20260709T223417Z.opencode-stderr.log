@@ -1,0 +1,47 @@
+timestamp=2026-07-09T22:34:18.493Z level=INFO run=5d4b5b62 message="creating instance" directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"
+timestamp=2026-07-09T22:34:18.494Z level=INFO run=5d4b5b62 message=fromDirectory directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"
+timestamp=2026-07-09T22:34:18.670Z level=INFO run=5d4b5b62 message=bootstrapping directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"
+timestamp=2026-07-09T22:34:18.674Z level=INFO run=5d4b5b62 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\config.json"
+timestamp=2026-07-09T22:34:18.675Z level=INFO run=5d4b5b62 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.json"
+timestamp=2026-07-09T22:34:18.685Z level=INFO run=5d4b5b62 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.jsonc"
+[path-normalize] loaded: Windows drive-path backslashes in bash commands -> forward slashes
+[command-timeout] loaded: bash/shell commands capped at 300000ms (server probe 10000ms)
+timestamp=2026-07-09T22:34:18.752Z level=INFO run=5d4b5b62 message="all LSPs are disabled"
+timestamp=2026-07-09T22:34:18.754Z level=INFO run=5d4b5b62 message="all formatters are disabled"
+timestamp=2026-07-09T22:34:18.754Z level=INFO run=5d4b5b62 message=init
+timestamp=2026-07-09T22:34:18.929Z level=INFO run=5d4b5b62 message="setup connection"
+timestamp=2026-07-09T22:34:18.975Z level=INFO run=5d4b5b62 message="global event connected"
+timestamp=2026-07-09T22:34:18.982Z level=INFO run=5d4b5b62 message="creating instance" directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"
+timestamp=2026-07-09T22:34:18.982Z level=INFO run=5d4b5b62 message=fromDirectory directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"
+timestamp=2026-07-09T22:34:19.120Z level=INFO run=5d4b5b62 message=bootstrapping directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"
+timestamp=2026-07-09T22:34:19.121Z level=INFO run=5d4b5b62 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\config.json"
+timestamp=2026-07-09T22:34:19.122Z level=INFO run=5d4b5b62 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.json"
+timestamp=2026-07-09T22:34:19.124Z level=INFO run=5d4b5b62 message=loading path="C:\\Users\\mrbla\\.config\\opencode\\opencode.jsonc"
+[path-normalize] loaded: Windows drive-path backslashes in bash commands -> forward slashes
+[command-timeout] loaded: bash/shell commands capped at 300000ms (server probe 10000ms)
+timestamp=2026-07-09T22:34:19.132Z level=INFO run=5d4b5b62 message="all LSPs are disabled"
+timestamp=2026-07-09T22:34:19.132Z level=INFO run=5d4b5b62 message="all formatters are disabled"
+timestamp=2026-07-09T22:34:19.132Z level=INFO run=5d4b5b62 message=init
+timestamp=2026-07-09T22:34:19.320Z level=INFO run=5d4b5b62 message="booting location services" directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel" workspaceID=undefined
+timestamp=2026-07-09T22:34:19.334Z level=INFO run=5d4b5b62 message=init count=28
+timestamp=2026-07-09T22:34:19.588Z level=INFO run=5d4b5b62 message="watcher backend" directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel" platform=win32 backend=windows
+timestamp=2026-07-09T22:34:19.982Z level=INFO run=5d4b5b62 message="project copy refresh started" projectID=97946fc9cdc0998a18c2115816a140b35dc0148d
+timestamp=2026-07-09T22:34:19.989Z level=INFO run=5d4b5b62 message=created id=ses_0b6fb7e2affev2xB2g75GLz27X slug=eager-comet version=1.17.8 projectID=97946fc9cdc0998a18c2115816a140b35dc0148d directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel" path="" workspaceID=undefined parentID=undefined title="New session - 2026-07-09T22:34:19.989Z" agent=build model.id=qwen3-14b model.providerID=local metadata=undefined permission=undefined cost=0 tokens.input=0 tokens.output=0 tokens.reasoning=0 tokens.cache.read=0 tokens.cache.write=0 time.created=1783636459989 time.updated=1783636459989
+timestamp=2026-07-09T22:34:20.056Z level=INFO run=5d4b5b62 message=loop session.id=ses_0b6fb7e2affev2xB2g75GLz27X step=0
+timestamp=2026-07-09T22:34:20.066Z level=INFO run=5d4b5b62 message="shell tool using shell" shell="C:\\Program Files\\Git\\bin\\bash.exe"
+timestamp=2026-07-09T22:34:20.096Z level=INFO run=5d4b5b62 message=stream providerID=local modelID=coder-30b session.id=ses_0b6fb7e2affev2xB2g75GLz27X small=true agent=title mode=primary
+timestamp=2026-07-09T22:34:20.112Z level=INFO run=5d4b5b62 message="llm runtime selected" llm.runtime=ai-sdk llm.provider=local llm.model=coder-30b
+timestamp=2026-07-09T22:34:20.129Z level=INFO run=5d4b5b62 message=process session.id=ses_0b6fb7e2affev2xB2g75GLz27X messageID=msg_f4904821a001ocaL5gztwSJrkg
+timestamp=2026-07-09T22:34:20.130Z level=INFO run=5d4b5b62 message=stream providerID=local modelID=coder-30b session.id=ses_0b6fb7e2affev2xB2g75GLz27X small=false agent=build mode=primary
+timestamp=2026-07-09T22:34:20.142Z level=INFO run=5d4b5b62 message="llm runtime selected" llm.runtime=ai-sdk llm.provider=local llm.model=coder-30b
+timestamp=2026-07-09T22:34:20.173Z level=INFO run=5d4b5b62 message="project copy refresh done" projectID=97946fc9cdc0998a18c2115816a140b35dc0148d updated=[] removed=[]
+timestamp=2026-07-09T22:35:34.810Z level=INFO run=5d4b5b62 message=evaluated permission=edit pattern=rpn.py action.permission=edit action.pattern=* action.action=allow
+timestamp=2026-07-09T22:35:34.820Z level=INFO run=5d4b5b62 message=formatting file=C:/Users/mrbla/projects/acp-spike-cancel/rpn.py
+timestamp=2026-07-09T22:35:34.821Z level=INFO run=5d4b5b62 message="touching file" file=C:/Users/mrbla/projects/acp-spike-cancel/rpn.py
+timestamp=2026-07-09T22:35:34.833Z level=INFO run=5d4b5b62 message=loop session.id=ses_0b6fb7e2affev2xB2g75GLz27X step=1
+timestamp=2026-07-09T22:35:34.856Z level=INFO run=5d4b5b62 message=process session.id=ses_0b6fb7e2affev2xB2g75GLz27X messageID=msg_f4905a6320010TipHS4kjT38Rf
+timestamp=2026-07-09T22:35:34.857Z level=INFO run=5d4b5b62 message=stream providerID=local modelID=coder-30b session.id=ses_0b6fb7e2affev2xB2g75GLz27X small=false agent=build mode=primary
+timestamp=2026-07-09T22:35:34.860Z level=INFO run=5d4b5b62 message="llm runtime selected" llm.runtime=ai-sdk llm.provider=local llm.model=coder-30b
+timestamp=2026-07-09T22:35:50.035Z level=INFO run=5d4b5b62 message=cancel session.id=ses_0b6fb7e2affev2xB2g75GLz27X
+timestamp=2026-07-09T22:35:50.039Z level=ERROR run=5d4b5b62 message=process session.id=ses_0b6fb7e2affev2xB2g75GLz27X messageID=msg_f4905a6320010TipHS4kjT38Rf error=Aborted stack=undefined
+timestamp=2026-07-09T22:35:50.128Z level=INFO run=5d4b5b62 message="disposing instance" directory="C:\\Users\\mrbla\\projects\\acp-spike-cancel"

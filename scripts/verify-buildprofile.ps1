@@ -51,10 +51,10 @@ Assert-Eq 'web'        (Resolve-BuildProfile -Surface 'web').scaffold          '
 Assert-Eq 'android'    (Resolve-BuildProfile -Surface 'mobile').scaffold       'BP3 mobile -> android'
 Assert-Eq 'powershell' (Resolve-BuildProfile -Surface 'automation').scaffold   'BP4 automation -> powershell'
 # command-line: default + language_hint refinement
-Assert-Eq 'dotnet-console' (Resolve-BuildProfile -Surface 'command-line').scaffold                      'BP5 command-line (no hint) -> dotnet-console (house default)'
+Assert-Eq 'python'         (Resolve-BuildProfile -Surface 'command-line').scaffold                      'BP5 command-line (no hint) -> python (house default: Python-centric AI, consistent with library; #740)'
 Assert-Eq 'python'         (Resolve-BuildProfile -Surface 'command-line' -LanguageHint 'python').scaffold 'BP6 command-line + python -> python'
 Assert-Eq 'dotnet-console' (Resolve-BuildProfile -Surface 'command-line' -LanguageHint 'dotnet').scaffold 'BP7 command-line + dotnet -> dotnet-console'
-Assert-Eq 'web'            (Resolve-BuildProfile -Surface 'command-line' -LanguageHint 'node').scaffold   'BP8 command-line + node -> web'
+Assert-Eq 'node-cli'       (Resolve-BuildProfile -Surface 'command-line' -LanguageHint 'node').scaffold   'BP8 command-line + node -> node-cli (a node CLI, NOT a node web server; #740)'
 Assert-Eq 'cpp'            (Resolve-BuildProfile -Surface 'command-line' -LanguageHint 'cpp').scaffold    'BP9 command-line + cpp -> cpp'
 Assert-Eq 'powershell'     (Resolve-BuildProfile -Surface 'command-line' -LanguageHint 'powershell').scaffold 'BP10 command-line + powershell -> powershell'
 # library: default + refinement

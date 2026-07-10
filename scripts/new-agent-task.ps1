@@ -212,10 +212,14 @@ if ($langConstraint) {
 # precision -- is the weak-model bottleneck; N fresh samples route around self-correction (a weaker open
 # model went 15.9% -> 56% on SWE-bench Lite from repeated sampling -- arXiv 2407.21787). N reuses the
 # existing complexity-scaled build budget ($MaxVerifyAttempts: simple 2 / moderate 3 / complex 5, staged
-# floor 5). SEQUENTIAL with early-exit (an easy task = candidate 1 green = ONE build, like today);
-# Invoke-BestOfN is the seam a future change makes CONCURRENT via OVMS continuous batching (measured
-# separately, Vikunja #695). POLICY is the unit-tested Invoke-BestOfN / Test-IsCandidateGreen /
-# Get-CandidateRank (fleet-lib.ps1; see verify-bestofn.ps1); the real MECHANISM is injected below.
+# floor 5). Two execution paths select on the resolved concurrency C (computed above): C=1 runs the
+# SEQUENTIAL best-of-N with early-exit (an easy task = candidate 1 green = ONE build, byte-identical to
+# the original #689 path); C>1 runs Invoke-BestOfNBatched (#695, SHIPPED -- the concurrent path is the
+# production default, ~line 278 below) which builds candidates CONCURRENTLY in batches of C, each in its
+# own worktree off $codeBase, all hitting the shared OVMS server so continuous batching overlaps them.
+# POLICY is the unit-tested Invoke-BestOfN / Invoke-BestOfNBatched / Test-IsCandidateGreen /
+# Get-CandidateRank (fleet-lib.ps1; see verify-bestofn.ps1 + verify-bestofn-concurrent.ps1); the real
+# MECHANISM is injected below.
 $priorReviewConcerns = ''
 $everFixFirst = $false
 $reviewPass = 0
@@ -262,7 +266,8 @@ $BuildTestVerify = {
         -AttemptPrompt $attemptPrompt -LogPath $logPath -Task $Task -BaseBranch $BaseBranch `
         -MaxBuildAttempts $MaxBuildAttempts -MaxRunMinutes $MaxRunMinutes -IdleTimeoutSec $IdleTimeoutSec `
         -OracleActive $oracleActive -AcceptanceTestPath $AcceptanceTestPath -Surface $Surface `
-        -LanguageHint $LanguageHint -ResetToBase $resetToBase
+        -LanguageHint $LanguageHint -ResetToBase $resetToBase `
+        -ShouldCancel { Test-DispatchCancelled }   # #771: honour a `/dispatch stop` between this candidate's gate steps
 }
 
 # ---- BEST-OF-N BUILD: up to N independent diverse candidates; the gate selects the winner ----
@@ -278,9 +283,10 @@ $concurrencyNote = ''                 # a non-blocking note surfaced into the re
 if ($Concurrency -gt 1) {
     try {
         $bon = Invoke-BestOfNBatched -MaxCandidates $MaxVerifyAttempts -Concurrency $Concurrency `
+            -ShouldCancel { Test-DispatchCancelled } `
             -OnBatch { param($idxs, $n) Write-Host "[1/5] Building $($idxs.Count) candidate(s) CONCURRENTLY ($($idxs -join ', ') of $n) in isolated worktrees ($Model, max $MaxRunMinutes min each)..." -ForegroundColor Cyan } `
             -IsWinner { param($c) Test-IsCandidateGreen -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked } `
-            -StopSampling { param($c) ([bool]$c.SecretBlocked) -or ([bool]$c.TimedOut) } `
+            -StopSampling { param($c) Test-IsSamplingTerminal -SecretBlocked $c.SecretBlocked -TimedOut $c.TimedOut -TimeoutReason "$($c.Run.TimeoutReason)" } `
             -ScoreCandidate { param($c) Get-CandidateRank -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -LoopSuspected $c.LoopSuspected } `
             -RunBatch {
                 param($idxs, $n)
@@ -302,7 +308,10 @@ if ($Concurrency -gt 1) {
                     $job = Start-Job -ScriptBlock {
                         param($sr, $w, $mdl, $cb, $ap, $lp, $tk, $bb, $mba, $mrm, $idle, $oa, $atp, $sf, $lh)
                         . "$sr\fleet-lib.ps1"
-                        Invoke-CandidateBuild -ScriptRoot $sr -Worktree $w -Model $mdl -CodeBase $cb -AttemptPrompt $ap -LogPath $lp -Task $tk -BaseBranch $bb -MaxBuildAttempts $mba -MaxRunMinutes $mrm -IdleTimeoutSec $idle -OracleActive $oa -AcceptanceTestPath $atp -Surface $sf -LanguageHint $lh
+                        # #771: the Start-Job child reads the SAME on-disk cancel sentinel (Test-DispatchCancelled
+                        # anchors on fleet-lib's dir == $sr), so a concurrent candidate honours a stop between its
+                        # own gate steps too -- not only the parent's between-batch check.
+                        Invoke-CandidateBuild -ScriptRoot $sr -Worktree $w -Model $mdl -CodeBase $cb -AttemptPrompt $ap -LogPath $lp -Task $tk -BaseBranch $bb -MaxBuildAttempts $mba -MaxRunMinutes $mrm -IdleTimeoutSec $idle -OracleActive $oa -AcceptanceTestPath $atp -Surface $sf -LanguageHint $lh -ShouldCancel { Test-DispatchCancelled }
                     } -ArgumentList $ScriptDir, $m.wt, $Model, $codeBase, $m.prompt, $m.log, $Task, $BaseBranch, $MaxBuildAttempts, $MaxRunMinutes, $IdleTimeoutSec, $oracleActive, $AcceptanceTestPath, $Surface, $LanguageHint
                     $jobs += @{ k = $k; job = $job }
                 }
@@ -339,9 +348,10 @@ if ($Concurrency -gt 1) {
 if ($null -eq $bon) {
     # ---- SEQUENTIAL best-of-N (C=1, or the concurrent fallback): today's EXACT path (#689), byte-identical ----
     $bon = Invoke-BestOfN -MaxCandidates $MaxVerifyAttempts `
+        -ShouldCancel { Test-DispatchCancelled } `
         -OnCandidate { param($k, $n) if ($k -gt 1) { Write-Host "  Candidate $($k - 1) did not pass the gate; trying a FRESH independent candidate ($k/$n)..." -ForegroundColor Yellow } } `
         -IsWinner { param($c) Test-IsCandidateGreen -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked } `
-        -StopSampling { param($c) ([bool]$c.SecretBlocked) -or ([bool]$c.TimedOut) } `
+        -StopSampling { param($c) Test-IsSamplingTerminal -SecretBlocked $c.SecretBlocked -TimedOut $c.TimedOut -TimeoutReason "$($c.Run.TimeoutReason)" } `
         -ScoreCandidate { param($c) Get-CandidateRank -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -LoopSuspected $c.LoopSuspected } `
         -RunCandidate {
             param($k, $n)
@@ -360,6 +370,13 @@ if ($null -eq $bon) {
 
 # ---- SELECT (the gate, never a model) + restore the winner / best partial onto the worktree ----
 $sel = $bon.Selected
+# #771 STOP-CONTRACT: best-of-N observed a `/dispatch stop` between candidates -> proceed PROMPTLY to this
+# task's finish so the swap driver reaches its normal teardown (stop OVMS -> restore 14B -> terminal stamp) at
+# the next task boundary, instead of the run-budget watchdog tearing down an hour later. A cancelled run has NO
+# green winner (best-of-N breaks on the first green BEFORE any cancel), so its selection is at best a parked
+# partial: skip the review-FIX loop (more agent runs) and never auto-merge a gate we cut short.
+$dispatchCancelled = [bool]$bon.Cancelled
+if ($dispatchCancelled) { Write-Host "  STOP: dispatch cancel observed; parking after the current candidate and proceeding to teardown (no fresh candidates, no review-fix churn) (#771)." -ForegroundColor Yellow }
 # Security posture preserved (#689): a SECRET-blocked candidate is SURFACED + parked, NEVER sampled-away.
 # Scan ALL candidates for a secret (sequential: it is the last candidate that stopped the loop; concurrent: it
 # can be anywhere in the stopping batch). If the run STOPPED on a secret, keep that candidate's worktree state.
@@ -429,11 +446,32 @@ $verdict = 'UNCLEAR'; $reviewTail = ''
 if ($hasChanges -and ($verifyResult -eq 'pass') -and ($testResult -eq 'pass')) {
     Write-Host "[4/5] Review SKIPPED - deterministic gates are GREEN (build + tests + verify pass); the gate decides the merge and the cross-model critic reviews post-merge." -ForegroundColor DarkGray
 }
-while ($hasChanges -and (Test-ShouldRunReview -HasChanges $hasChanges -VerifyResult $verifyResult -TestResult $testResult)) {
+while ($hasChanges -and -not $dispatchCancelled -and (Test-ShouldRunReview -HasChanges $hasChanges -VerifyResult $verifyResult -TestResult $testResult)) {   # #771: a stopped run skips review-FIX (no more agent churn)
     Write-Host "[4/5] Review agent is judging the changes (max $MaxReviewMinutes min)..." -ForegroundColor Cyan
     $ReviewLog = $Report -replace '\.txt$', '.review.log'
+    # #694: gather the diff IN POWERSHELL and embed it in the prompt (the exact critic-run.ps1
+    # posture) so the review agent needs no git/bash -- its read-only contract is then ENFORCED
+    # (bash: deny in review.md), not merely requested. Live incident (run 20260627-083757-bd):
+    # the old prompt told the reviewer to run `git diff` itself, which required bash, and a
+    # bash-capable agent mutated the worktree DURING the "read-only" review (namespace edit +
+    # an untracked Tests/ dir), leaving an un-buildable parked tree over a buildable commit.
+    # Re-gathered EVERY pass: a review-FIX lap changes the tree, so the diff must be fresh.
+    $revRange = Resolve-CriticRange -Repo $wt -Base $BaseBranch
+    $revStat  = if ($revRange) { (git -C $wt diff $revRange --stat 2>$null) -join "`n" } else { '' }
+    $revDiff  = if ($revRange) { (git -C $wt diff $revRange 2>$null) -join "`n" } else { '' }
+    $MaxRevDiffChars = 8000
+    if ($revDiff -and $revDiff.Length -gt $MaxRevDiffChars) {
+        $revDiff = $revDiff.Substring(0, $MaxRevDiffChars) +
+            "`n[diff truncated at $MaxRevDiffChars chars -- use the Read tool on specific files above for full context]"
+    }
+    if (-not $revStat) { $revStat = '(no stat output -- git may not be on PATH or branch not found)' }
+    if (-not $revDiff) { $revDiff = '(no diff output)' }
+    $revPrompt = 'Review the changes this branch makes. The diff is provided below; do NOT run any command.' +
+        "`n`nCHANGED FILES:`n" + $revStat + "`n`nDIFF:`n" + $revDiff +
+        "`n`nApply your protocol. If you need full-file context, use the Read tool on the paths in the diff headers. " +
+        "Your reply MUST end with one final line that is exactly 'VERDICT: MERGE' or 'VERDICT: FIX FIRST' and nothing after it."
     $rv = Invoke-AgentRun -WorkDir $wt -Model $Model -Agent 'review' -LogPath $ReviewLog -TimeoutSec ($MaxReviewMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec `
-          -Prompt "Review the changes this branch makes: run 'git diff $BaseBranch...HEAD' to see them. Apply your protocol. Your reply MUST end with one final line that is exactly 'VERDICT: MERGE' or 'VERDICT: FIX FIRST' and nothing after it."
+          -Prompt $revPrompt
     $review = if (Test-Path $ReviewLog) { Get-Content $ReviewLog -Raw } else { '' }
     $reviewTail = (($review -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 15) -join "`n"
     $reviewFindings = (($review -split "`r?`n") | Where-Object { $_ -and $_ -notmatch '(?im)^\s*VERDICT:\s*(MERGE|FIX FIRST)' } | Select-Object -Last 60) -join "`n"
@@ -471,7 +509,13 @@ $mergeDecision = Test-ShouldMerge -HasChanges $hasChanges -SecretBlocked $secret
     -AgentTimedOut $agentTimedOut -LoopSuspected $anomaly.LoopSuspected `
     -TestResult $testResult -VerifyResult $verifyResult -Verdict $verdict `
     -Ecosystems (Get-ProjectEcosystem $wt)
-if ($mergeDecision.Merge) {
+if ($mergeDecision.Merge -and $dispatchCancelled) {
+    # #771: a cancelled run never auto-merges. This only bites the build-only-ecosystem UNCLEAR-merge edge
+    # (a verify=pass partial whose review we deliberately skipped on the stop); a real green winner cannot be
+    # cancelled (best-of-N breaks on the first green before any cancel), so no completed work is lost here.
+    Write-Host "  STOP: skipping the auto-merge -- this run was cancelled; parking the branch for the operator (#771)." -ForegroundColor Yellow
+}
+if ($mergeDecision.Merge -and -not $dispatchCancelled) {
     git -C $Repo merge $branch --no-edit 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) {
         $merged = $true
@@ -649,13 +693,13 @@ if ($merged) {
 $summary = @"
 TASK: $Task  ($repoName)
 ASKED: $OrigPrompt
-BUILD: $(if ($agentTimedOut) {"STOPPED by circuit breaker after $MaxRunMinutes min"} elseif ($run.Capped) {"completed (bounded - $($run.CappedReason))"} elseif ($buildExit -eq 0) {'completed'} else {"agent exited with code $buildExit"})$(if ($buildAttempt -gt 1) { " (after $buildAttempt build attempts; the local model no-op'd the earlier ones)" })
+BUILD: $(if ($agentTimedOut) { Get-TimeoutStopText -Reason "$($run.TimeoutReason)" -MaxRunMinutes $MaxRunMinutes -IdleTimeoutSec $IdleTimeoutSec } elseif ($run.Capped) {"completed (bounded - $($run.CappedReason))"} elseif ($buildExit -eq 0) {'completed'} else {"agent exited with code $buildExit"})$(if ($buildAttempt -gt 1) { " (after $buildAttempt build attempts; the local model no-op'd the earlier ones)" })
 TRANSCRIPT: $AgentLog
 CHANGES: $(if ($hasChanges) {'yes'} else {'none made'})
 TESTS: $testResult
 VERIFY: $verifyResult$(if ($verifyResult -eq 'fail') { ' (build/lint/typecheck FAILED - blocked the merge)' })
 SECRETS: $(if ($secretBlocked) { "BLOCKED - $($secret.detail)" } elseif ($secret.status -eq 'unavailable') { 'scan skipped (gitleaks not installed)' } else { 'clean' })
-ANOMALIES: $(if ($anomaly.Anomalies.Count) { ($anomaly.Anomalies -join '; ') } else { 'none' })$(if ($concurrencyNote) { "`nNOTE (concurrency): $concurrencyNote" })
+ANOMALIES: $(if ($anomaly.Anomalies.Count) { ($anomaly.Anomalies -join '; ') } else { 'none' })$(if ($concurrencyNote) { "`nNOTE (concurrency): $concurrencyNote" })$(if ($dispatchCancelled) { "`nSTOPPED: a /dispatch stop was observed mid-run; best-of-N parked after the current candidate and did not start fresh candidates or auto-merge (#771)." })
 REVIEW VERDICT: $verdict$(if ($critiqueSummary) { "`nVISUAL CRITIQUE (post-merge design signal — NOT a gate, your eyeball is the verdict):`n  $($critiqueSummary -replace "`n", "`n  ")" })
 RESULT: $(if ($secretBlocked) {"BLOCKED: a potential secret was detected, so nothing was committed or merged. Your changes are left UNCOMMITTED in $wt for review."} elseif ($merged) {"MERGED into your project - just open the app and try it.$(if ($mergedVia -eq 'build-only-gate') { ' (Merged via the build-only gate: the build passed cleanly but the AI code review was inconclusive - please launch and eyeball it.)' })"} elseif (-not $hasChanges) {'Nothing to merge.'} else {"NOT merged. The work is parked safely on branch '$branch' (workspace: $wt)."})
 $(if (-not $merged -and $hasChanges) {@"

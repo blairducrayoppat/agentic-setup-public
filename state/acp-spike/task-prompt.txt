@@ -1,0 +1,24 @@
+Implement a small, self-contained Python module in this repository.
+
+Create a file `rpn.py` containing a function:
+
+    def rpn_eval(expression: str) -> float
+
+that evaluates a Reverse Polish Notation (postfix) arithmetic expression given as a
+space-separated string. Requirements:
+
+- Support the four binary operators: +  -  *  /
+- Operands are integers or floats (parse with float()).
+- Return the final numeric result as a float.
+- Raise ValueError with a clear message on: an empty expression, an unknown token,
+  too few operands for an operator, leftover operands at the end, or division by zero.
+
+Then create `test_rpn.py` with pytest tests that cover:
+- a happy-path multi-operator expression (e.g. "3 4 + 2 *" == 14.0),
+- each operator at least once,
+- division by zero raising ValueError,
+- a malformed expression (unknown token) raising ValueError,
+- too-few-operands raising ValueError.
+
+Finally, run `python -m pytest -q` in the repository root and make sure every test passes.
+Do not add any network calls, external dependencies, or files other than rpn.py and test_rpn.py.
