@@ -1,0 +1,13 @@
+# Build artifacts and test output -- generated, never committed.
+#
+# Keeping bin/ and obj/ out of git is what stops a `dotnet build` during the coder
+# leg from being swept into the commit by `git add -A`. That matters beyond tidiness:
+# every tracked build artifact WIDENS the #694 read-only-review digest surface, so a
+# late build-output write can trip the mutation guard and false-park honest work.
+# The scan/gate runs on STAGED changes, so un-staged artifacts are never seen.
+bin/
+obj/
+
+# The dotnet-console skeleton's offline `dotnet run -- --test` harness writes its
+# pass/fail detail here at runtime.
+test-results.txt

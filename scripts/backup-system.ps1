@@ -149,6 +149,15 @@ Log 'opencode/jobhunt-data/handoffs/fleet-state mirrored'
 # Fresh installed-package list (cheap, drifts as software changes)
 winget export -o "$BackupRoot/system/winget-packages.json" --accept-source-agreements 2>&1 | Out-Null
 
+# Restore runbook: the tracked MASTER (blarai repo) -> backup root, so the copy
+# read after a disaster is never staler than the last backup (#782). Fail loud:
+# a missing master means the runbook moved and this sync must be repointed.
+$runbookMaster = 'C:/Users/mrbla/blarai/docs/runbooks/DISASTER_RECOVERY_RESTORE.md'
+if (Test-Path $runbookMaster) {
+    Copy-Item $runbookMaster "$BackupRoot/RESTORE_RUNBOOK.md" -Force
+    Log 'restore runbook synced from tracked master'
+} else { Fail 'restore runbook master missing (docs/runbooks/DISASTER_RECOVERY_RESTORE.md)' }
+
 # ------------------------------------------- 4. Local secrets staging (no cloud)
 New-Item -ItemType Directory -Force $SecretsDir | Out-Null
 Copy-Item C:/Users/mrbla/.ssh "$SecretsDir/ssh" -Recurse -Force

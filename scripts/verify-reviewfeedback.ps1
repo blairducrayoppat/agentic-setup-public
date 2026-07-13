@@ -68,7 +68,7 @@ $nat = Get-Content "$PSScriptRoot\new-agent-task.ps1" -Raw
 # for cleanup -- #689 follow-up). The error-feedback-CHAINING assertions (old W11-W15) retire with it: a
 # best-of-N candidate is a FRESH independent sample, so there is no build-fix pass to chain concerns onto.
 Assert-True ([regex]::IsMatch($nat, '(?m)^\s*\$bon\s*=\s*Invoke-BestOfN\b')) 'W1 wiring: the build is driven by best-of-N (Invoke-BestOfN), replacing the serial multi-pass loop'
-Assert-True ([regex]::IsMatch($nat, 'while \(\$hasChanges -and \(Test-ShouldRunReview\b')) 'W2 wiring: the review runs in a BOUNDED loop gated by Test-ShouldRunReview (only when the gates are not both green)'
+Assert-True ([regex]::IsMatch($nat, 'while \(\$hasChanges -and -not \$dispatchCancelled -and \(Test-ShouldRunReview\b')) 'W2 wiring: the review runs in a BOUNDED loop gated by Test-ShouldRunReview (only when gates are not both green) AND skipped on a cancelled dispatch (#771)'
 Assert-True ([regex]::IsMatch($nat, 'Add-ReviewFeedback -Prompt \$Prompt -ReviewConcerns \$reviewFindings')) 'W3 wiring: a FIX-FIRST pass feeds the VERDICT-STRIPPED findings ($reviewFindings) back via Add-ReviewFeedback'
 Assert-True ([regex]::IsMatch($nat, '\$reviewPass\+\+')) 'W4 wiring: each review-feedback pass spends the review budget ($reviewPass++)'
 Assert-True ([regex]::IsMatch($nat, '\$reviewPass -ge \$MaxReviewPasses')) 'W5 wiring: the review-feedback loop is BOUNDED by the separate review budget ($MaxReviewPasses)'

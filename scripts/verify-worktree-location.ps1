@@ -65,6 +65,16 @@ foreach ($k in 1..3) {
     Assert-True ((N $cand) -like "*\state\worktrees\testproject9-create-product-page-c$k") "candidate -c$k is under state\worktrees"
 }
 
+Section '#775 ACP-01 (D-B): the containment relocation is FLAG-GATED (byte-dormant by default)'
+# The 23:00 battery runs the EXACT current path until the containment flag flips. Lock BOTH values:
+$offDefault = Resolve-WorktreeBase -ScriptRoot $scripts                                # no -Containment
+$offExplicit = Resolve-WorktreeBase -ScriptRoot $scripts -Containment 'off'
+$restricted  = Resolve-WorktreeBase -ScriptRoot $scripts -Containment 'restricted_account'
+Assert-Eq (N 'C:\Users\mrbla\agentic-setup\state\worktrees') (N $offDefault) "default (no flag) == today's in-profile base"
+Assert-Eq (N $offDefault) (N $offExplicit) "-Containment 'off' is byte-identical to the default (dormant)"
+Assert-Eq (N 'C:\blarai-fleet\worktrees') (N $restricted) "-Containment 'restricted_account' relocates to the shared dual-SID base"
+Assert-False ((N $restricted) -like ((N 'C:\Users\mrbla') + '\*')) 'the relocated base is OUTSIDE the operator profile (the D-B point)'
+
 Write-Host ''
 if ($script:Fail -eq 0) {
     Write-Host "RESULT: $($script:Pass) passed, 0 failed" -ForegroundColor Green; exit 0

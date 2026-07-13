@@ -119,7 +119,10 @@ $repoName = Split-Path $Repo -Leaf
 # candidate worktrees derive from $wt ("$wt-cK") so they inherit the location; the merge, the reap, and the
 # report all use absolute paths + branch names, so they are location-independent. (Resolve-WorktreeBase is
 # unit-tested in verify-worktree-location.ps1.)
-$wtBase = Resolve-WorktreeBase -ScriptRoot $PSScriptRoot
+# #775 ACP-01 (D-B): the worktree base relocates to the shared dual-SID tree ONLY when the containment flag
+# in configs/fleet-driver.json is 'restricted_account'; with the default 'off' this is byte-identical to the
+# historical call (the flag-dormant guarantee -- tonight's battery uses the exact current state\worktrees).
+$wtBase = Resolve-WorktreeBase -ScriptRoot $PSScriptRoot -Containment (Get-FleetDriverConfig -ScriptRoot $PSScriptRoot).containment
 New-Item -ItemType Directory -Force $wtBase | Out-Null
 $wt = Join-Path $wtBase "$repoName-$Task"
 $branch = "agent/$Task"
@@ -470,8 +473,41 @@ while ($hasChanges -and -not $dispatchCancelled -and (Test-ShouldRunReview -HasC
         "`n`nCHANGED FILES:`n" + $revStat + "`n`nDIFF:`n" + $revDiff +
         "`n`nApply your protocol. If you need full-file context, use the Read tool on the paths in the diff headers. " +
         "Your reply MUST end with one final line that is exactly 'VERDICT: MERGE' or 'VERDICT: FIX FIRST' and nothing after it."
+    # #694 FAIL-CLOSED read-only enforcement: review.md's edit/bash:deny is a REQUEST the harness cannot
+    # trust alone -- a live config-sync once reverted that very deny (2026-07-09), and the incident's
+    # mutation came from OUTSIDE the agent's own tool calls anyway. So snapshot the worktree digest around
+    # the review leg and REFUSE to trust a verdict from a leg that MOVED it: a "read-only" reviewer that
+    # changed the tree corrupted the candidate it judged (run 20260627-083757-bd left an un-buildable
+    # Calculator.cs over a buildable commit). This guard is independent of review.md and cannot be
+    # reverted by a config sync. The fix pass legitimately mutates, so the window is JUST this call.
+    # #694 follow-up -- QUIESCE the coder leg before snapshotting the tree for review. Invoke-AgentRun now
+    # reaps each leg's process tree on exit, but PROVE the tree stopped moving (a straggling child's late
+    # flush is what tripped the guard on an HONEST build -- run 20260710-152121: a trailing-newline normalize
+    # of Calculator.cs landed during the read-only review) and DISCARD any post-commit stray write so the
+    # reviewed tree is exactly the committed candidate. Iteration 1 (fresh off the best-of-N selection reset)
+    # is a no-op; a later iteration settles + cleans the preceding review-FIX coder leg. The discard is
+    # guarded by -not $secretBlocked so a deliberately-preserved secret-blocked tree is NEVER wiped (that
+    # path yields hasChanges=false and does not reach here anyway -- belt over suspenders).
+    $qz = Wait-WorktreeQuiesced -Repo $wt
+    if (-not $secretBlocked) {
+        $strayed = Restore-WorktreeToHead -Repo $wt
+        if ($strayed.Count -gt 0) {
+            Write-Host "  QUIESCE (#694): discarded $($strayed.Count) post-leg stray worktree change(s) before review (tooling flush; tree restored to the committed candidate)." -ForegroundColor DarkYellow
+            Add-Content -Path $Report -Value ("QUIESCE (#694): discarded post-coder-leg stray write(s) so the reviewed tree == the committed candidate: " + ((@($strayed) | Select-Object -First 8) -join '; ')) -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $qz.Settled) {
+        Write-Host "  QUIESCE (#694): worktree did not settle within the barrier window ($($qz.WaitedMs)ms) -- a straggling child may still be writing; the #694 digest guard remains the backstop." -ForegroundColor Yellow
+    }
+    $preReviewDigest = Get-WorktreeDigest -Repo $wt
     $rv = Invoke-AgentRun -WorkDir $wt -Model $Model -Agent 'review' -LogPath $ReviewLog -TimeoutSec ($MaxReviewMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec `
           -Prompt $revPrompt
+    if (Test-ReviewLegMutated -Before $preReviewDigest -After (Get-WorktreeDigest -Repo $wt)) {
+        Write-Host "  FAIL-CLOSED (#694): the READ-ONLY review leg MUTATED the worktree ($wt). The reviewer is a SIGNAL, never an actor; a tree that changed under review corrupts the candidate it judged. Forcing FIX FIRST and parking the branch -- NO auto-merge. (incident 20260627-083757-bd)" -ForegroundColor Red
+        Add-Content -Path $Report -Value "REVIEW-MUTATION (#694): the read-only review leg changed the worktree; verdict forced to FIX FIRST, branch parked for the operator." -ErrorAction SilentlyContinue
+        $verdict = 'FIX FIRST'; $everFixFirst = $true
+        break
+    }
     $review = if (Test-Path $ReviewLog) { Get-Content $ReviewLog -Raw } else { '' }
     $reviewTail = (($review -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 15) -join "`n"
     $reviewFindings = (($review -split "`r?`n") | Where-Object { $_ -and $_ -notmatch '(?im)^\s*VERDICT:\s*(MERGE|FIX FIRST)' } | Select-Object -Last 60) -join "`n"

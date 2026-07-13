@@ -11,12 +11,20 @@ It is deliberately **PowerShell-first, Windows-native, single-operator**. There 
 container runtime, no orchestration cluster, no second machine. Everything below is
 tuned to the one hard constraint that governs the whole design.
 
+> **PowerShell 7+ (pwsh) only.** Every `scripts/*.ps1`, the scheduled tasks, and the fleet
+> run under PowerShell 7 — the production runtime. Windows PowerShell 5.1 is **not
+> supported**: many scripts are UTF-8 (no BOM) with non-ASCII punctuation (em-dashes,
+> arrows) that 5.1's ANSI-default parser mis-tokenizes, and re-punctuating ~37 scripts for
+> a parser nothing here uses would churn history for no benefit. Do not add 5.1 to any
+> verify matrix; if a specific file must be 5.1-parseable for an external tool, add a BOM to
+> that one file. (#785 decision (b), 2026-07-10.)
+
 ## The one constraint everything follows from
 
 **CPU, integrated GPU, OS, VMs, and build jobs all share ONE \~31.3 GB memory pool** on
 this hardware (Core Ultra 7 258V / Arc 140V iGPU / 32 GB soldered LPDDR5X). It is not
 upgradable. So exactly **one model is resident at a time**, and every decision — model
-choice, concurrency, swap timing, whether the fleet runs the 30B or the 14B — is a
+choice, concurrency, swap timing, which model is resident when — is a
 memory-budget decision first and a quality decision second.
 
 ## Architecture — three layers
@@ -34,8 +42,8 @@ memory-budget decision first and a quality decision second.
 ├─────────────────────────────────────────────────────────────────┤
 │  MODEL SERVER    OpenVINO Model Server (ovms.exe, native, on GPU) │
 │                  OpenAI-compatible /v3 endpoint, ONE model loaded: │
-│                    coder-30b  = deep coding    (~18 GB resident)   │
-│                    qwen3-14b  = everyday/fleet (~10.5 GB)          │
+│                    coder-30b  = deep coding + fleet (~18 GB)       │
+│                    qwen3-14b  = everyday/orchestrator (~10.5 GB)   │
 │                    qwen3-vl-8b = screenshots   (~6 GB)             │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -69,15 +77,17 @@ in `content` and strips cosmetic trailing markers. It is transparent passthrough
 
 | Role | Model | Resident | Decode (Arc 140V) |
 |---|---|---|---|
-| Deep agentic coding | Qwen3-Coder-30B-A3B-Instruct INT4 (MoE, \~3.3B active) | \~18 GB | \~35–45 t/s |
-| Everyday / fleet / orchestrator | Qwen3-14B INT4 (dense) | \~10.5 GB | \~12 t/s |
+| Deep agentic coding + fleet dispatch | Qwen3-Coder-30B-A3B-Instruct INT4 (MoE, \~3.3B active) | \~18 GB | \~35–45 t/s |
+| Everyday / orchestrator / critic | Qwen3-14B INT4 (dense) | \~10.5 GB | \~12 t/s |
 | Vision (screenshot/UI debugging) | Qwen3-VL-8B-Instruct INT4 | \~6 GB | swap-in only |
 
 Counter-intuitively the MoE 30B **outruns** the dense 14B once memory isn't the
 bottleneck — it reads fewer active parameters per token. Model swap latency is real
-(\~20–60 s of compile/load), so workflows batch around it rather than ping-pong. The
-fleet runs the **14B only** — the first `npm ci` or pytest spike on top of the 30B starts
-paging exactly when an agent is mid-task.
+(\~20–60 s of compile/load), so workflows batch around it rather than ping-pong. **The
+fleet codes on the 30B**: BlarAI's dispatch driver loads `coder-30b` via
+`start-llm.ps1 -Model coder-30b -Force` and waits for it to serve before any task
+runs, so every dispatched run and overnight batch codes on the 30B. The 14B remains
+the everyday/orchestrator model.
 
 **The 10× fix (measured, `bench/`).** Out of the box the 30B decodes at \~3.5 t/s: its
 \~18 GB working set exceeds the Arc's default \~17.9 GB shared-GPU window and spills onto

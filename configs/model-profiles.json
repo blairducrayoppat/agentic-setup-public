@@ -1,0 +1,192 @@
+{
+  "schema": "model-profile/v1",
+  "note": "#834 QUALITY-15 model-profiles manifest (mirrors configs/fleet-driver.json + configs/opencode-version-pin.json: flat JSON, one long note, DORMANT by default, fail-soft reads). Per-model attributes the BlarAI-side dispatch/swap/oracle/gate machinery reads so the harness can branch on model ARCHITECTURE/FAMILY, not just task complexity. SUPERSET of opencode.json's provider.local.models block (which opencode itself consumes); the overlapping fields (tool_call, reasoning, limit.context, limit.output) MUST agree with this file and with the hand-wired values in scripts/start-llm.ps1 (tool_parser, the resident-GB table, the MoE env) -- two gate checks assert it: blarai tests/integration/test_model_profiles_ssot.py (Python) and scripts/verify-model-profiles.ps1 (this repo). TWO TABLES: 'models' = STABLE per-model attributes (arch/params/quant/serving_backend/tool_call_format/thinking_mode/grammar/context/cost_profile/resident_gb + the model's CARD-RECOMMENDED sampling -- reference data, NOT what any call-site runs today); 'call_sites' = the per-ROLE overlay DESCRIBING TODAY's actual policy (the same 14B is GREEDY in-proc as planner/oracle_author but 0.7-on-OVMS as coder -- policy cannot live purely per-model). FAIL-SOFT: an unknown served-model id falls back to 'defaults'; a missing field falls back to that field's conservative default; a MISSING or MALFORMED file degrades to today's hard-coded behavior and never crashes a consumer. 'arch' and 'serving_backend' are SEPARATE fields even though today they are 1:1 (coder-30b->ovms, 14B->inproc+ovms) so the day they decouple nothing silently mis-branches. DORMANCY / ROLLOUT: nothing reads this file until each consumer explicitly adopts a field, each adoption its own reviewed change. The ONLY field consumed as of #834 is models.<assistant-role model>.reasoning_strip.hidden_block_tags -- the AO brain's <think>/<tool_call> strip binding (entrypoint.py + gpu_inference.py), which resolves to the byte-identical historical regex when this file is absent. SAMPLING-POLICY ADOPTION (killing the greedy anti-pattern the model cards warn against, dossier docs/handoffs/research-model-profiles-20260711.md sec 2/6.1) is EXPLICITLY NOT wired here -- it waits for #835's A1 greedy-vs-low-temp battery data and the LA's CLAUDE.md 'deterministic = temperature=0' doctrine call. call_sites.*.sampling_today therefore records what runs NOW (greedy for the in-proc 14B), never a recommendation. Changing a field is an LA/coordinator go-live step, never a silent edit.",
+  "defaults": {
+    "family": "unknown",
+    "arch": "dense",
+    "quant": "int4",
+    "serving_backend": "ovms",
+    "tool_call_format": "hermes",
+    "tool_call_lenient_repair": true,
+    "thinking_mode": "none",
+    "grammar_support": "none",
+    "context_window": 32768,
+    "effective_context": 32768,
+    "max_output_tokens": 8192,
+    "resident_gb": 10,
+    "reasoning_strip": {
+      "hidden_block_tags": ["think", "tool_call"]
+    },
+    "sampling": {
+      "deterministic_mode": "low_temp_fixed_seed",
+      "greedy_safe": false,
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "top_k": 20
+    },
+    "best_of_n": { "width": 2, "diversity_axis": "sampling_only" },
+    "retry": { "n": 3, "canonicalize_before_vote": false }
+  },
+  "models": {
+    "coder-30b": {
+      "name": "Qwen3-Coder-30B-A3B INT4 (power/coding tier)",
+      "family": "qwen3",
+      "arch": "moe",
+      "total_params_b": 30.5,
+      "active_params_b": 3.3,
+      "n_experts": 128,
+      "experts_active": 8,
+      "quant": "int4",
+      "serving_backend": "ovms",
+      "tool_parser": "qwen3coder",
+      "tool_call_format": "qwen3_xml",
+      "tool_call_lenient_repair": true,
+      "thinking_mode": "none",
+      "grammar_support": "tool_guided",
+      "context_window": 262144,
+      "effective_context": 65536,
+      "max_output_tokens": 16384,
+      "cost_profile": {
+        "decode": "cheap",
+        "prefill": "expensive",
+        "decode_tok_s": 38,
+        "prefill_pp_tok_s": 480
+      },
+      "resident_gb": 18,
+      "sampling": {
+        "deterministic_mode": "low_temp_fixed_seed",
+        "greedy_safe": false,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "repetition_penalty": 1.05
+      },
+      "best_of_n": { "width": 8, "diversity_axis": "sampling_only_via_ovms", "measured_curve": null },
+      "retry": { "n": 5, "canonicalize_before_vote": true },
+      "quant_scheme_note": "MoE -- if ever re-quantized, protect router + shared-experts + down-proj at >=int8 and add a post-quant routing sanity check; a standing quant-quality gate is required. INT4 uniform is NOT safe for an MoE (dossier sec 3).",
+      "moe_prefill_workaround": "start-llm.ps1 sets env MOE_USE_MICRO_GEMM_PREFILL=0 for this model (OpenVINO 2026.2 INT4-on-GPU long-prompt accuracy workaround).",
+      "roles": ["coder"]
+    },
+    "qwen3-14b": {
+      "name": "Qwen3-14B INT4 (everyday/fleet tier -- the AO brain, planner, grader, oracle-author, critic)",
+      "family": "qwen3",
+      "arch": "dense",
+      "total_params_b": 14,
+      "active_params_b": 14,
+      "quant": "int4",
+      "serving_backend": "ov_genai_inproc|ovms",
+      "tool_parser": "hermes3",
+      "reasoning_parser": "qwen3",
+      "tool_call_format": "hermes",
+      "tool_call_lenient_repair": true,
+      "thinking_mode": "optional",
+      "grammar_support": "full_json_schema",
+      "context_window": 32768,
+      "effective_context": 32768,
+      "max_output_tokens": 8192,
+      "cost_profile": {
+        "decode": "expensive",
+        "prefill": "cheap",
+        "decode_tok_s": 17,
+        "prefill_pp_tok_s": 1960
+      },
+      "resident_gb": 10,
+      "reasoning_strip": {
+        "hidden_block_tags": ["think", "tool_call"],
+        "note": "Family-conditioned hidden-block strip for the hybrid-thinking Qwen3 dense model. Consumed by the AO: entrypoint._strip_hidden_blocks and gpu_inference._visible_text build the DOTALL alternation <think>...</think>|<tool_call>...</tool_call> from these tags. This is the ONLY field any consumer reads as of #834; a non-Qwen swap that does not <think> would clear this list."
+      },
+      "sampling": {
+        "deterministic_mode": "low_temp_fixed_seed",
+        "greedy_safe": false,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "sampling_note": "CARD-RECOMMENDED reference values (HF Qwen3-14B card, non-greedy). NOT what the in-proc planner/oracle_author/decompose call-sites run today -- those are GREEDY (see call_sites.*.sampling_today). The greedy->low-temp adoption is #835-A1."
+      },
+      "best_of_n": { "width": 3, "diversity_axis": "sampling" },
+      "retry": { "n": 3, "canonicalize_before_vote": false },
+      "roles": ["planner", "decompose", "oracle_author", "critic", "assistant"]
+    },
+    "qwen3-vl-8b": {
+      "name": "Qwen3-VL-8B INT4 (vision/screenshots -- the AO eyes)",
+      "family": "qwen3",
+      "arch": "dense",
+      "total_params_b": 8,
+      "active_params_b": 8,
+      "quant": "int4",
+      "serving_backend": "ov_genai_inproc|ovms",
+      "tool_call_format": "none",
+      "thinking_mode": "none",
+      "grammar_support": "none",
+      "modalities": ["text", "image"],
+      "context_window": 16384,
+      "effective_context": 16384,
+      "max_output_tokens": 4096,
+      "resident_gb": 6,
+      "roles": ["vision"]
+    }
+  },
+  "call_sites": {
+    "planner": {
+      "model": "qwen3-14b",
+      "serving_backend": "ov_genai_inproc",
+      "sampling_today": "greedy",
+      "sampling_today_detail": "temperature=0.0, do_sample=false, top_p=1.0 (gpu_inference GenerationConfig).",
+      "grammar_today": "json_first_fail_soft",
+      "best_of_n_today": 1,
+      "regenerate_on_defect": null,
+      "adoption_pending": "#835-A1 (greedy-vs-low-temp battery A/B decides the sampling override)."
+    },
+    "decompose": {
+      "model": "qwen3-14b",
+      "serving_backend": "ov_genai_inproc",
+      "sampling_today": "greedy",
+      "sampling_today_detail": "greedy in-proc with /no_think on the decompose template.",
+      "grammar_today": "json_first_fail_soft",
+      "best_of_n_today": 1,
+      "regenerate_on_defect": null,
+      "adoption_pending": "#835-A1."
+    },
+    "oracle_author": {
+      "model": "qwen3-14b",
+      "serving_backend": "ov_genai_inproc",
+      "sampling_today": "greedy",
+      "sampling_today_detail": "greedy in-proc; the oracle Hypothesis is NOT grammar-constrained today (acceptance.py).",
+      "grammar_today": "off",
+      "best_of_n_today": 1,
+      "regenerate_on_defect": null,
+      "regenerate_on_defect_note": "No oracle-regeneration-on-defect path exists today; the dossier sec 6.3 gap, deferred.",
+      "adoption_pending": "#835-A1 (sampling) + a later ticket for regenerate_on_defect."
+    },
+    "coder": {
+      "model": "coder-30b",
+      "serving_backend": "ovms",
+      "sampling_today": "temperature_0.7_top_p_0.8",
+      "sampling_today_detail": "opencode.json agent.build/plan (0.7 / 0.8); OVMS exposes temperature/top_p/top_k only.",
+      "grammar_today": "tool_guided",
+      "best_of_n_today": "complexity_driven",
+      "best_of_n_today_detail": "fleet-lib.ps1 Resolve-PassBudget: simple 2 / moderate 3 / complex 8 -- keyed on task complexity, NOT arch (dossier sec 6.3).",
+      "regenerate_on_defect": null,
+      "adoption_pending": "#835-A2 (arch x best-of-N width)."
+    },
+    "critic": {
+      "model": "qwen3-14b",
+      "serving_backend": "ovms",
+      "sampling_today": "ovms_default",
+      "sampling_today_detail": "14B cross-model critic served on OVMS (swap_ops._CRITIC_MODEL_ID).",
+      "grammar_today": "off",
+      "best_of_n_today": 1,
+      "regenerate_on_defect": null,
+      "adoption_pending": "#835-A1."
+    },
+    "vision": {
+      "model": "qwen3-vl-8b",
+      "serving_backend": "ov_genai_inproc",
+      "sampling_today": "model_default",
+      "grammar_today": "off",
+      "best_of_n_today": 1,
+      "regenerate_on_defect": null,
+      "adoption_pending": null
+    }
+  }
+}

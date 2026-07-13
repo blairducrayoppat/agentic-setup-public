@@ -5,13 +5,16 @@
 #   1. CAMPAIGN CHECK  — reads state/battery-campaign.json; if the campaign is
 #      complete (target passes reached) it UNREGISTERS its own scheduled task and
 #      exits (Task Scheduler hygiene — the LA's explicit requirement).
-#   2. OPERATOR GUARD  — the box owner may be on the device until ~00:30: if there
-#      has been keyboard/mouse input in the last 15 min, or a BlarAI app window is
-#      up, or the coder port is busy, WAIT 30 min and re-check (until the cutoff).
-#      Never seize the GPU from a human.
-#   3. PREFLIGHT       — AO headless up on :5001 (boot if absent), :8000 free,
-#      stale cancel file cleared, fresh sandbox repos for the night's jobs (the
-#      previous night's repos are ARCHIVED by rename, never deleted).
+#   2. DISPATCH GUARD  — if the coder port (:8000) is busy a dispatch is already
+#      running: WAIT 30 min and re-check (until the cutoff). Never clobber a run
+#      in flight. Presence checks (input idle / app window) were REMOVED by LA
+#      direction 2026-07-09 ("it's fine to start at 23:00" — the guard kept
+#      deferring nights he wanted run; #740).
+#   3. PREFLIGHT       — swap admission (fast-path projection, then the #784 real-load
+#      PROBE in the marginal band — see the LEAN + PROBE ADMISSION block), AO headless
+#      up on :5001 (boot if absent), :8000 free, stale cancel file cleared, fresh sandbox
+#      repos for the night's jobs (the previous night's repos are ARCHIVED by rename,
+#      never deleted).
 #   4. RUN             — python -m tools.dispatch_harness.battery --jobs <set>;
 #      scorecards land under state/battery/<stamp>/.
 #   5. MORNING REPORT  — a human-readable summary at state/battery/MORNING-REPORT.md
@@ -24,7 +27,7 @@
 [CmdletBinding()]
 param(
     [string]$CampaignConfig = "$PSScriptRoot\..\state\battery-campaign.json",
-    [switch]$Now  # skip the operator guard (manual daytime invocation)
+    [switch]$Now  # skip the dispatch guard + lean wait-loop (manual daytime invocation)
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,33 +95,18 @@ if ($camp.completed_passes -ge $camp.target_full_passes) {
     exit 0
 }
 
-# ---- 2. operator guard ------------------------------------------------------
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class IdleTime {
-    [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
-    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
-    public static uint MinutesIdle() {
-        var lii = new LASTINPUTINFO(); lii.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
-        GetLastInputInfo(ref lii);
-        return ((uint)Environment.TickCount - lii.dwTime) / 60000u;
-    }
-}
-'@
-function Test-OperatorActive {
-    $idle = [IdleTime]::MinutesIdle()
-    $app  = Get-Process -Name "BlarAI*" -ErrorAction SilentlyContinue |
-            Where-Object { $_.MainWindowHandle -ne 0 }
+# ---- 2. dispatch guard --------------------------------------------------------
+# Presence checks (LASTINPUTINFO idle + BlarAI app window) removed 2026-07-09 by
+# LA direction: the battery launches at 23:00 regardless of operator presence.
+# Only a dispatch already holding :8000 defers the launch (collision, not presence).
+function Test-DispatchBusy {
     $coderBusy = Test-NetConnection -ComputerName 127.0.0.1 -Port 8000 -InformationLevel Quiet -WarningAction SilentlyContinue
-    if ($idle -lt 15)  { Write-Log "guard: input $idle min ago — operator active."; return $true }
-    if ($app)          { Write-Log "guard: a BlarAI app window is open — operator active."; return $true }
-    if ($coderBusy)    { Write-Log "guard: :8000 busy (a dispatch is running) — waiting."; return $true }
+    if ($coderBusy) { Write-Log "guard: :8000 busy (a dispatch is running) — waiting."; return $true }
     return $false
 }
 if (-not $Now) {
     $cutoff = (Get-Date).Date.AddDays(1).AddHours(4)   # stop retrying at 04:00
-    while (Test-OperatorActive) {
+    while (Test-DispatchBusy) {
         if ((Get-Date) -gt $cutoff) {
             Write-Log "Guard never cleared by 04:00 — skipping tonight (not counted as a pass)."
             Stop-Transcript | Out-Null; exit 0
@@ -126,7 +114,7 @@ if (-not $Now) {
         Write-Log "guard: retrying in 30 min."
         Start-Sleep -Seconds 1800
     }
-    Write-Log "guard clear — box is idle."
+    Write-Log "guard clear — no dispatch in flight."
 }
 
 # ---- job set for the night --------------------------------------------------
@@ -144,16 +132,26 @@ Write-Log ("tonight's jobs: " + ($jobs -join ", "))
 $cancel = "$AgenticRoot\state\fleet-swap\cancel"
 if (Test-Path $cancel) { Remove-Item $cancel -Force; Write-Log "cleared stale cancel file." }
 
-# LEAN PREFLIGHT (#740 c.1504, built 2026-07-09): the 30B swap gate needs 21 GiB of system
-# RAM free AFTER the 14B unloads (swap_ops gate_gb=21.0; the 14B returns ~8.7 GiB — projected
-# conservatively at 8.0 here). Nights 2026-07-08 attempt 1+2 burned SIX stalls on this exact
-# gap (20.7 / 20.6 GiB measured at swap time — the operator's browser held the missing
-# margin) and cost ~2.5 h of darkness. So: PROJECT the post-unload headroom BEFORE
-# dispatching. Short + operator idle -> lean the known-safe restartable apps (firefox,
-# OneDrive — the LA's standing process authority, granted live 2026-07-09 01:55 and codified
-# in settings the same day) and re-measure; still short (or operator active) -> rejoin the
-# 30-min guard loop rather than burning a pass on a known number. GiB is BINARY (/1024),
-# matching swap_ops.real_available_gb — the F1 decimal-GB trap.
+# LEAN + PROBE ADMISSION (#784, reworked 2026-07-10; supersedes the #740 c.1504 arithmetic-
+# only gate). The 30B swap needs ~20 GiB of system RAM free AFTER the 14B unloads (swap_driver
+# gate_gb=20.0, #777 measured 2026-07-09; the 14B returns ~8.7 GiB, projected conservatively at
+# 8.0 here). Two-stage admission:
+#
+#   FAST PATH (unchanged) — PROJECT post-unload headroom; if it clears $LEAN_GATE_GIB (20.5 =
+#     gate 20.0 + margin) proceed immediately. Short -> lean the known-safe restartable apps
+#     (firefox, OneDrive — the LA's standing process authority, codified in settings 2026-07-09;
+#     firefox restores its session, OneDrive re-syncs) and re-project.
+#
+#   PROBE (new, #784) — the arithmetic gate has a DEAD BAND: #777 proved a CLEAN load from
+#     19.85 GiB, yet the projection gate (20.5) would wait all night on it (nights 2026-07-08
+#     attempt 1+2 burned SIX stalls at 20.7/20.6 GiB and ~2.5 h of darkness on exactly this
+#     gap). Predicting a threshold never ends the 20-vs-18-vs-17.5 argument; MEASURING does. So
+#     when the projection is still short after leaning but Available >= $PROBE_FLOOR_GIB (15.0,
+#     a sanity floor, NOT a prediction), attempt the REAL 30B load once, OUTSIDE any job (the
+#     probe stamps no verdict/swap-state/scorecard), bounded by this same 04:00 deadline and an
+#     always-restore abort. Probe exit 0 -> admit the night; 1/2/3 -> rejoin the 30-min retry
+#     loop. Below the floor -> too starved to probe; retry. GiB is BINARY (/1024), matching
+#     swap_ops.real_available_gb — the F1 decimal-GB trap.
 function Get-ProjectedSwapHeadroomGiB {
     param([bool]$AoUp)
     $availGiB = (Get-Counter '\Memory\Available MBytes' -ErrorAction Stop).CounterSamples[0].CookedValue / 1024
@@ -161,43 +159,30 @@ function Get-ProjectedSwapHeadroomGiB {
     if ($AoUp) { return @{ Avail = $availGiB; Projected = $availGiB + 8.0 } }
     return @{ Avail = $availGiB; Projected = $availGiB }
 }
-$LEAN_GATE_GIB   = 20.5   # swap gate 20.0 (#777, 2026-07-09) + 0.5 margin
+$LEAN_GATE_GIB   = 20.5   # fast-path projection gate: swap gate 20.0 (#777, 2026-07-09) + 0.5 margin
+$PROBE_FLOOR_GIB = 15.0   # #784: below this Available, too starved to even probe (sanity, not prediction)
 $LEAN_SAFE_PROCS = @('firefox', 'OneDrive')
-function Test-SwapHeadroom {
+
+# Measure the post-unload headroom, leaning the restartable apps if the first projection is
+# short; returns @{ Avail; Projected } POST-lean. No probe, no block — the admission/-Now
+# callers decide what to do with the number.
+function Measure-SwapHeadroom {
     $aoNow = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
     $h = Get-ProjectedSwapHeadroomGiB -AoUp $aoNow
-    Write-Log ("lean preflight: available {0:N1} GiB, projected post-unload {1:N1} GiB (gate {2} GiB)" -f $h.Avail, $h.Projected, $LEAN_GATE_GIB)
-    if ($h.Projected -ge $LEAN_GATE_GIB) { return $true }
-    if ([IdleTime]::MinutesIdle() -ge 15) {
-        foreach ($p in $LEAN_SAFE_PROCS) {
-            $procs = Get-Process -Name $p -ErrorAction SilentlyContinue
-            if ($procs) {
-                Write-Log "lean preflight: headroom short — stopping $p ($(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1GB | ForEach-Object { '{0:N1}' -f $_ }) GB resident, restartable)."
-                $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-            }
+    Write-Log ("lean preflight: available {0:N1} GiB, projected post-unload {1:N1} GiB (fast-path gate {2} GiB)" -f $h.Avail, $h.Projected, $LEAN_GATE_GIB)
+    if ($h.Projected -ge $LEAN_GATE_GIB) { return $h }
+    foreach ($p in $LEAN_SAFE_PROCS) {
+        $procs = Get-Process -Name $p -ErrorAction SilentlyContinue
+        if ($procs) {
+            Write-Log "lean preflight: headroom short — stopping $p ($(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1GB | ForEach-Object { '{0:N1}' -f $_ }) GB resident, restartable)."
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
         }
-        Start-Sleep -Seconds 20   # let the working sets actually return
-        $h2 = Get-ProjectedSwapHeadroomGiB -AoUp $aoNow
-        Write-Log ("lean preflight: post-lean available {0:N1} GiB, projected {1:N1} GiB" -f $h2.Avail, $h2.Projected)
-        return ($h2.Projected -ge $LEAN_GATE_GIB)
     }
-    Write-Log "lean preflight: headroom short but operator recently active — will not lean; waiting."
-    return $false
-}
-if (-not $Now) {
-    $cutoffLean = (Get-Date).Date.AddDays(1).AddHours(4)
-    while (-not (Test-SwapHeadroom)) {
-        if ((Get-Date) -gt $cutoffLean) {
-            Write-Log "lean preflight: headroom never cleared by 04:00 — skipping tonight (not counted as a pass; NOT a burned attempt)."
-            Stop-Transcript | Out-Null; exit 0
-        }
-        Write-Log "lean preflight: retrying in 30 min."
-        Start-Sleep -Seconds 1800
-    }
-    Write-Log "lean preflight: headroom OK."
-} else {
-    # Manual/supervised runs have a human watching — measure + warn, never block.
-    $null = Test-SwapHeadroom
+    Start-Sleep -Seconds 20   # let the working sets actually return
+    $aoNow2 = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
+    $h2 = Get-ProjectedSwapHeadroomGiB -AoUp $aoNow2
+    Write-Log ("lean preflight: post-lean available {0:N1} GiB, projected {1:N1} GiB" -f $h2.Avail, $h2.Projected)
+    return $h2
 }
 
 # AO headless on :5001 (production env — no debug vars). Boot via the SAME tested detached
@@ -205,27 +190,79 @@ if (-not $Now) {
 # `Start-Process -WindowStyle Hidden` hands the launcher a hidden CONSOLE, which drives Textual
 # into "Driver must be in application mode" and crashes the boot in an interactive/`-Now` run;
 # DETACHED_PROCESS (no console) makes it fall back to the headless driver (found live 2026-07-06).
-# The wait is NON-FATAL: the runner's per-job AoReensurer re-boots (and now heals cert-drift —
-# a socket that is up but whose mTLS leaf no longer verifies) as the backstop, so a slow or
-# failed preflight boot must NOT abort the whole night.
-$aoUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
-if (-not $aoUp) {
-    Write-Log "booting the AO headless (detached)..."
-    $bootPy = 'import sys; from pathlib import Path; from tools.dispatch_harness.battery import boot_launcher_detached; boot_launcher_detached(Path(sys.argv[1]), Path(sys.argv[2]))'
-    Push-Location $BlarRoot
-    try {
-        & $Python -c $bootPy $BlarRoot "$NightDir\ao-boot.log"
-    } finally { Pop-Location }
-    $deadline = (Get-Date).AddSeconds(240)   # a cold 14B load can exceed 2 min
-    while (-not (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-        if ((Get-Date) -gt $deadline) {
-            Write-Log "WARNING: AO not up on :5001 within 240s of the preflight boot — proceeding anyway; the runner's per-job AoReensurer will re-boot it (non-fatal backstop)."
-            break
+# The wait is NON-FATAL: the runner's per-job AoReensurer re-boots (and heals cert-drift — a
+# socket that is up but whose mTLS leaf no longer verifies) as the backstop, so a slow or failed
+# boot must NOT abort the night. Called at preflight AND after a successful probe (which restores
+# the AO — the runner expects it up at start).
+function Ensure-AoHeadless {
+    $aoUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if (-not $aoUp) {
+        Write-Log "booting the AO headless (detached)..."
+        $bootPy = 'import sys; from pathlib import Path; from tools.dispatch_harness.battery import boot_launcher_detached; boot_launcher_detached(Path(sys.argv[1]), Path(sys.argv[2]))'
+        Push-Location $BlarRoot
+        try {
+            & $Python -c $bootPy $BlarRoot "$NightDir\ao-boot.log"
+        } finally { Pop-Location }
+        $deadline = (Get-Date).AddSeconds(240)   # a cold 14B load can exceed 2 min
+        while (-not (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+            if ((Get-Date) -gt $deadline) {
+                Write-Log "WARNING: AO not up on :5001 within 240s of the preflight boot — proceeding anyway; the runner's per-job AoReensurer will re-boot it (non-fatal backstop)."
+                break
+            }
+            Start-Sleep -Seconds 3
         }
-        Start-Sleep -Seconds 3
+        if (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue) { Write-Log "AO up." }
+    } else { Write-Log "AO already up on :5001 — the runner's per-job AoReensurer verifies its mTLS health before each job and re-boots on cert-drift." }
+}
+
+# ONE admission decision: $true to ADMIT (run tonight), $false to RETRY (rejoin the wait loop).
+# Fast path first; then the #784 probe in the marginal band. Only ever called under NON-$Now.
+function Test-NightAdmission {
+    $h = Measure-SwapHeadroom
+    if ($h.Projected -ge $LEAN_GATE_GIB) {
+        Write-Log ("lean preflight: fast path — projected {0:N1} GiB clears the {1} GiB gate." -f $h.Projected, $LEAN_GATE_GIB)
+        return $true
     }
-    if (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue) { Write-Log "AO up." }
-} else { Write-Log "AO already up on :5001 — the runner's per-job AoReensurer verifies its mTLS health before each job and re-boots on cert-drift." }
+    if ($h.Avail -lt $PROBE_FLOOR_GIB) {
+        Write-Log ("lean preflight: available {0:N1} GiB below the probe floor {1} GiB — too starved to probe; retrying." -f $h.Avail, $PROBE_FLOOR_GIB)
+        return $false
+    }
+    Write-Log ("lean preflight: projected {0:N1} GiB short of {1} but available {2:N1} GiB >= probe floor {3} — PROBING a real 30B load (#784; ends the dead band #777 exposed)." -f $h.Projected, $LEAN_GATE_GIB, $h.Avail, $PROBE_FLOOR_GIB)
+    Push-Location $BlarRoot   # `-m tools.dispatch_harness.probe` resolves from the repo root
+    try {
+        # 2>&1 folds the probe's stderr log line into the captured output (kept for the
+        # transcript); the branch is on the EXIT CODE, which is the reliable signal.
+        $probeOut = (& $Python -m tools.dispatch_harness.probe --min-free-gb $PROBE_FLOOR_GIB --json 2>&1 | Out-String).Trim()
+        $probeExit = $LASTEXITCODE
+    } finally { Pop-Location }
+    Write-Log "probe: exit $probeExit -- $probeOut"
+    if ($probeExit -eq 0) {
+        Write-Log "probe: the 30B loaded outside any job (exit 0) — ADMITTING the night."
+        Ensure-AoHeadless   # the probe restored the AO; re-verify + re-boot if needed (non-fatal)
+        return $true
+    }
+    Write-Log "probe: did NOT admit (exit $probeExit) — rejoining the 30-min retry loop."
+    return $false
+}
+
+if (-not $Now) {
+    $cutoffLean = (Get-Date).Date.AddDays(1).AddHours(4)
+    while (-not (Test-NightAdmission)) {
+        if ((Get-Date) -gt $cutoffLean) {
+            Write-Log "lean preflight: never admitted by 04:00 — skipping tonight (not counted as a pass; NOT a burned attempt)."
+            Stop-Transcript | Out-Null; exit 0
+        }
+        Write-Log "lean preflight: retrying in 30 min."
+        Start-Sleep -Seconds 1800
+    }
+    Write-Log "lean preflight: night admitted."
+} else {
+    # Manual/supervised runs have a human watching — measure + warn, never block, never probe.
+    $h = Measure-SwapHeadroom
+    Write-Log ("manual (-Now): available {0:N1} GiB, projected {1:N1} GiB (fast-path gate {2}); NOT blocking, NOT probing." -f $h.Avail, $h.Projected, $LEAN_GATE_GIB)
+}
+
+Ensure-AoHeadless
 
 # Fresh sandbox repos: archive last night's (rename — zero deletion), re-init.
 $cards = Get-ChildItem "$BlarRoot\evals\battery\B*.json"
@@ -286,11 +323,22 @@ $scorecards = Get-ChildItem "$NightDir\scorecards" -Filter "*.json" -ErrorAction
 $lines = @("# M2 battery — night $Stamp", "",
            "jobs requested: $($jobs -join ', ')  |  runner exit: $runnerExit", "")
 $verdicts = @{}
+# #789 measurement fairness: segment the GREEN-rate over plan-graph-ELIGIBLE jobs only.
+# A flat-queue job (under-decomposed to <2 tasks) is structurally non-GREEN, so counting
+# it in the denominator quietly depresses the coder rate. mode rides evidence.mode
+# ("plan-graph"|"flat"), stamped by the driver's scorecard; absent = mode-unknown.
+$green = 0; $planEligible = 0; $flatQueue = 0; $modeUnknown = 0
 foreach ($sc in $scorecards) {
     try {
         $d = Get-Content $sc.FullName -Raw | ConvertFrom-Json
         if ($d.job_id) {
             $verdicts[$d.job_id] = $d.verdict
+            if ($d.verdict -eq "GREEN") { $green++ }
+            switch ($d.evidence.mode) {
+                "plan-graph" { $planEligible++ }
+                "flat"       { $flatQueue++ }
+                default      { $modeUnknown++ }
+            }
             $ga = $d.evidence.guest_agreement
             $gaNote = if ($ga) { "; guest: $ga" } else { "" }
             $lines += ("* **{0}**: {1} ({2}; {3:n0}s; attribution: {4}{5})" -f
@@ -301,6 +349,12 @@ foreach ($sc in $scorecards) {
         }
     } catch { $lines += "* unreadable scorecard: $($sc.Name)" }
 }
+# The honest denominator: GREEN over plan-graph-eligible, with the raw rate + the
+# structurally-non-GREEN flat count both shown (nothing hidden; no verdict altered).
+$relLine = ("reliability (#789 — honest denominator): GREEN {0}/{1} plan-graph-eligible (raw {0}/{2}); flat-queue={3} (structurally non-GREEN, under-decomposed)" -f `
+    $green, $planEligible, $verdicts.Count, $flatQueue)
+if ($modeUnknown -gt 0) { $relLine += ("; mode-unknown={0}" -f $modeUnknown) }
+$lines += ""; $lines += $relLine
 $falseDone = $verdicts.Values | Where-Object { $_ -eq "FALSE-DONE" }
 if ($falseDone) { $lines = @("## !! FALSE-DONE DETECTED — RED ALERT !!", "") + $lines }
 $fullPass = ($jobs | Where-Object { -not $verdicts.ContainsKey($_) }).Count -eq 0
