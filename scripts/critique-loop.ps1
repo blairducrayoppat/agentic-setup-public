@@ -140,6 +140,8 @@ function Merge-DesignSignals {
         [string[]]$LayoutMessages = @(),
         [bool]$PixelHard = $false,
         [string[]]$PixelMessages = @(),
+        [bool]$RuntimeHard = $false,
+        [string[]]$RuntimeMessages = @(),
         [bool]$VlmOk = $false,
         [bool]$VlmNeedsWork = $false,
         [bool]$VlmShouldIterate = $false,
@@ -147,16 +149,23 @@ function Merge-DesignSignals {
         [Parameter(Mandatory)][int]$Iteration,
         [Parameter(Mandatory)][int]$MaxIter
     )
-    # A hard DETERMINISTIC finding -- XAML layout (Lever A) OR rendered-pixel (Lever B) -- forces
-    # another pass while the iteration budget remains, EVEN IF the VLM passed. The VLM is never the
-    # sole gate (the false-pass fix). PixelHard/PixelMessages default inert so pre-pixel callers are
-    # byte-identical.
-    $detHard       = [bool]($LayoutHard -or $PixelHard)
+    # A hard DETERMINISTIC finding -- XAML layout (Lever A), rendered-pixel (Lever B), OR a browser
+    # RUNTIME error (#823 Lever D: a console error / uncaught exception / undefined-in-text / declared-
+    # behavior failure) -- forces another pass while the iteration budget remains, EVEN IF the VLM
+    # passed. The VLM is never the sole gate (the false-pass fix). Pixel*/Runtime* default inert so
+    # pre-pixel / pre-runtime callers are byte-identical.
+    $detHard       = [bool]($LayoutHard -or $PixelHard -or $RuntimeHard)
     $detIterate    = $detHard -and ($Iteration -lt $MaxIter)
     $shouldIterate = [bool]($VlmShouldIterate -or $detIterate)
     $needsWork     = [bool]($VlmNeedsWork -or $detHard)
 
     $parts = New-Object System.Collections.ArrayList
+    # RUNTIME errors LEAD the feedback (#823 item 2: ranked ABOVE cosmetic critique -- fix the thrown
+    # error before the layout). A runtime finding carries the message VERBATIM (file/line/message).
+    if ($RuntimeHard -and $RuntimeMessages -and $RuntimeMessages.Count -gt 0) {
+        [void]$parts.Add("Runtime errors (browser console / uncaught exceptions) -- fix these FIRST, before any layout or styling:")
+        foreach ($m in $RuntimeMessages) { [void]$parts.Add("  - $m") }
+    }
     if ($LayoutHard -and $LayoutMessages -and $LayoutMessages.Count -gt 0) {
         [void]$parts.Add("Deterministic layout issues (fix these FIRST):")
         foreach ($m in $LayoutMessages) { [void]$parts.Add("  - $m") }
@@ -169,9 +178,11 @@ function Merge-DesignSignals {
     $feedback = ($parts -join "`n").Trim()
 
     # LayoutHard in the return means "any deterministic hard finding" so the Python _design_note
-    # (which reads layout_hard) reports deterministic issues for pixel hits too. For a pre-pixel
-    # caller PixelHard=$false, so $detHard == $LayoutHard and the return is byte-identical.
-    return @{ ShouldIterate = $shouldIterate; NeedsWork = $needsWork; Feedback = $feedback; LayoutHard = $detHard }
+    # (which reads layout_hard) reports deterministic issues for pixel/runtime hits too. For a
+    # pre-pixel/pre-runtime caller Pixel/RuntimeHard=$false, so $detHard == $LayoutHard and the return
+    # is byte-identical. RuntimeHard is ALSO returned distinctly so the Python side can word the
+    # operator note as a runtime error (not "layout") and gate the clean-ending reclass on it.
+    return @{ ShouldIterate = $shouldIterate; NeedsWork = $needsWork; Feedback = $feedback; LayoutHard = $detHard; RuntimeHard = [bool]$RuntimeHard }
 }
 
 function Invoke-LayoutLint {
@@ -242,6 +253,32 @@ function Invoke-PixelLint {
     $msgs = @($obj.findings | Where-Object { $_.severity -eq 'high' } | ForEach-Object { [string]$_.message })
     $msgsJson = '[' + (($msgs | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ',') + ']'
     return @{ Hard = $hard; Messages = $msgs; MessagesJson = $msgsJson }
+}
+
+function Read-ConsoleSidecar {
+    <#
+    .SYNOPSIS
+      Read the browser-console sidecar ("<png>.console.json") that capture-web-cdp.mjs (#823 H8/H9)
+      writes beside a WEB capture (the protocol-level (CDP) console + uncaught-exception stream and
+      the positive behavior smoke. Returns the design loop's RUNTIME-error signal (Lever D).
+
+      Fail-soft + HONEST (the ok-flag discipline -- a degraded env must never fake a richer verdict):
+        * a MISSING sidecar (a WinUI tier-1/2 capture, the structural floor, or an old capture), OR
+        * a captured:false sidecar (the msedge --screenshot fallback ran -> console UNAVAILABLE)
+      both yield @{ Captured=$false; Hard=$false; Messages=@() } -- NO runtime signal, so the loop
+      degrades to today's pixel-only behavior. Only a captured:true sidecar contributes a signal, and
+      its ``hard`` verdict (a console/exception error, an undefined/NaN text leak, or a DECLARED-
+      behavior failure -- computed authoritatively by the Node helper) forces another FIX iteration.
+      Returns @{ Captured=[bool]; Hard=[bool]; Messages=[string[]] }.
+    #>
+    param([Parameter(Mandatory)][string]$SidecarPath)
+    $empty = @{ Captured = $false; Hard = $false; Messages = @() }
+    if (-not (Test-Path $SidecarPath)) { return $empty }
+    try { $obj = Get-Content $SidecarPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $empty }
+    if (-not $obj -or -not $obj.captured) { return $empty }
+    $msgs = @()
+    if ($obj.findings) { $msgs = @($obj.findings | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
+    return @{ Captured = $true; Hard = [bool]$obj.hard; Messages = $msgs }
 }
 
 # ---------------------------------------------------------------------------
@@ -349,6 +386,14 @@ function Invoke-CritiquePass {
     $detMessages = @($layoutResult.Messages) + @($pixelResult.Messages)
     $detMessagesJson = '[' + (($detMessages | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ',') + ']'
 
+    # ---- Step 3.6: browser RUNTIME channel (#823 H8/H9, Lever D) ---------
+    # A WEB capture (capture-web-cdp.mjs) writes "<png>.console.json" carrying the protocol-level
+    # console + uncaught exceptions + the positive behavior smoke. Read it: a captured:true sidecar
+    # with hard=true forces a FIX and LEADS the feedback (ranked above the VLM's cosmetic critique).
+    # Missing / captured:false (WinUI capture, or the msedge --screenshot fallback) -> NO runtime
+    # signal, so a console-blind capture degrades to today's pixel-only behavior, honestly.
+    $runtimeResult = Read-ConsoleSidecar -SidecarPath "$pngPath.console.json"
+
     # ---- Step 4: VLM critique -------------------------------------------
     $pythonExe = Join-Path $BlarAiRepo '.venv\Scripts\python.exe'
     if (-not (Test-Path $pythonExe)) {
@@ -400,20 +445,24 @@ function Invoke-CritiquePass {
     $feedback      = [string]($critiqueObj.feedback ?? '')
     $shouldIterate = [bool]($critiqueObj.should_iterate)
 
-    # Combine the soft VLM signal with the HARD deterministic layout gate (Lever A): a
-    # high-severity layout defect forces a FIX even when the VLM passed (the false-pass fix).
+    # Combine the soft VLM signal with the HARD deterministic gates: a layout (Lever A), pixel
+    # (Lever B), or browser-RUNTIME (Lever D, #823) defect forces a FIX even when the VLM passed
+    # (the false-pass fix). Runtime findings LEAD the merged feedback (fix the thrown error first).
     $merged = Merge-DesignSignals -LayoutHard $layoutResult.Hard -LayoutMessages $layoutResult.Messages `
         -PixelHard $pixelResult.Hard -PixelMessages $pixelResult.Messages `
+        -RuntimeHard $runtimeResult.Hard -RuntimeMessages $runtimeResult.Messages `
         -VlmOk $ok -VlmNeedsWork $needsWork -VlmShouldIterate $shouldIterate -VlmFeedback $feedback `
         -Iteration $Iteration -MaxIter $MaxIter
     return @{
-        ShouldIterate  = $merged.ShouldIterate
-        NeedsWork      = $merged.NeedsWork
-        Feedback       = $merged.Feedback
-        CaptureTier    = $captureTier
-        Ok             = $ok
-        LayoutHard     = $merged.LayoutHard
-        ScreenshotPath = $pngPath
+        ShouldIterate   = $merged.ShouldIterate
+        NeedsWork       = $merged.NeedsWork
+        Feedback        = $merged.Feedback
+        CaptureTier     = $captureTier
+        Ok              = $ok
+        LayoutHard      = $merged.LayoutHard
+        RuntimeHard     = $merged.RuntimeHard
+        RuntimeCaptured = $runtimeResult.Captured
+        ScreenshotPath  = $pngPath
     }
 }
 

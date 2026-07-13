@@ -461,6 +461,19 @@ function Invoke-AgentRun {
         }
     }
     $sw.Stop()
+    # #694 follow-up -- REAP the leg's process tree on EVERY exit path (normal included). The timeout/cap
+    # branches above already `taskkill /T` while $p is alive, but a NORMAL exit killed nothing, so opencode's
+    # node / language-server / sub-agent children could orphan and flush a late write into the NEXT leg's
+    # tree -- the 20260710-152121 park (a trailing-newline normalize of Calculator.cs landed ~10 min after
+    # the coder-fix leg, DURING the read-only review, tripping the #694 digest guard). Kill the leg's own
+    # tree now so no straggler outlives it. Scoped + guarded (Stop-AgentProcessTree) -- only this worktree's
+    # descendants, never a sibling dispatch or the live AO/OVMS; never throws into the run.
+    try {
+        $reapedPids = Stop-AgentProcessTree -RootPid $p.Id -WorkDir $WorkDir
+        if ($reapedPids.Count -gt 0) {
+            Add-Content -Path $LogPath -Value ("[reap #694] killed $($reapedPids.Count) straggling child process(es) on leg exit: $($reapedPids -join ', ')") -ErrorAction SilentlyContinue
+        }
+    } catch {}
     if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
     # Fold stderr into the transcript log, then drop the temp err file.
     if (Test-Path $errPath) {
@@ -487,6 +500,186 @@ function Invoke-AgentRun {
     # failure, so the gate runs + the auto-merge can fire (#670 run-3).
     $exit = if ($timedOut) { $null } elseif ($capped) { 0 } else { $p.ExitCode }
     return @{ TimedOut = $timedOut; TimeoutReason = $timeoutReason; Capped = $capped; CappedReason = $cappedReason; ExitCode = $exit; LogPath = $LogPath; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Error = '' }
+}
+
+function Get-FleetDriverConfig {
+    # #775 ACP-01: read the fleet driver manifest (configs/fleet-driver.json). Returns a
+    # normalized object with .driver ('stdin'|'acp'), .containment ('off'|'restricted_account'),
+    # and .acp settings. FAIL-SAFE to the DORMANT defaults on ANY problem (file absent, bad JSON,
+    # missing keys) so the production stdin/operator-account path runs unless the manifest
+    # DELIBERATELY says otherwise -- flag-dormant by construction (the 23:00 battery boots on this).
+    # Memoised per process (the manifest does not change mid-dispatch); pass -Fresh to re-read.
+    param([string]$ScriptRoot = $PSScriptRoot, [switch]$Fresh)
+    if (-not $Fresh -and $script:_FleetDriverCfg) { return $script:_FleetDriverCfg }
+    $default = [pscustomobject]@{
+        driver = 'stdin'; containment = 'off'
+        acp = [pscustomobject]@{ python = ''; blarai_root = 'C:/Users/mrbla/blarai'; idle_sec = 600; max_steps = 45; spin_steps = 10 }
+    }
+    try {
+        # $env:BLARAI_FLEET_DRIVER_CONFIG overrides the manifest path for OFFLINE verify/tests only
+        # (mirrors the coder-leg queue's BLARAI_CODER_LEG_ROOT hook); production leaves it unset, so the
+        # live path is always <agentic-setup>\configs\fleet-driver.json.
+        $path = if ($env:BLARAI_FLEET_DRIVER_CONFIG) { $env:BLARAI_FLEET_DRIVER_CONFIG } else { Join-Path (Split-Path $ScriptRoot -Parent) 'configs\fleet-driver.json' }
+        if (-not (Test-Path $path)) { $script:_FleetDriverCfg = $default; return $default }
+        $raw = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $driver = if ($raw.driver -in @('stdin','acp')) { $raw.driver } else { 'stdin' }
+        $cont   = if ($raw.containment -in @('off','restricted_account')) { $raw.containment } else { 'off' }
+        $acp = [pscustomobject]@{
+            python      = [string]$raw.acp.python
+            blarai_root = if ($raw.acp.blarai_root) { [string]$raw.acp.blarai_root } else { 'C:/Users/mrbla/blarai' }
+            idle_sec    = if ($raw.acp.idle_sec)    { [int]$raw.acp.idle_sec }    else { 600 }
+            max_steps   = if ($raw.acp.max_steps)   { [int]$raw.acp.max_steps }   else { 45 }
+            spin_steps  = if ($raw.acp.spin_steps)  { [int]$raw.acp.spin_steps }  else { 10 }
+        }
+        $cfg = [pscustomobject]@{ driver = $driver; containment = $cont; acp = $acp }
+        $script:_FleetDriverCfg = $cfg
+        return $cfg
+    } catch {
+        # A manifest we cannot read must never enable a non-default posture.
+        $script:_FleetDriverCfg = $default
+        return $default
+    }
+}
+
+function Invoke-AcpCoderRun {
+    # #775 ACP-01: drive ONE coder build through the persistent opencode-acp session via the Python
+    # client (blarai/tools/dispatch_harness/acp_coder.py, run under a Python 3.14 + agent-client-protocol
+    # interpreter). Returns @{ Ok=[bool]; Result=<Invoke-AgentRun-shaped hashtable>; Reason=[string] }.
+    #   Ok=$true  -> .Result is the run's result contract (surface it verbatim).
+    #   Ok=$false -> the ACP client could NOT run pre-prompt (no interpreter, SDK import, or handshake
+    #                failure) and the caller must FALL BACK to stdin for this run (ACP-01 §2 config-fallback).
+    # A mid-run error (the prompt started then the SDK raised) is NOT a fallback -- it returns Ok=$true with
+    # an errored .Result so the gate parks it rather than silently RE-driving the coder under stdin.
+    param(
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][pscustomobject]$Acp,
+        [int]$TimeoutSec = 3600,
+        [int]$IdleTimeoutSec = 600,
+        [int]$MaxSteps = 45,
+        [int]$SpinSteps = 10
+    )
+    $py = $Acp.python
+    if (-not $py -or -not (Test-Path $py)) {
+        return @{ Ok = $false; Reason = "no ACP python interpreter provisioned (acp.python='$py'); falling back to stdin" }
+    }
+    $blarRoot = if ($Acp.blarai_root) { $Acp.blarai_root } else { 'C:/Users/mrbla/blarai' }
+    # Prompt + envelope ride files (never argv): the prompt may contain <, >, & etc., and the envelope is
+    # JSON the shim parses -- exactly why Invoke-AgentRun feeds a stdin file, mirrored here.
+    $promptFile = "$LogPath.acp-prompt.txt"
+    $resultJson = "$LogPath.acp-result.json"
+    try {
+        Set-Content -Path $promptFile -Value $Prompt -NoNewline -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        return @{ Ok = $false; Reason = "could not stage ACP prompt file: $($_.Exception.Message); falling back to stdin" }
+    }
+    $ideal = if ($IdleTimeoutSec -gt 0) { $IdleTimeoutSec } elseif ($Acp.idle_sec) { [int]$Acp.idle_sec } else { 600 }
+    $argList = @(
+        '-m', 'tools.dispatch_harness.acp_coder',
+        '--workdir', $WorkDir,
+        '--model', $Model,
+        '--log-path', $LogPath,
+        '--prompt-file', $promptFile,
+        '--timeout-sec', "$TimeoutSec",
+        '--idle-sec', "$ideal",
+        '--max-steps', "$MaxSteps",
+        '--spin-steps', "$SpinSteps",
+        '--result-json', $resultJson
+    )
+    # The client must import blarai's `shared`/`tools` packages -> run WITH the blarai root on PYTHONPATH
+    # and cwd there, matching how the fleet already invokes blarai python (run-battery-night.ps1).
+    $prevPP = $env:PYTHONPATH; $env:PYTHONPATH = $blarRoot
+    try {
+        # A generous outer ceiling: the client enforces its OWN idle/step/overall bounds and tree-kills;
+        # this WaitForExit is only a backstop against a wedged interpreter that never writes the envelope.
+        $outerSec = [int]($TimeoutSec + 300)
+        $p = Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $blarRoot -PassThru -NoNewWindow -ErrorAction Stop
+        $null = $p.Handle
+        if (-not $p.WaitForExit($outerSec * 1000)) {
+            try { & taskkill.exe /PID $p.Id /T /F *> $null } catch {}
+            try { $null = $p.WaitForExit(5000) } catch {}
+            if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+            return @{ Ok = $false; Reason = "ACP client exceeded the outer ceiling (${outerSec}s) and was killed; falling back to stdin" }
+        }
+    } catch {
+        if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+        return @{ Ok = $false; Reason = "ACP client failed to launch: $($_.Exception.Message); falling back to stdin" }
+    }
+    if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+    if (-not (Test-Path $resultJson)) {
+        return @{ Ok = $false; Reason = 'ACP client wrote no result envelope; falling back to stdin' }
+    }
+    try {
+        $envelope = Get-Content $resultJson -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return @{ Ok = $false; Reason = "ACP result envelope unreadable: $($_.Exception.Message); falling back to stdin" }
+    } finally {
+        Remove-Item $resultJson -ErrorAction SilentlyContinue
+        Remove-Item $promptFile -ErrorAction SilentlyContinue
+    }
+    if ($envelope.fallback_to_stdin) {
+        return @{ Ok = $false; Reason = "ACP client signalled fallback (phase=$($envelope.phase)): $($envelope.error)" }
+    }
+    if (-not $envelope.result) {
+        return @{ Ok = $false; Reason = 'ACP envelope carried no result; falling back to stdin' }
+    }
+    # Rehydrate the result contract as a hashtable byte-compatible with Invoke-AgentRun's return.
+    $r = $envelope.result
+    $result = @{
+        TimedOut = [bool]$r.TimedOut; TimeoutReason = [string]$r.TimeoutReason
+        Capped = [bool]$r.Capped; CappedReason = [string]$r.CappedReason
+        ExitCode = $r.ExitCode   # JSON null -> $null, matching Invoke-AgentRun
+        LogPath = [string]$r.LogPath; Seconds = [double]$r.Seconds; Error = [string]$r.Error
+    }
+    return @{ Ok = $true; Result = $result; Reason = "acp phase=$($envelope.phase)" }
+}
+
+function Invoke-CoderDriver {
+    # #775 ACP-01 SEAM: the single point the candidate loop calls to DRIVE + WATCH the coder. It selects
+    # the driver from configs/fleet-driver.json and returns the SAME result contract Invoke-CandidateBuild
+    # already consumes. With driver='stdin' (the DEFAULT), this is BYTE-IDENTICAL to the historical call --
+    # it delegates to Invoke-AgentRun with the exact same arguments. With driver='acp' it drives the
+    # persistent opencode-acp session via the Python client, and FALLS BACK to the identical stdin call on
+    # any pre-prompt ACP failure (import/handshake/no-interpreter). ACP replaces only HOW the coder is
+    # driven; the gate/selection/merge are untouched.
+    param(
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [int]$TimeoutSec = 1800,
+        [int]$IdleTimeoutSec = 240,
+        [string]$ScriptRoot = $PSScriptRoot
+    )
+    $cfg = Get-FleetDriverConfig -ScriptRoot $ScriptRoot
+    if ($cfg.driver -eq 'acp') {
+        try {
+            $mdl = if ($Model -and $Model -notmatch '/') { "local/$Model" } else { $Model }
+            # The ACP path uses its OWN semantic idle bound (acp.idle_sec, default 600 -- RAISED from
+            # the spike's 120 after the #790 A/B finding that a 120 s idle watchdog false-killed ~84%
+            # of 30B candidates: the "no session/update" signal cannot tell a slow-generating 30B
+            # (first-token starvation / long thinking bursts) from a genuinely wedged one; calibrated
+            # in shared/timeout_registry.py ACP_IDLE_TIMEOUT_S), NOT the stdin transcript-idle
+            # ($IdleTimeoutSec, 240): it is a DIFFERENT number by design. This $cfg.acp.idle_sec is
+            # the LIVE per-run value the nightly battery threads to acp_coder.py --idle-sec.
+            $acpIdle = if ($cfg.acp.idle_sec) { [int]$cfg.acp.idle_sec } else { 600 }
+            $acp = Invoke-AcpCoderRun -WorkDir $WorkDir -Model $mdl -Prompt $Prompt -LogPath $LogPath `
+                -Acp $cfg.acp -TimeoutSec $TimeoutSec -IdleTimeoutSec $acpIdle `
+                -MaxSteps ([int]$cfg.acp.max_steps) -SpinSteps ([int]$cfg.acp.spin_steps)
+            if ($acp.Ok) {
+                Write-Host "  [driver=acp] $($acp.Reason)" -ForegroundColor DarkCyan
+                return $acp.Result
+            }
+            Write-Host "  [driver=acp] $($acp.Reason)" -ForegroundColor Yellow
+        } catch {
+            Write-Host "  [driver=acp] error, falling back to stdin: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    # stdin (default) OR an ACP pre-prompt fallback -> the byte-identical production path.
+    return Invoke-AgentRun -WorkDir $WorkDir -Model $Model -Prompt $Prompt -LogPath $LogPath `
+        -TimeoutSec $TimeoutSec -IdleTimeoutSec $IdleTimeoutSec -JsonStepCap
 }
 
 function Test-IsSamplingTerminal {
@@ -705,6 +898,225 @@ function Resolve-CriticRange {
     if (((git -C $Repo diff "$Base...HEAD" --name-only 2>$null) -join "`n")) { return "$Base...HEAD" }
     if (((git -C $Repo diff "HEAD~1..HEAD" --name-only 2>$null) -join "`n")) { return "HEAD~1..HEAD" }
     return ""
+}
+
+function Get-WorktreeDigest {
+    # #694 read-only-review enforcement. Return a SHA-256 over the worktree's mutation-relevant state
+    # so two snapshots taken around a "read-only" leg PROVE whether the tree changed under it. The
+    # signature is `git status --porcelain --untracked-files=all` (every dirty OR new path) joined with
+    # `git diff HEAD` (the full content of every tracked change vs the committed tree). A namespace edit
+    # flips the diff; an untracked Tests/ dir flips the status -- exactly the two mutations the incident
+    # produced (run 20260627-083757-bd: a read-only review leg edited Calculator.cs AND added Tests/,
+    # leaving an un-buildable parked tree over a buildable commit). At review time the selected
+    # candidate's work is already COMMITTED, so a clean review sees a stable "matches-HEAD" digest;
+    # opencode stores session state in ~/.local/share/opencode (share disabled), NOT the --dir worktree,
+    # so it does not move this digest -- only a real write does. Only reads git; never mutates.
+    # ASCII; PS 5.1 + 7 safe (EAP=Continue so git's informational stderr never throws).
+    param([Parameter(Mandatory)][string]$Repo)
+    $ErrorActionPreference = 'Continue'
+    $status = (git -C $Repo status --porcelain --untracked-files=all 2>$null) -join "`n"
+    $diff   = (git -C $Repo diff HEAD 2>$null) -join "`n"
+    $combined = $status + "`n--DIFF--`n" + $diff
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($combined)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+    } finally { $sha.Dispose() }
+}
+
+function Test-ReviewLegMutated {
+    # #694: the PURE verdict the harness acts on -- did the worktree digest move across the review leg?
+    # $true => the read-only reviewer MUTATED the tree, so the harness FAILS CLOSED (never merge; park
+    # for the operator). The reviewer's own edit/bash:deny is a REQUEST the harness cannot trust alone:
+    # a live config-sync once reverted that very deny (2026-07-09), and the incident's mutation came from
+    # OUTSIDE the agent's tool calls anyway -- so this digest guard is the enforcement, independent of
+    # review.md. Two empty/failed digests that MATCH (a git hiccup on both sides) are NOT a false
+    # mutation; only a genuine difference trips it. Pure -> unit-tested without a model.
+    param([string]$Before, [string]$After)
+    return ($Before -ne $After)
+}
+
+function ConvertTo-NormalizedContentHash {
+    # #780 (c) helper: SHA-256 over LF-normalized UTF-8 text so a config file's IDENTITY is
+    # line-ending-insensitive. sync-harness fires on raw-byte Get-FileHash, but the SECURITY question
+    # #780 asks is "did the CONTENT (e.g. bash: deny) change direction?" -- that must not be fooled by a
+    # bare CRLF drift. Trailing newlines are trimmed so a Copy-Item file vs a git-show round-trip compare equal.
+    param([string]$Text)
+    if ($null -eq $Text) { $Text = '' }
+    $norm = (($Text -replace "`r`n", "`n") -replace "`r", "`n").TrimEnd("`n")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($norm)))).Replace('-', '')
+    } finally { $sha.Dispose() }
+}
+
+function Get-ConfigDeployDivergence {
+    # #780 fix (c): compare a git-tracked REPO config against its LIVE deployed copy and name the DIRECTION
+    # of any divergence, so the #694 merge motion can PROVE the sync-harness revert trap is disarmed.
+    # sync-harness.ps1 is one-way LIVE->repo (it Copy-Items the live file over the repo file whenever the two
+    # differ, then auto-commits). So the four verdicts each carry an action:
+    #   IN_SYNC     live == repo -- deployed; a sync is a no-op (the state the merge motion must LEAVE behind).
+    #   REPO_AHEAD  live == a KNOWN past committed version of the repo path -- the repo advanced and is awaiting
+    #               deploy. Benign IF deployed promptly; the exact #780 precursor if left (a later sync copies
+    #               the stale live back over the repo fix -- how f219074 was reverted by 3553b56).
+    #   LIVE_AHEAD  live carries content the repo's history NEVER held -- the next sync captures novel live state
+    #               into the tracked tree with no review. For a security-critical agent def that is the armed
+    #               trap and MUST fail loud (see Test-DeployDivergenceFatal).
+    #   LIVE_ABSENT no live copy (fresh box) -- nothing deployed, nothing to revert.
+    # Direction is decided on LF-normalized CONTENT (not raw bytes) so a bare CRLF drift is not misread as
+    # novel. Read-only: git log/show never mutate and the live file is only read; NOTHING is deployed here.
+    # ASCII; PS 5.1 + 7 safe.
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$RepoRelPath,
+        [Parameter(Mandatory)][string]$LivePath
+    )
+    $ErrorActionPreference = 'Continue'
+    if (-not (Test-Path -LiteralPath $LivePath)) { return 'LIVE_ABSENT' }
+    $liveRaw = Get-Content -LiteralPath $LivePath -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $liveRaw) { return 'LIVE_ABSENT' }
+    $repoFull = Join-Path $Repo $RepoRelPath
+    if (-not (Test-Path -LiteralPath $repoFull)) { return 'LIVE_AHEAD' }
+    $liveH = ConvertTo-NormalizedContentHash $liveRaw
+    $repoH = ConvertTo-NormalizedContentHash (Get-Content -LiteralPath $repoFull -Raw -ErrorAction SilentlyContinue)
+    if ($liveH -eq $repoH) { return 'IN_SYNC' }
+    foreach ($c in @(git -C $Repo log --all --format='%H' -- $RepoRelPath 2>$null)) {
+        $past = (@(git -C $Repo show "$($c):$RepoRelPath" 2>$null) -join "`n")
+        if ($past -and ((ConvertTo-NormalizedContentHash $past) -eq $liveH)) { return 'REPO_AHEAD' }
+    }
+    return 'LIVE_AHEAD'
+}
+
+function Test-DeployDivergenceFatal {
+    # #780 (c): the PURE severity verdict a gate acts on. LIVE_AHEAD is ALWAYS fatal -- a sync would silently
+    # mutate the tracked tree with unreviewed live content. REPO_AHEAD (pending deploy) and LIVE_ABSENT
+    # (fresh box) are non-fatal by default -- they are the benign merge-window / new-box states -- but -Strict
+    # (the POST-deploy gate the runbook uses) demands full IN_SYNC and fails anything else. Pure -> unit-tested.
+    param([string]$Verdict, [switch]$Strict)
+    if ($Verdict -eq 'LIVE_AHEAD') { return $true }
+    if ($Strict.IsPresent -and $Verdict -ne 'IN_SYNC') { return $true }
+    return $false
+}
+
+function Select-AgentProcessTreeTargets {
+    # PURE (#694 follow-up -- the coder-leg reap decision). Given a process SNAPSHOT, return the pids to
+    # reap for ONE agent leg so opencode's node / language-server / sub-agent children cannot outlive the
+    # leg and flush a late write into the NEXT leg's tree. That is the 20260710-152121 park: a
+    # trailing-newline normalize of Calculator.cs (a seed file the coder never edited) landed ~10 min after
+    # the coder-fix leg, DURING the read-only review, tripping the #694 digest guard. Targets =
+    #   (a) every DESCENDANT of $RootPid via the ParentProcessId chain -- Windows leaves the STALE ppid on an
+    #       orphan after its parent exits, so the chain still attributes the leg's own children post-exit; and
+    #   (b) any process whose image is in $ImageAllow AND whose CommandLine names the exact leg worktree
+    #       $WorkDir -- coverage for a child a language server re-parented off the ppid chain.
+    # NEVER returns $RootPid itself nor any pid in $Protect. The $WorkDir scoping is what makes a reap safe:
+    # it can touch only THIS leg's own tree -- never a sibling dispatch (different worktree, different root)
+    # nor the production AO/OVMS (not a descendant of this opencode, no worktree path in its cmdline). Kills
+    # (a) regardless of image because ppid-attribution to our own freshly-spawned opencode is strong; the
+    # weaker cmdline branch (b) is image-gated. Snapshot objects need .ProcessId/.ParentProcessId/.Name/
+    # .CommandLine. Pure -> unit-tested without spawning anything.
+    param(
+        [Parameter(Mandatory)]$Processes,
+        [Parameter(Mandatory)][int]$RootPid,
+        [string]$WorkDir = '',
+        [string[]]$ImageAllow = @('node.exe', 'opencode.exe'),
+        [int[]]$Protect = @()
+    )
+    $byParent = @{}
+    foreach ($pr in @($Processes)) {
+        $k = [int]$pr.ParentProcessId
+        if (-not $byParent.ContainsKey($k)) { $byParent[$k] = New-Object System.Collections.ArrayList }
+        [void]$byParent[$k].Add($pr)
+    }
+    $targets = @{}
+    # (a) ppid-chain descendants of RootPid (iterative; $walked guards a recycled-ppid cycle).
+    $stack = New-Object System.Collections.Stack; $stack.Push([int]$RootPid)
+    $walked = @{}
+    while ($stack.Count -gt 0) {
+        $cur = [int]$stack.Pop()
+        if ($walked.ContainsKey($cur)) { continue }
+        $walked[$cur] = $true
+        if ($byParent.ContainsKey($cur)) {
+            foreach ($ch in $byParent[$cur]) {
+                $cid = [int]$ch.ProcessId
+                if ($cid -ne [int]$RootPid) { $targets[$cid] = $true }
+                if (-not $walked.ContainsKey($cid)) { $stack.Push($cid) }
+            }
+        }
+    }
+    # (b) allowlisted image whose command line names the exact worktree (re-parented straggler coverage).
+    $wd = if ($WorkDir) { ($WorkDir -replace '/', '\').TrimEnd('\') } else { '' }
+    if ($wd) {
+        foreach ($pr in @($Processes)) {
+            $cl = ("$($pr.CommandLine)") -replace '/', '\'
+            if ($cl -and ($cl -like "*$wd*") -and ($ImageAllow -contains "$($pr.Name)")) {
+                $targets[[int]$pr.ProcessId] = $true
+            }
+        }
+    }
+    $protectSet = @{}; foreach ($x in @($Protect)) { $protectSet[[int]$x] = $true }
+    $protectSet[[int]$RootPid] = $true
+    return @($targets.Keys | Where-Object { -not $protectSet.ContainsKey([int]$_) } | Sort-Object -Unique)
+}
+
+function Stop-AgentProcessTree {
+    # #694 follow-up: REAP one agent leg's opencode process tree on EVERY exit path. The timeout/cap paths
+    # already `taskkill /T` while the parent is alive; a NORMAL exit killed nothing, so node / language-server
+    # / sub-agent children could orphan and flush a late write into the next leg (run 20260710-152121).
+    # Snapshot the live processes, pick the leg's own tree (Select-AgentProcessTreeTargets -- scoped + pure),
+    # and force-kill it. Fully guarded so it can NEVER throw into an agent run. Returns the reaped pids for
+    # the transcript. Reads processes; kills ONLY this leg's tree (see the selector's scoping note).
+    param([Parameter(Mandatory)][int]$RootPid, [string]$WorkDir = '', [int[]]$Protect = @())
+    $reaped = @()
+    try {
+        $snap = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                  Select-Object ProcessId, ParentProcessId, Name, CommandLine)
+        if (-not $snap -or $snap.Count -eq 0) { return @($reaped) }
+        $prot = @($Protect) + @([int]$PID)
+        $targets = Select-AgentProcessTreeTargets -Processes $snap -RootPid $RootPid -WorkDir $WorkDir -Protect $prot
+        foreach ($t in @($targets)) {
+            try { & taskkill.exe /PID $t /T /F *> $null; $reaped += [int]$t } catch {}
+        }
+    } catch {}
+    return @($reaped)
+}
+
+function Wait-WorktreeQuiesced {
+    # #694 follow-up: the write-SETTLE barrier. After a reap, PROVE the worktree stopped moving before the
+    # next leg snapshots it: sample Get-WorktreeDigest across a quiet window and return once two consecutive
+    # samples MATCH (no write landed in $QuietMs), or give up at $MaxWaitMs. A reaped tree settles on the
+    # first window; a still-writing one (an un-reaped straggler) surfaces as Settled=$false so the caller can
+    # log it and let the digest guard remain the backstop, rather than snapshot a moving tree. Read-only.
+    param([Parameter(Mandatory)][string]$Repo, [int]$QuietMs = 750, [int]$MaxWaitMs = 6000)
+    $ErrorActionPreference = 'Continue'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $prev = Get-WorktreeDigest -Repo $Repo
+    while ($sw.ElapsedMilliseconds -lt $MaxWaitMs) {
+        Start-Sleep -Milliseconds $QuietMs
+        $cur = Get-WorktreeDigest -Repo $Repo
+        if ($cur -eq $prev) { return @{ Settled = $true; WaitedMs = [int]$sw.ElapsedMilliseconds } }
+        $prev = $cur
+    }
+    return @{ Settled = $false; WaitedMs = [int]$sw.ElapsedMilliseconds }
+}
+
+function Restore-WorktreeToHead {
+    # #694 follow-up: DISCARD-and-log any POST-COMMIT stray worktree write so the reviewed tree is EXACTLY
+    # the committed candidate. Trade-off (named): the coder leg's COMMIT is its deliverable; a write that
+    # lands AFTER it (a formatter / language-server flush from a straggling child) is tooling noise, not
+    # intended work -- folding it into the commit would ship an unrequested change AND still race the digest
+    # guard, so we restore to HEAD instead. Returns the stray paths it discarded (empty = tree already clean)
+    # so the caller records them. Mirrors the existing best-of-N selection idiom (reset --hard + clean -fd).
+    # CALLER CONTRACT: only invoke when the leg's work is COMMITTED (never on a secret-blocked tree, whose
+    # uncommitted work is deliberately preserved for human review -- that path yields hasChanges=false and so
+    # never reaches here).
+    param([Parameter(Mandatory)][string]$Repo)
+    $ErrorActionPreference = 'Continue'
+    $stray = @(git -C $Repo status --porcelain --untracked-files=all 2>$null | Where-Object { $_ })
+    if ($stray.Count -gt 0) {
+        git -C $Repo reset --hard HEAD 2>&1 | Out-Null
+        git -C $Repo clean -fd 2>&1 | Out-Null
+    }
+    return @($stray)
 }
 
 function Resolve-PassBudget {
@@ -1603,7 +2015,19 @@ function Resolve-WorktreeBase {
     # state/worktrees), so projects/ only EVER shows the one folder the operator named -- even a worktree
     # leaked by a hard-killed run is invisible here, not beside the project. Pure: derives the base from the
     # scripts dir; the caller creates it. Unit-tested in verify-worktree-location.ps1 (no git, no model).
-    param([Parameter(Mandatory)][string]$ScriptRoot)
+    #
+    # #775 ACP-01 (D-B): the (b) containment floor relocates the throwaway worktree base OUT of the operator
+    # profile so the profile default-deny does the containment heavy-lifting (a separate standard account is
+    # already denied everything under C:\Users\mrbla) instead of hand-punching read-holes into it -- and to a
+    # SHARED tree both the operator SID and the coder SID can Modify, so the orchestrator-side merge can still
+    # read the coder-created files. This is FLAG-GATED: it fires ONLY when -Containment 'restricted_account'.
+    # With the default -Containment 'off' the return is BYTE-IDENTICAL to today (the 23:00 battery runs the
+    # EXACT current path), so nothing merged here can move the live worktree base until the flag flips.
+    param(
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [ValidateSet('off','restricted_account')][string]$Containment = 'off'
+    )
+    if ($Containment -eq 'restricted_account') { return 'C:\blarai-fleet\worktrees' }
     Join-Path (Split-Path $ScriptRoot -Parent) 'state\worktrees'
 }
 
@@ -1748,7 +2172,7 @@ function Invoke-CandidateBuild {
     $build = Invoke-BuildWithRetry -MaxBuildAttempts $MaxBuildAttempts `
         -OnRetry { param($n) Write-Host "  Attempt $($n - 1) produced no changes; retrying ($n/$MaxBuildAttempts) from a clean worktree..." -ForegroundColor Yellow } `
         -ResetWorktree { git -C $wt reset --hard HEAD 2>&1 | Out-Null; git -C $wt clean -fd 2>&1 | Out-Null } `
-        -RunAgent { Invoke-AgentRun -WorkDir $wt -Model $Model -Prompt $AttemptPrompt -LogPath $LogPath -TimeoutSec ($MaxRunMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec -JsonStepCap } `
+        -RunAgent { Invoke-CoderDriver -WorkDir $wt -Model $Model -Prompt $AttemptPrompt -LogPath $LogPath -TimeoutSec ($MaxRunMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec -ScriptRoot $ScriptRoot } `
         -ProducedChanges { (@(git -C $wt status --porcelain 2>$null).Count -gt 0) -or (([int](git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null)) -gt 0) }
     $run = $build.Run
     if ($run.Error) { Write-Host "  $($run.Error)" -ForegroundColor Red }

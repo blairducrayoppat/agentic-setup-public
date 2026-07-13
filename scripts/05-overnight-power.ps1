@@ -21,7 +21,7 @@ Write-Host @"
 
 RULES FOR FLEET NIGHTS (BLUEPRINT.md section 8):
   - Laptop on AC power, lid open or lid-action verified
-  - Fleet tier = qwen3-14b ONLY (never the 30B)
+  - Fleet codes on coder-30b (loaded by BlarAI's dispatch driver before each run)
   - WSL2 memory cap in place if OpenClaw lives there (configs\wslconfig-snippet.txt)
   - Expect thermal throttling on a thin laptop — slower, not broken
 

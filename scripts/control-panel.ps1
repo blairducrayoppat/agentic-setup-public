@@ -46,7 +46,8 @@ while ($true) {
     Write-Host "  [2] Load Deep Coding (30B)  (big jobs - wants a lean machine)"
     Write-Host "  [3] Load Everyday (14B)"
     Write-Host "  [4] Load Vision (8B)        (screenshot analysis)"
-    Write-Host "  [5] Stop AI models          (free the memory)"
+    Write-Host "  [5] Stop the model server   (OVMS - the coder/vision/everyday swap models)"
+    Write-Host "  [S] Stop the assistant      (BlarAI's resident 14B on :5001 - frees ~12.6 GB)"
     Write-Host "  [6] Full status report"
     Write-Host "  [7] Live GPU monitor        (opens its own window)"
     Write-Host "  [8] Undo AI changes in a project"
@@ -60,6 +61,7 @@ while ($true) {
     Write-Host "  [G] Install secret scanner  (one-time setup)"
     Write-Host "  [A] Add a coding task       (queue a job for the agent)"
     Write-Host "  [T] Run overnight queue now (processes queued fleet tasks)"
+    Write-Host "  [H] Quality & Grading Health   (regenerate + open the #840 dashboard)"
     Write-Host "  [Q] Quit"
     try { $c = Read-Host "Pick" } catch { break }   # no console input -> exit instead of looping
     if ($null -eq $c) { break }
@@ -69,6 +71,7 @@ while ($true) {
     elseif ($c -eq '3') { & "$S\start-llm.ps1" -Model qwen3-14b }
     elseif ($c -eq '4') { & "$S\start-llm.ps1" -Model vision }
     elseif ($c -eq '5') { & "$S\stop-llm.ps1" }
+    elseif ($c -match '^[Ss]$') { & "$S\stop-assistant.ps1" }
     elseif ($c -eq '6') { & "$S\ai-status.ps1" }
     elseif ($c -eq '7') {
         # own window so closing the monitor does not close the panel
@@ -112,6 +115,14 @@ while ($true) {
         }
     }
     elseif ($c -match '^[Tt]$') { & "$S\run-fleet.ps1" }
+    elseif ($c -match '^[Hh]$') {
+        # Regenerate + open the #840 live-proof grading & integration health dashboard (blarai repo).
+        $blarPy = 'C:\Users\mrbla\blarai\.venv\Scripts\python.exe'
+        if (-not (Test-Path $blarPy)) { $blarPy = 'python' }
+        $gen = 'C:\Users\mrbla\blarai\scripts\live_proof\generate_dashboard.py'
+        Write-Host " Regenerating the grading & integration health dashboard..." -ForegroundColor Cyan
+        & $blarPy $gen --open
+    }
     elseif ($c -match '^[Qq]$') { break }
     else { continue }
 

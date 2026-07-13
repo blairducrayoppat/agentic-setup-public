@@ -958,6 +958,93 @@ Assert-Eq 'All criteria met.' $md.Feedback 'MDP5 [kill] omitting pixel params re
 Assert-False $md.ShouldIterate 'MDP5 omitting pixel params -> unchanged stop behavior'
 
 # =============================================================================
+Section 'MDR* -- Merge-DesignSignals: the Lever D (browser RUNTIME) gate (#823 H8/H9)'
+# The runtime gate is the fix for the pixel-BLINDNESS class (B5n2): a console error / uncaught
+# exception the VLM cannot see forces a FIX and LEADS the feedback (ranked above the cosmetic
+# critique). RuntimeHard/RuntimeMessages default inert so every pre-runtime caller above is
+# byte-identical.
+
+$_b5err = 'Uncaught exception: ReferenceError: sum is not defined (chart.js:10)'
+
+# MDR1 [kill]: a hard RUNTIME finding OVERRIDES a VLM pass (the console-blindness false-pass fix).
+$md = Merge-DesignSignals -LayoutHard $false -RuntimeHard $true -RuntimeMessages @($_b5err) `
+    -VlmOk $true -VlmNeedsWork $false -VlmShouldIterate $false -VlmFeedback 'All criteria met.' -Iteration 0 -MaxIter 3
+Assert-True  $md.ShouldIterate 'MDR1 [kill] a hard runtime finding forces a FIX even when the VLM PASSED (the B5 shape)'
+Assert-True  $md.NeedsWork     'MDR1 needs_work true when the runtime gate is hard'
+Assert-True  $md.RuntimeHard   'MDR1 RuntimeHard is returned distinctly (so Python names it a runtime error, not layout)'
+Assert-True  $md.LayoutHard    'MDR1 returned LayoutHard means ANY deterministic hard (runtime included)'
+Assert-Contains $md.Feedback 'sum is not defined' 'MDR1 feedback carries the runtime error VERBATIM (file/line/message)'
+Assert-Contains $md.Feedback 'Runtime errors' 'MDR1 feedback labels the runtime section'
+
+# MDR2 [kill]: runtime findings LEAD -- ranked ABOVE layout, pixel, AND the VLM (fix the error first).
+$md = Merge-DesignSignals -LayoutHard $true -LayoutMessages @('Display overlap.') `
+    -PixelHard $true -PixelMessages @('green absent.') -RuntimeHard $true -RuntimeMessages @($_b5err) `
+    -VlmOk $true -VlmNeedsWork $true -VlmShouldIterate $true -VlmFeedback 'Buttons too small.' -Iteration 0 -MaxIter 3
+Assert-True ($md.Feedback.IndexOf('sum is not defined') -lt $md.Feedback.IndexOf('Display overlap')) 'MDR2 [kill] runtime leads layout'
+Assert-True ($md.Feedback.IndexOf('Display overlap') -lt $md.Feedback.IndexOf('green absent')) 'MDR2 layout still precedes pixel'
+Assert-True ($md.Feedback.IndexOf('green absent') -lt $md.Feedback.IndexOf('Buttons too small')) 'MDR2 the VLM (cosmetic) feedback is last'
+
+# MDR3 [kill]: runtime-hard but the iteration budget is spent -> NO iteration (bounded).
+$md = Merge-DesignSignals -LayoutHard $false -RuntimeHard $true -RuntimeMessages @('boom') -VlmShouldIterate $false -VlmFeedback '' -Iteration 3 -MaxIter 3
+Assert-False $md.ShouldIterate 'MDR3 [kill] runtime-hard does NOT iterate past the MaxIter budget (bounded)'
+Assert-True  $md.NeedsWork     'MDR3 needs_work still true at the cap (the error is real even when we stop)'
+
+# MDR4 [kill]: runtime messages WITHOUT RuntimeHard never force iteration nor appear (Hard is the gate).
+$md = Merge-DesignSignals -LayoutHard $false -RuntimeHard $false -RuntimeMessages @('a soft note') -VlmShouldIterate $false -VlmFeedback 'ok' -Iteration 0 -MaxIter 3
+Assert-False $md.ShouldIterate 'MDR4 [kill] runtime messages without RuntimeHard do not force iteration'
+Assert-Eq 'ok' $md.Feedback 'MDR4 runtime messages are omitted from feedback when not hard'
+Assert-False $md.RuntimeHard 'MDR4 RuntimeHard false is returned when not hard'
+
+# MDR5 [kill]: omitting ALL runtime params reproduces the pre-runtime behavior byte-for-byte.
+$md = Merge-DesignSignals -LayoutHard $false -VlmOk $true -VlmNeedsWork $false -VlmShouldIterate $false -VlmFeedback 'All criteria met.' -Iteration 0 -MaxIter 3
+Assert-Eq 'All criteria met.' $md.Feedback 'MDR5 [kill] omitting runtime params reproduces the pre-runtime feedback exactly'
+Assert-False $md.ShouldIterate 'MDR5 omitting runtime params -> unchanged stop behavior'
+Assert-False $md.RuntimeHard 'MDR5 RuntimeHard defaults false when the param is omitted'
+
+# =============================================================================
+Section 'RCS* -- Read-ConsoleSidecar: the browser-runtime sidecar reader (#823, honest degraded)'
+$rcsDir = Join-Path $scratch 'rcs'
+New-Item -ItemType Directory -Force $rcsDir | Out-Null
+
+# RCS1 [kill]: a MISSING sidecar -> no runtime signal (WinUI capture / structural floor / old capture).
+$r = Read-ConsoleSidecar -SidecarPath (Join-Path $rcsDir 'nope.console.json')
+Assert-False $r.Captured 'RCS1 [kill] missing sidecar -> Captured=$false'
+Assert-False $r.Hard     'RCS1 missing sidecar -> Hard=$false'
+Assert-Eq 0 $r.Messages.Count 'RCS1 missing sidecar -> no messages'
+
+# RCS2 [kill]: a captured:false sidecar (the msedge --screenshot fallback) -> HONEST no-signal.
+$s2 = Join-Path $rcsDir 's2.console.json'
+'{"captured":false,"error":"cdp unavailable","console":[],"pageErrors":[],"findings":["ignored because captured=false"]}' | Set-Content $s2 -Encoding UTF8
+$r = Read-ConsoleSidecar -SidecarPath $s2
+Assert-False $r.Captured 'RCS2 [kill] captured:false (pixel-only fallback) -> Captured=$false (never fakes a verdict)'
+Assert-False $r.Hard     'RCS2 captured:false -> Hard=$false'
+Assert-Eq 0 $r.Messages.Count 'RCS2 captured:false -> findings ignored (no runtime signal)'
+
+# RCS3 [kill]: a captured:true + hard:true sidecar -> the verbatim finding rides the signal (the B5 catch).
+$s3 = Join-Path $rcsDir 's3.console.json'
+('{"captured":true,"hard":true,"errorCount":2,"findings":[' +
+ '"' + $_b5err + '","Rendered text contains \"undefined\""]}') | Set-Content $s3 -Encoding UTF8
+$r = Read-ConsoleSidecar -SidecarPath $s3
+Assert-True  $r.Captured 'RCS3 [kill] captured:true -> Captured=$true'
+Assert-True  $r.Hard     'RCS3 hard:true -> Hard=$true (forces a FIX)'
+Assert-Contains ($r.Messages -join ' | ') 'sum is not defined' 'RCS3 the verbatim runtime finding is carried'
+
+# RCS4 [kill]: a captured:true + hard:false sidecar (a clean page) -> the zero-error PASS signal.
+$s4 = Join-Path $rcsDir 's4.console.json'
+'{"captured":true,"hard":false,"errorCount":0,"findings":[]}' | Set-Content $s4 -Encoding UTF8
+$r = Read-ConsoleSidecar -SidecarPath $s4
+Assert-True  $r.Captured 'RCS4 captured:true clean -> Captured=$true (belt: console channel ran)'
+Assert-False $r.Hard     'RCS4 [kill] zero console errors -> Hard=$false (a PASS signal, no forced fix)'
+Assert-Eq 0 $r.Messages.Count 'RCS4 clean page -> no runtime findings'
+
+# RCS5 [kill]: garbled JSON -> fail-soft to no-signal (never throws).
+$s5 = Join-Path $rcsDir 's5.console.json'
+'{not valid json at all' | Set-Content $s5 -Encoding UTF8
+$r = Read-ConsoleSidecar -SidecarPath $s5
+Assert-False $r.Captured 'RCS5 [kill] garbled sidecar JSON -> Captured=$false (fail-soft, never throws)'
+Assert-False $r.Hard     'RCS5 garbled sidecar -> Hard=$false'
+
+# =============================================================================
 Section 'LA* -- layout gate forces a FIX through the full critique pass (Lever A integration)'
 
 # LA1 [kill]: the VLM PASSES but the layout gate is HARD -> the pass returns ShouldIterate=$true.

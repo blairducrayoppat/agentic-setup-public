@@ -189,7 +189,7 @@ Your OpenVINO GenAI stack IS the platform: Python 3.12 venvs + `openvino`, `open
 3. Merge gate every morning: tests pass + you read the diff (`git diff main...agent/task`) like a colleague's PR. Never let an agent run in your main checkout.
 4. Nightly dispatch via **Windows Task Scheduler** → `run-fleet.ps1` over a queue built with `add-fleet-task.ps1` (§13), with 1 active agent (+1 light lane) — the honest limit of this box. (OpenClaw's cron was the original Phase-4 plan; it was dropped — see §5. Conversational dispatch instead comes from BlarAI's 14B AO/PA enqueuing fleet tasks.)
 5. **Overnight survival** (`scripts\05-overnight-power.ps1`): AC power required, sleep/hibernate disabled while plugged in, Windows Update active hours set. A thin laptop will thermally throttle on multi-hour inference — expect reduced t/s, that's fine. These kill overnight runs more often than OOM does.
-6. Fleet tier = **qwen3-14b only**. The first `npm ci` or pytest spike on top of coder-30b starts paging exactly when an agent is mid-task.
+6. Fleet tier = **coder-30b**. BlarAI's dispatch driver loads `coder-30b` before any task runs, so every dispatched run and overnight batch codes on the 30B.
 
 ---
 

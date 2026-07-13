@@ -81,7 +81,7 @@ for ($i = 0; $i -lt $tasks.Count; $i++) {
     $waitDeadline = (Get-Date).AddMinutes($ServerWaitMinutes)
     $model = Get-LoadedModelId
     if (-not $model) {
-        Write-Host "  model server not ready - waiting up to $ServerWaitMinutes min (to start one: start-llm.ps1 -Model qwen3-14b)..." -ForegroundColor Yellow
+        Write-Host "  model server not ready - waiting up to $ServerWaitMinutes min (to start one: start-llm.ps1 -Model coder-30b)..." -ForegroundColor Yellow
     }
     while (-not $model -and (Get-Date) -lt $waitDeadline) {
         Start-Sleep -Seconds 15

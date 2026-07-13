@@ -347,6 +347,34 @@ if (-not $resolvedExe) {
                 }
             }
             try {
+                # ---- H8/H9 (#823): CDP console-capturing helper FIRST, msedge --screenshot fallback ----
+                # capture-web-cdp.mjs drives Edge over the DevTools Protocol, so it captures the browser
+                # console + uncaught exceptions (PROTOCOL events a page cannot suppress) AND runs a positive
+                # behavior smoke, writing "$OutPng.console.json" beside the PNG. That is the runtime-error
+                # channel the msedge --screenshot one-shot could never carry (B5n2: the thrown JS error sat
+                # unread in the console). If node or the helper is unavailable/fails, we FALL BACK to the
+                # proven --screenshot path and stamp a captured:false sidecar so the design loop degrades to
+                # today's pixel-only behavior WITHOUT faking a richer verdict (the ok-flag discipline).
+                $sidecar = "$OutPng.console.json"
+                $cdpOk = $false
+                $cdpScript = Join-Path $ScriptDir 'capture-web-cdp.mjs'
+                $node = Get-Command node -ErrorAction SilentlyContinue
+                if ($node -and (Test-Path $cdpScript)) {
+                    try {
+                        & $node.Source $cdpScript --url $uri --out $OutPng --console-out $sidecar `
+                            --app-dir $AppDir --timeout-ms ($WebTimeoutSec * 1000) *> $null
+                        if ($LASTEXITCODE -eq 0 -and (Test-Path $OutPng) -and (Get-Item $OutPng).Length -gt 100) {
+                            $m = [System.IO.File]::ReadAllBytes($OutPng) | Select-Object -First 4
+                            if ($m.Count -ge 4 -and $m[0] -eq 0x89 -and $m[1] -eq 0x50 -and $m[2] -eq 0x4E -and $m[3] -eq 0x47) {
+                                $cdpOk = $true; $webOk = $true
+                                Write-Tier web "CDP capture OK (protocol-level console + behavior smoke) -> $sidecar"
+                            }
+                        }
+                    } catch { Write-Tier web "CDP helper threw: $($_.Exception.Message)" }
+                    if (-not $cdpOk) { Write-Tier web "CDP console capture unavailable -> msedge --screenshot fallback (pixel-only)" }
+                }
+
+                if (-not $cdpOk) {
                 # ARG ORDER + FLAGS ARE LOAD-BEARING (pinned empirically 2026-06-26): msedge
                 # --screenshot SILENTLY no-ops (exit 0, NO PNG written) when --hide-scrollbars is
                 # present OR when --window-size precedes --screenshot. The prior invocation had BOTH,
@@ -382,6 +410,12 @@ if (-not $resolvedExe) {
                 # Best-effort reap of the launcher + worker tree for this one-shot capture.
                 try { & taskkill.exe /PID $proc.Id /T /F *> $null } catch {}
                 if (-not $webOk) { Write-Tier web "FAIL: no screenshot within ${WebTimeoutSec}s -> fall through to tier 3" }
+                # Honesty sidecar (#823 fail-soft): the --screenshot path captured NO console, so the
+                # design loop must read captured:false and degrade to pixel-only -- never fake a runtime verdict.
+                if ($webOk) {
+                    try { '{"captured":false,"error":"cdp console capture unavailable (msedge --screenshot fallback)","console":[],"pageErrors":[],"findings":[]}' | Set-Content -Path $sidecar -Encoding UTF8 } catch {}
+                }
+                }
             } catch {
                 Write-Tier web "FAIL: $($_.Exception.Message) -> fall through to tier 3"
             } finally {
