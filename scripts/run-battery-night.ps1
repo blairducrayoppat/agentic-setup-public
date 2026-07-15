@@ -84,6 +84,28 @@ if (-not $IsElevated) {
 # ---- 1. campaign state ------------------------------------------------------
 if (-not (Test-Path $CampaignConfig)) { throw "campaign config missing: $CampaignConfig" }
 $camp = Get-Content $CampaignConfig -Raw | ConvertFrom-Json
+
+# ---- 1a. hard end date (LA direction 2026-07-14) -----------------------------
+# The campaign must not run indefinitely chasing a pass target that may never
+# bank — LA set a calendar backstop independent of completed_passes ("extra
+# passes are fine, running forever is not"). Optional field: absent/blank
+# end_date = no calendar cutoff (a side/manual config just omits it). Scoped to
+# $IsDefaultCampaign like the pass-count check below (2026-07-09 scoping fix) —
+# a side config's cutoff must never touch the shared nightly task.
+if ($camp.end_date) {
+    $endDate = [datetime]::ParseExact($camp.end_date, "yyyy-MM-dd", $null)
+    if ((Get-Date).Date -gt $endDate) {
+        Write-Log "Campaign end date ($($camp.end_date)) has passed ($($camp.completed_passes)/$($camp.target_full_passes) passes banked) — unregistering the scheduled task per the hard calendar cutoff."
+        if ($IsDefaultCampaign) {
+            try { Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Confirm:$false } catch {}
+        } else {
+            Write-Log "side campaign config past its end date — NOT touching the shared scheduled task (scoping fix, 2026-07-09)."
+        }
+        Stop-Transcript | Out-Null
+        exit 0
+    }
+}
+
 if ($camp.completed_passes -ge $camp.target_full_passes) {
     if ($IsDefaultCampaign) {
         Write-Log "Campaign COMPLETE ($($camp.completed_passes)/$($camp.target_full_passes) passes) — unregistering the scheduled task."

@@ -70,8 +70,11 @@ password_file C:\Program Files\mosquitto\passwd
 - **go2rtc 1.9.14** (2026-01-19; AlexxIT/go2rtc): ships a native **Windows binary** (zero-dependency single exe). API: web UI on `:1984`, MSE `ws://host:1984/api/ws?src=cam`, WebRTC on `:8555` + `POST /api/webrtc?src=cam` (WHEP), MJPEG `/api/stream.mjpeg?src=cam`, snapshots `/api/frame.jpeg`. Config:
 ```yaml
 streams:
-  front_door: rtsp://user:pass@192.168.1.50:554/h264Preview_01_main
+  front_door: rtsp://user:pass@192.0.2.50:554/h264Preview_01_main
 ```
+(IP shown is the RFC 5737 documentation range, matching the convention used in
+`build-infra/knowledge/networking-devices.md` — this is illustrative go2rtc
+config syntax, not a real device address.)
 Embeds in any web page via its `video-stream.js`/WebRTC — the canonical way to get live video into a custom dashboard.
 
 ## 6. Protocol hardware (offline-first, 2026)
