@@ -86,7 +86,11 @@ foreach ($r in $repos) {
             $why = ($pushOut | Where-Object { $_ -match 'error|fatal|rejected' } | Select-Object -First 3) -join ' | '
             Fail "$($r.Name): branch push exited $LASTEXITCODE — $why"
         }
-        git push origin --tags 2>&1 | Out-Null
+        $tagOut = git push origin --tags 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $why = ($tagOut | Where-Object { $_ -match 'error|fatal|rejected' } | Select-Object -First 3) -join ' | '
+            Fail "$($r.Name): tag push exited $LASTEXITCODE — $why"
+        }
         Log "$($r.Name): pushed $($refs.Count) branches + tags"
     } finally { Pop-Location }
 }
@@ -137,9 +141,12 @@ Log 'claude memory + settings mirrored'
 
 # opencode config, jobhunt data files, gitignored handoff docs, fleet queue state
 robocopy C:\Users\mrbla\.config\opencode "$BackupRoot\opencode\config" /E /XD node_modules /XF package-lock.json /NFL /NDL /NJH /NJS | Out-Null
+if ($LASTEXITCODE -ge 8) { Fail "opencode config robocopy exited $LASTEXITCODE" }
 robocopy C:\Users\mrbla\jobhunt\data "$BackupRoot\runtime-data\jobhunt" /E /XF jobhunt.db /NFL /NDL /NJH /NJS | Out-Null
+if ($LASTEXITCODE -ge 8) { Fail "jobhunt-data robocopy exited $LASTEXITCODE" }
 if (Test-Path 'C:/Users/mrbla/blarai/docs/handoffs') {
     robocopy C:\Users\mrbla\blarai\docs\handoffs "$BackupRoot\misc\blarai-handoffs" /E /NFL /NDL /NJH /NJS | Out-Null
+    if ($LASTEXITCODE -ge 8) { Fail "handoffs robocopy exited $LASTEXITCODE" }
 }
 foreach ($f in 'C:/Users/mrbla/agentic-setup/state/fleet-queue.json','C:/Users/mrbla/agentic-setup/state/recent-projects.txt') {
     if (Test-Path $f) { Copy-Item $f "$BackupRoot/misc/" -Force }

@@ -111,6 +111,7 @@ for ($i = 0; $i -lt $tasks.Count; $i++) {
             if ($t.visual_criteria_json) { $params.VisualCriteriaJson = $t.visual_criteria_json }  # UC-010 Phase 3: visual-tier criterion texts (JSON array string); gates the critique hook
             if ($t.acceptance_test_code) { $params.AcceptanceTestCode = $t.acceptance_test_code }  # #690: the shared spec-derived ORACLE (python single-feature); seeded + protected + restored before the gate
             if ($t.acceptance_test_path) { $params.AcceptanceTestPath = $t.acceptance_test_path }  # #690: repo-relative path the oracle is seeded to
+            if ($t.canonical_package) { $params.CanonicalPackage = $t.canonical_package }  # #790 sub-task 5: the job-oracle contract's ONE top-level package -- the python skeleton seeds under this name (no generic app/ twin beside the oracle's package)
             if ($Concurrency -gt 0) { $params.Concurrency = $Concurrency }  # #695: run-level best-of-N concurrency override
             if ($t.concurrency) { $params.Concurrency = $t.concurrency }    # #695: a queue task's own concurrency wins over the run-level value
             # GO-LIVE (2026-06-25, operator-approved): the VLM design-critique + auto-FIX loop is LIVE.

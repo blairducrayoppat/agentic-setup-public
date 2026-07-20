@@ -801,18 +801,6 @@ function Format-VerifyError {
     }) -join "`n`n"
 }
 
-function Add-BuildErrorFeedback {
-    # ERROR-FEEDBACK: augment the coder's prompt with the prior attempt's build error and an
-    # instruction to FIX the existing code (not start over). Returns the prompt UNCHANGED when
-    # there is no error, so attempt 1 and no-error resamples are unaffected. Pure + unit-tested.
-    param([string]$Prompt, [string]$BuildError)
-    if ([string]::IsNullOrWhiteSpace($BuildError)) { return $Prompt }
-    $Prompt + "`n`n--- YOUR PREVIOUS ATTEMPT DID NOT PASS THE BUILD; FIX IT ---`n" +
-        "The code already in this workspace failed the build/verify gate. The exact error(s):`n`n" +
-        $BuildError +
-        "`n`nMake the SMALLEST change to the EXISTING code that resolves the error(s) above and makes it build. Do NOT start over or delete working code."
-}
-
 function Add-ReviewFeedback {
     # REVIEW-FEEDBACK: augment the coder's prompt with the code reviewer's FIX-FIRST findings, so a
     # building-but-flawed attempt gets FIXED (logic/completeness the build gate can't see) instead of
@@ -823,37 +811,6 @@ function Add-ReviewFeedback {
         "Address these review findings, then make sure it still builds:`n`n" +
         $ReviewConcerns +
         "`n`nMake the SMALLEST changes to the EXISTING code that resolve the findings above. Do NOT start over or delete working code."
-}
-
-function Test-ShouldContinue {
-    # POLICY: should the build loop run ANOTHER pass? Two INDEPENDENT dimensions, each with its own budget
-    # so build-resamples can never starve review-feedback (and vice-versa):
-    #   (1) build/test FAILED -> resample / error-feedback (the proven Test-ShouldResample decision), bounded
-    #       by the BUILD budget ($Pass < $MaxPasses), and
-    #   (2) build is OK but the REVIEW said FIX FIRST -> a review-feedback pass, bounded by the REVIEW budget
-    #       ($ReviewPass < $MaxReviewPasses).
-    # NEVER continues on a timeout or a secret-block. A hard total ceiling ($MaxPasses + $MaxReviewPasses) is
-    # a defensive backstop -- each dimension self-bounds first. Pure + injectable so it unit-tests w/o a model.
-    # NOTE: $TimedOut is the BUILD agent's circuit-breaker ONLY; a REVIEW-agent timeout is surfaced by the
-    # caller as $Verdict='UNCLEAR' and intentionally ends the loop (no extra pass).
-    param(
-        [string]$VerifyResult,
-        [string]$TestResult,
-        [string]$Verdict,
-        [bool]$TimedOut,
-        [bool]$SecretBlocked,
-        [int]$Pass,
-        [int]$MaxPasses,
-        [int]$ReviewPass = 0,
-        [int]$MaxReviewPasses = 0
-    )
-    # (1) build/test failure -> the proven resample/error-feedback policy (build budget).
-    if (Test-ShouldResample -VerifyResult $VerifyResult -TestResult $TestResult -TimedOut $TimedOut -SecretBlocked $SecretBlocked -Attempt $Pass -MaxAttempts $MaxPasses) { return $true }
-    if ($TimedOut -or $SecretBlocked) { return $false }
-    if (($Pass + $ReviewPass) -ge ($MaxPasses + $MaxReviewPasses)) { return $false }   # hard total ceiling (build + review work; backstop)
-    # (2) builds + tests clean but the reviewer wants fixes -> review-feedback, bounded by its OWN budget.
-    if ($VerifyResult -ne 'fail' -and $TestResult -ne 'fail' -and $Verdict -eq 'FIX FIRST' -and $ReviewPass -lt $MaxReviewPasses) { return $true }
-    return $false
 }
 
 function Test-ShouldRunReview {
@@ -1216,6 +1173,31 @@ OFFLINE RULES (this box has NO network -- breaking these is why the build fails)
     return "$Prompt`n`n--- OFFLINE WEB BUILD (extend the seeded offline skeleton; no external assets) ---`n$note"
 }
 
+function Add-WebStaticHint {
+    # STATIC-PAGE PROMPT (#886, 2026-07-15): a `web-static` scaffold ships a SINGLE self-contained
+    # `index.html` (inline <style>, inline <svg>, inline <script> plain DOM) and NOTHING else -- no
+    # package.json, no src/server.js, no public/app.js, no fetch. It is the correct seed for an ask
+    # that explicitly excludes a server/build step ("one index.html file... opens correctly in a
+    # browser"). The live failure this prevents: the `web` seed's node:http server + public/app.js
+    # that fetches `/api/health` left a "Loading..." box stuck forever when the page was opened as
+    # file:// (no backend). This hint tells the coder to EXTEND THE ONE FILE and stay static +
+    # offline -- do NOT add a server, a build step, a package.json, or any fetch. Gated on $WebStatic
+    # (the resolved scaffold == 'web-static') so every other task is byte-identical, and it ALWAYS
+    # preserves the original prompt verbatim (appended, never replaces). Pure -> unit-tests without a model.
+    param([string]$Prompt, [bool]$WebStatic)
+    if (-not $WebStatic) { return $Prompt }
+    $note = @'
+This build ships ONE self-contained `index.html` (inline `<style>`, inline `<svg>` images, inline `<script>` using plain DOM) that opens straight in a browser with NO build step and NO server. EXTEND THAT ONE FILE -- do NOT add a `package.json`, a `src/server.js`, a `public/app.js`, a build tool, a framework, or a second project.
+ACT FIRST -- your FIRST tool call should be an EDIT to `index.html`. The seed marks its placeholder content with `class="placeholder"` and an "EXTEND THIS FILE" comment; REPLACE that placeholder with the real content the goal asks for (never leave the placeholder text as the final page).
+STATIC + OFFLINE RULES (this box has NO network, and there is NO backend -- breaking these is why the page fails):
+- NO server, NO `fetch`, NO backend call, NO build step. Everything is inline in the one HTML file. There is no `/api/...` to call -- a page that waits on a fetch will hang forever when opened as `file://`.
+- NEVER reference an external URL: no CDN, no remote image/script/style/font. For an image use an inline `<svg>...</svg>` or a `data:` URI -- NOT `<img src="https://...">` (a remote asset will not load offline).
+- Put your JavaScript in an inline `<script>` in the same file using plain DOM (`document.querySelector`, event listeners) -- no `import`, no module, no external `.js` file.
+- Verify by opening the page with the browser tool on its `file:///` path -- a rendered page with a clean console (no errors, nothing stuck "Loading...") means done.
+'@
+    return "$Prompt`n`n--- STATIC WEB PAGE (extend the ONE self-contained index.html; no server, no build, no fetch) ---`n$note"
+}
+
 function Add-AssetHint {
     # ASSET-CONSUMPTION PROMPT (#714, UC-010 SEAM A): when BlarAI's on-device image generator
     # PRE-GENERATED real raster image assets into the target repo BEFORE the coder ran, tell the
@@ -1301,6 +1283,7 @@ function Resolve-BuildProfile {
     switch ($s) {
         'desktop-gui'  { return @{ scaffold = 'winui';   structural_contract = $winuiContract; staged = $true } }
         'web'          { return @{ scaffold = 'web';      structural_contract = $null;          staged = $false } }
+        'web-static'   { return @{ scaffold = 'web-static'; structural_contract = $null;        staged = $false } }
         'mobile'       { return @{ scaffold = 'android';  structural_contract = $null;          staged = $false } }
         'command-line' {
             # House default is PYTHON, consistent with `library` below: a Python-centric local
@@ -1505,23 +1488,50 @@ function Copy-ScaffoldInto {
     # Copy a known-good skeleton from build-infra/<name>/reference (+ the sibling offline nuget.config)
     # into the worktree so the coder starts from a compiling project. Returns the seeded file names
     # (empty array if the scaffold dir is missing). ScaffoldRoot is injectable for tests.
+    # #790 sub-task 5: -PackageName seeds the skeleton's PACKAGE under the job-oracle contract's ONE
+    # canonical top-level name instead of the generic 'app' -- the B4 flashcards park grew BOTH an
+    # 'app/' twin (stale placeholder core + a tests/test_core.py importing app.core) AND the real
+    # 'flashcard_app/' package because the seed and the oracle each pinned a different layout. The
+    # rename fires ONLY when the name is a valid python identifier, differs from 'app', AND the
+    # scaffold actually ships a top-level app/ package (today: the python skeleton) -- anything else
+    # is the byte-identical legacy seed (deny-by-default; a miss is safe, never worse).
     param(
         [Parameter(Mandatory)][string]$Scaffold,
         [Parameter(Mandatory)][string]$Worktree,
-        [string]$ScaffoldRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) 'build-infra')
+        [string]$ScaffoldRoot = (Join-Path (Split-Path $PSScriptRoot -Parent) 'build-infra'),
+        [string]$PackageName = ''
     )
     $base = Join-Path $ScaffoldRoot $Scaffold
     $ref  = Join-Path $base 'reference'
     if (-not (Test-Path $ref)) { return @() }
+    $renameApp = [bool]($PackageName -and $PackageName -cne 'app' -and
+        $PackageName -cmatch '^[A-Za-z_][A-Za-z0-9_]*$' -and
+        (Test-Path (Join-Path (Join-Path $ref 'app') '__init__.py')))
     $seeded = New-Object System.Collections.ArrayList
     # Copy the WHOLE reference tree (files + subdirs, e.g. Python's app/ and tests/) into the
     # worktree, preserving structure. WinUI's flat layout is unaffected (rel == file name).
     foreach ($f in Get-ChildItem -LiteralPath $ref -Recurse -File) {
         $rel = $f.FullName.Substring($ref.Length).TrimStart('\', '/')
+        $content = $null
+        if ($renameApp) {
+            # Re-root the package dir in the seeded PATH (app/... -> <pkg>/...) and rewrite the
+            # package NAME inside the seeded text files. Every standalone lowercase 'app' token in
+            # the python reference refers to THE PACKAGE (import lines, pyproject name/include,
+            # README paths/prose) -- locked by verify-scaffold C12; word-boundary + case-sensitive
+            # so 'apps'/'Application' never match.
+            if ($rel -cmatch '^app([\\/])') { $rel = $PackageName + $rel.Substring(3) }
+            if ($f.Extension -in @('.py', '.toml', '.md', '.cfg', '.ini', '.txt')) {
+                $content = (Get-Content -LiteralPath $f.FullName -Raw) -creplace '\bapp\b', $PackageName
+            }
+        }
         $dest = Join-Path $Worktree $rel
         $destDir = Split-Path $dest -Parent
         if ($destDir -and -not (Test-Path $destDir)) { New-Item -ItemType Directory -Force $destDir | Out-Null }
-        Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        if ($null -ne $content) {
+            Set-Content -LiteralPath $dest -Value $content -NoNewline -Encoding utf8NoBOM
+        } else {
+            Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        }
         [void]$seeded.Add($rel)
     }
     $ng = Join-Path $base 'nuget.config'
@@ -2120,6 +2130,93 @@ function Invoke-BestOfNBatched {
     return @{ Selected = $selected; SelectedIndex = $bestIdx; WinnerFound = $false; Stopped = $stopped; Cancelled = $cancelled; Count = $arr.Count; Candidates = $arr }
 }
 
+function Test-IsGatedTestPath {
+    # #790: does this repo-relative path name a test file the per-candidate gate COLLECTS? PYTHON only
+    # for now -- pytest/unittest naming (test_*.py / *_test.py). Node (*.test.js) + Pester (*.Tests.ps1)
+    # coder-authored tests are deliberately NOT scoped yet (their runners glob differently; scoping them
+    # is a documented follow-up), so their behaviour is byte-identical to before. Never matches under a
+    # vendor/vcs dir. Pure + ASCII; unit-tested without a repo.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $p = $Path -replace '\\', '/'
+    if ($p -match '(^|/)(\.git|\.venv|venv|node_modules)/') { return $false }
+    $leaf = ($p -split '/')[-1]
+    return ($leaf -match '^test_.*\.py$') -or ($leaf -match '.+_test\.py$')
+}
+
+function Split-CandidateTestFiles {
+    # #790: PURE partition (no git, no I/O -- unit-testable with plain arrays) of a candidate's test files
+    # into TRUSTED vs SCRATCH. TRUSTED = the BASELINE set (every test file present in the coder's baseline
+    # tree: the seeded #690 oracle + any prior-wave / product tests -- the immutable SPEC). It is returned
+    # as the WHOLE baseline set (not the intersection with the worktree) SO THAT a candidate DELETING a
+    # baseline test cannot shrink the hard gate -- the caller restores each Trusted path from the baseline.
+    # SCRATCH = worktree test files whose path is NOT in the baseline (i.e. coder-ADDED this task): an
+    # advisory soft signal, never a hard block. Paths are matched case-insensitively as POSIX-normalised
+    # repo-relative strings (Windows fs + git-tree slashes reconciled).
+    param([string[]]$BaseTestFiles = @(), [string[]]$WorktreeTestFiles = @())
+    $norm = { param($s) ($s -replace '\\', '/') }
+    $baseSet = @{}
+    foreach ($b in $BaseTestFiles) { if ($b) { $baseSet[((& $norm $b)).ToLowerInvariant()] = $true } }
+    $scratch = New-Object System.Collections.ArrayList
+    foreach ($w in $WorktreeTestFiles) {
+        if (-not $w) { continue }
+        $wn = & $norm $w
+        if (-not $baseSet.ContainsKey($wn.ToLowerInvariant())) { [void]$scratch.Add($wn) }
+    }
+    $trusted = @($BaseTestFiles | Where-Object { $_ } | ForEach-Object { & $norm $_ })
+    return @{ Trusted = $trusted; Scratch = @($scratch) }
+}
+
+function Get-CandidateTestPartition {
+    # #790: gather a candidate worktree's test files from git + the filesystem and classify them
+    # (Split-CandidateTestFiles). BASELINE tests come from the $BaseRef TREE (git ls-tree -- exactly what
+    # the coder inherited); WORKTREE tests from the FILESYSTEM so a still-UNTRACKED coder-added file is
+    # seen (this runs BEFORE `git add`). Only PYTHON test files are classified (Test-IsGatedTestPath), so
+    # a project with no coder-added python tests yields an empty Scratch set == today's behaviour. Reads
+    # only; returns @{ Trusted; Scratch } of POSIX repo-relative paths.
+    param([Parameter(Mandatory)][string]$Worktree, [Parameter(Mandatory)][string]$BaseRef)
+    $base = @(git -C $Worktree ls-tree -r --name-only $BaseRef 2>$null | Where-Object { Test-IsGatedTestPath $_ })
+    $root = (Resolve-Path -LiteralPath $Worktree).Path
+    $wtFiles = New-Object System.Collections.ArrayList
+    foreach ($f in @(Get-ChildItem -Path $root -Recurse -File -Filter '*.py' -ErrorAction SilentlyContinue)) {
+        $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
+        if (Test-IsGatedTestPath $rel) { [void]$wtFiles.Add($rel) }
+    }
+    return Split-CandidateTestFiles -BaseTestFiles $base -WorktreeTestFiles @($wtFiles)
+}
+
+function Invoke-ScratchTestSignal {
+    # #790: run coder-ADDED ("scratch") test files as an ADVISORY soft signal, ONE FILE AT A TIME so a
+    # single buggy self-verification test is isolated to ITS file. NEVER sets the hard TestResult -- the
+    # caller uses this only to (a) surface the signal (fail-LOUD -- a control that degrades silently is
+    # worse than none) and (b) DROP the RED files before the commit so a coder's buggy throwaway test
+    # neither parks working code NOR poisons a downstream wave's baseline gate; a GREEN file is KEPT
+    # (delivered coverage that stays green). Mirrors the [2/5] pytest env (PYTHONPATH=worktree, the uv
+    # ephemeral install with a local-python fallback). Exit 0/5 (pass / nothing-collected) = green; any
+    # other exit or a timeout = red. Returns @{ Result='pass'|'fail'|'none'; Green; Red; Detail }.
+    param([Parameter(Mandatory)][string]$Worktree, [string[]]$ScratchTests = @(), [int]$TimeoutSec = 300)
+    $green = New-Object System.Collections.ArrayList
+    $red = New-Object System.Collections.ArrayList
+    if (@($ScratchTests).Count -eq 0) { return @{ Result = 'none'; Green = @(); Red = @(); Detail = 'no coder-added tests' } }
+    $useUv = [bool](Get-Command uv -ErrorAction SilentlyContinue)
+    $prevPP = $env:PYTHONPATH
+    $env:PYTHONPATH = $Worktree
+    try {
+        foreach ($rel in $ScratchTests) {
+            $cmd = if ($useUv) { "uv run --no-project --with pytest --with hypothesis pytest -q `"$rel`"" } else { "python -m pytest -q `"$rel`"" }
+            $r = Invoke-WithTimeout -CommandLine $cmd -WorkDir $Worktree -TimeoutSec $TimeoutSec
+            if ($r.TimedOut) { [void]$red.Add($rel) }
+            elseif (($r.ExitCode -eq 0) -or ($r.ExitCode -eq 5)) { [void]$green.Add($rel) }   # 5 = nothing collected (empty file) -> harmless, keep
+            else { [void]$red.Add($rel) }
+        }
+    } finally {
+        if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+    }
+    $result = if ($red.Count -gt 0) { 'fail' } elseif ($green.Count -gt 0) { 'pass' } else { 'none' }
+    $detail = "$($green.Count) green kept, $($red.Count) red dropped-from-merge (of $(@($ScratchTests).Count) coder-added)"
+    return @{ Result = $result; Green = @($green); Red = @($red); Detail = $detail }
+}
+
 function Invoke-CandidateBuild {
     # BEST-OF-N candidate pipeline (#695; UNIFIED by #700). The SINGLE per-candidate build->gate function for
     # BOTH the sequential (C=1) and concurrent (C>1) paths. It takes EVERY input as a PARAMETER (no
@@ -2193,6 +2290,33 @@ function Invoke-CandidateBuild {
     # weakened, or deleted it is OVERWRITTEN -- judged by the BYTE-IDENTICAL scorecard, and the merged commit
     # keeps the original. `git checkout <baseline> -- <path>` re-materialises the committed bytes.
     if ($OracleActive) { git -C $wt checkout $CodeBase -- $AcceptanceTestPath 2>&1 | Out-Null }
+    # #790: SCOPE the per-candidate hard gate to the SPEC/BASELINE tests, quarantining the coder's own
+    # throwaway self-verification tests. A plan-graph NODE seeds NO oracle into the worktree (the job
+    # oracle runs only at integration -- BlarAI shared/fleet/acceptance.py), so EVERY test_*.py at a node
+    # is coder-authored; a buggy self-test (B4 night-20260715: `test_final_verification_fixed.py`, an
+    # UnboundLocalError IN THE TEST) then failed `pytest -x -q` and PARKED ~90%-complete working code --
+    # a gate ARTIFACT sinking good work, the same shape as the idle-abort park. Fix: partition test files
+    # into TRUSTED (present in the coder's baseline $CodeBase -> the seeded oracle + prior-wave / product
+    # tests: the immutable spec) and SCRATCH (coder-ADDED this task). RESTORE every Trusted test from the
+    # baseline (fail-closed: a candidate cannot delete or weaken a spec test to pass -- the same protect
+    # property #690 gives the oracle, generalised to every baseline test). Run SCRATCH as an ADVISORY soft
+    # signal (reported, NEVER a hard block); DROP the RED scratch files before the commit so a red self-test
+    # neither parks working code NOR poisons a downstream wave's baseline gate, and KEEP the GREEN ones
+    # (delivered coverage that stays green). Runs AFTER the oracle restore + BEFORE staging, so the merged
+    # candidate keeps the baseline spec tests and never carries a red scratch test. FORGIVING: any scoping
+    # error falls back to today's whole-tree gate (fail-safe toward the stricter old behaviour, never open).
+    try {
+        $__part = Get-CandidateTestPartition -Worktree $wt -BaseRef $CodeBase
+        foreach ($__tt in @($__part.Trusted)) { git -C $wt checkout $CodeBase -- "$__tt" 2>&1 | Out-Null }
+        if (@($__part.Scratch).Count -gt 0) {
+            $__scratch = Invoke-ScratchTestSignal -Worktree $wt -ScratchTests @($__part.Scratch)
+            foreach ($__rf in @($__scratch.Red)) { Remove-Item (Join-Path $wt $__rf) -Force -ErrorAction SilentlyContinue }
+            $__scColor = if ($__scratch.Result -eq 'fail') { 'Yellow' } else { 'DarkGray' }
+            Write-Host "  SCRATCH TESTS (coder-added; advisory, non-gating): $($__scratch.Detail)" -ForegroundColor $__scColor
+        }
+    } catch {
+        Write-Host "  test-gate scoping skipped (non-fatal; whole-tree gate stands): $($_.Exception.Message)" -ForegroundColor Yellow
+    }
     # Stage, then SECRET-SCAN before committing (a detected secret never enters history + never merges).
     git -C $wt add -A 2>&1 | Out-Null
     $secret = & "$ScriptRoot\secret-scan.ps1" -Repo $wt
@@ -2400,7 +2524,7 @@ function Get-RunAnomalies {
 function Add-VisualFeedback {
     # VISUAL-FEEDBACK: augment the coder's ORIGINAL prompt with the VLM's concrete design
     # critique so a built-and-merged-but-visually-rough app gets a FIX pass. Mirrors
-    # Add-BuildErrorFeedback / Add-ReviewFeedback exactly (same delimited-section shape,
+    # Add-ReviewFeedback exactly (same delimited-section shape,
     # same "smallest change, do not start over" discipline). Returns the prompt UNCHANGED
     # when there is no feedback, so a no-op pass is a true no-op. Pure + unit-tested.
     param([string]$Prompt, [string]$Feedback)

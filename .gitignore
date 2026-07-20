@@ -7,3 +7,6 @@ tools/
 # References ${VIKUNJA_PASS} via env substitution (no literal secret), but
 # it's local-env config (devplatform venv paths), so keep it out of git.
 .mcp.json
+
+# git worktree checkouts must never be tracked (a harness-sync blanket add once swept them in as gitlinks - #952)
+.worktrees/

@@ -1,0 +1,105 @@
+<!doctype html>
+<!--
+  ═══════════════════════════════════════════════════════════════════════════
+  EXTEND THIS FILE. This is a single self-contained static page skeleton.
+  ─ There is NO build step and NO server. This file opens directly in a
+    browser (double-click / file://). Keep it that way.
+  ─ Put ALL styles in the inline <style> below, ALL scripts in the inline
+    <script> at the bottom (plain DOM — no `import`, no external .js).
+  ─ For images use an inline <svg> or a data: URI. NEVER a remote URL / CDN
+    (this machine is offline; a remote asset will not load).
+  ─ Do NOT add a package.json, a src/server.js, a fetch()/XHR, or a second
+    project. If the goal needs a server it is NOT a static page — stop and
+    reconsider the surface.
+  ─ REPLACE every element marked class="placeholder" with the real content
+    the goal asks for. Nothing marked "placeholder" should survive to the
+    finished page.
+  ═══════════════════════════════════════════════════════════════════════════
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Static page</title>
+  <style>
+    :root {
+      --ink: #16181d;
+      --muted: #5b616e;
+      --accent: #2563eb;
+      --bg: #ffffff;
+      --card: #f4f6fb;
+      --line: #e2e6ef;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e8eaf0; --muted: #a4abbb; --accent: #6ea8fe;
+        --bg: #14161b; --card: #1c1f27; --line: #2a2e39;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      line-height: 1.55;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    main { max-width: 40rem; margin: 0 auto; padding: 3rem 1.25rem; }
+    header { display: flex; align-items: center; gap: 0.85rem; margin-bottom: 1.5rem; }
+    h1 { font-size: 1.6rem; margin: 0; }
+    p { color: var(--muted); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 0.75rem;
+      padding: 1.25rem 1.4rem;
+      margin: 1.25rem 0;
+    }
+    /* The placeholder style makes unfinished scaffold content visibly provisional
+       — replace these nodes; do not ship the page with a .placeholder left. */
+    .placeholder {
+      outline: 2px dashed var(--accent);
+      outline-offset: 3px;
+      opacity: 0.75;
+    }
+    footer { color: var(--muted); font-size: 0.85rem; margin-top: 2.5rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <!-- Inline SVG logo (offline-safe). Replace with your own artwork. -->
+      <svg width="44" height="44" viewBox="0 0 96 96" role="img" aria-label="Logo">
+        <rect x="6" y="6" width="84" height="84" rx="20" fill="var(--accent)" />
+        <text x="48" y="62" font-size="42" text-anchor="middle" fill="#fff"
+              font-family="system-ui, sans-serif">·</text>
+      </svg>
+      <h1 class="placeholder">Page title goes here</h1>
+    </header>
+
+    <p class="placeholder">
+      Replace this paragraph with the real introduction the goal asks for. This
+      page is a static skeleton: everything renders from this one file with no
+      build step, no server, and no network.
+    </p>
+
+    <section class="card placeholder">
+      <strong>Placeholder section.</strong> Replace this card (and add more) with
+      the actual content, controls, or copy the goal describes. Keep any
+      interactivity in the inline &lt;script&gt; below using plain DOM.
+    </section>
+
+    <footer>
+      <!-- Example of the inline-script pattern: a purely local DOM update, no network. -->
+      Rendered locally · <span id="rendered-at">—</span>
+    </footer>
+  </main>
+
+  <script>
+    // Plain DOM, inline, offline. Extend this — no modules, no external files, no fetch.
+    // Example: stamp a local render marker so you can see the script ran.
+    document.getElementById('rendered-at').textContent =
+      new Date().toLocaleString();
+  </script>
+</body>
+</html>

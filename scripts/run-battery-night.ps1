@@ -154,6 +154,86 @@ Write-Log ("tonight's jobs: " + ($jobs -join ", "))
 $cancel = "$AgenticRoot\state\fleet-swap\cancel"
 if (Test-Path $cancel) { Remove-Item $cancel -Force; Write-Log "cleared stale cancel file." }
 
+# #833 task-settings conformance: the scheduled task's OWN ExecutionTimeLimit must still
+# DOMINATE the runner's per-job budgets (the durable control for the 2026-07-11 PT10H
+# incident, where the ceiling tree-killed the runner 3 min before its last job finished).
+# READ-ONLY + NON-FATAL: a drift is logged loud and banners the morning report so it is
+# caught the next morning at the latest, but it never aborts a night (a too-low ceiling
+# only risks a LATE kill; denying the night outright would be worse). A missing or
+# throwing check must equally never sink the run, so it is wrapped despite the script's
+# ErrorActionPreference=Stop. verify-battery-task-settings.ps1 derives the required floor
+# from BlarAI's own runner constants (tools.dispatch_harness.battery_execution_limit).
+$TaskSettingsDrift = $null
+$verifyTaskSettings = "$PSScriptRoot\verify-battery-task-settings.ps1"
+try {
+    if (Test-Path $verifyTaskSettings) {
+        # The drift SIGNAL rides the child's exit code, so read it host-preference-independently
+        # (#903). This launcher runs ErrorActionPreference=Stop; on a host where
+        # $PSNativeCommandUseErrorActionPreference is $true, a non-zero `& pwsh` exit would THROW
+        # instead of setting $LASTEXITCODE — the throw would land in the generic catch below and
+        # MISLABEL a real settings drift as "check errored", muddying the morning DRIFT banner.
+        # (The night is never aborted either way — this check is non-fatal — so this is pure
+        # signal fidelity, not a run-safety fix.) Scope the preference to $false around JUST this
+        # call (save/restore), leaving the launcher's other native calls — git, the python probe,
+        # the runner — on the box default. Mirrors verify-battery-task-settings.ps1's own internal
+        # setting; a genuine launch failure (child missing/uninvokable) still throws -> the catch's
+        # honest "errored" path, distinct from a drift.
+        $prevNativeErrPref = $PSNativeCommandUseErrorActionPreference
+        try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $verifyTaskSettings -BlarRepo $BlarRoot *>&1 |
+                ForEach-Object { Write-Log "task-settings: $_" }
+            $verifyExit = $LASTEXITCODE
+        } finally {
+            $PSNativeCommandUseErrorActionPreference = $prevNativeErrPref
+        }
+        if ($verifyExit -ne 0) {
+            $TaskSettingsDrift = "scheduled-task settings DRIFTED (verify-battery-task-settings.ps1 exit $verifyExit) - the ExecutionTimeLimit/trigger/RestartCount no longer conform (see the launcher log above). A drifted ExecutionTimeLimit is the PT10H incident class."
+            Write-Log "WARNING: $TaskSettingsDrift"
+        } else {
+            Write-Log "task-settings: conform (ExecutionTimeLimit covers the runner run-phase floor)."
+        }
+    } else {
+        Write-Log "task-settings: verify-battery-task-settings.ps1 not found at $verifyTaskSettings - skipping (non-fatal)."
+    }
+} catch {
+    Write-Log "task-settings: check errored ($($_.Exception.Message)) - non-fatal, continuing the night."
+}
+
+# #790 budget-coherence conformance: the (window, budget) INNER pairs the idle-600 landing put under
+# stress -- the per-candidate ceiling must dominate acp.idle_sec (C1), and each per-job budget must cover
+# a multi-wave job's candidate wall-time under idle-600 (C2, the Blair's Lab starvation), while a C2-fix
+# must still fit PT16H (C3). This is the sibling of the #833 task-settings check (which owns the OUTER
+# ExecutionTimeLimit pair). READ-ONLY + NON-FATAL, same posture: a drift is logged loud and banners the
+# morning report, but never aborts a night (a starved multi-wave job is a reliability loss, not a reason
+# to deny the whole battery). Wrapped despite ErrorActionPreference=Stop so a missing/throwing check
+# never sinks the run.
+$BudgetDrift = $null
+$verifyBudget = "$PSScriptRoot\verify-battery-budget-coherence.ps1"
+try {
+    if (Test-Path $verifyBudget) {
+        $prevNativeErrPref = $PSNativeCommandUseErrorActionPreference
+        try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $verifyBudget -BlarRepo $BlarRoot *>&1 |
+                ForEach-Object { Write-Log "budget-coherence: $_" }
+            $budgetExit = $LASTEXITCODE
+        } finally {
+            $PSNativeCommandUseErrorActionPreference = $prevNativeErrPref
+        }
+        if ($budgetExit -ne 0) {
+            $BudgetDrift = "battery budget INCOHERENT under idle-600 (verify-battery-budget-coherence.ps1 exit $budgetExit) - a multi-wave job can starve on its per-job run budget (the Blair's Lab STALLED/HARNESS class). Fix is BlarAI-side (swap_run_budget_s / a multi-wave card run_budget_s); see the launcher log above."
+            Write-Log "WARNING: $BudgetDrift"
+        } else {
+            Write-Log "budget-coherence: conform (per-job budget covers a multi-wave job under idle-600)."
+        }
+    } else {
+        Write-Log "budget-coherence: verify-battery-budget-coherence.ps1 not found at $verifyBudget - skipping (non-fatal)."
+    }
+} catch {
+    Write-Log "budget-coherence: check errored ($($_.Exception.Message)) - non-fatal, continuing the night."
+}
+
 # LEAN + PROBE ADMISSION (#784, reworked 2026-07-10; supersedes the #740 c.1504 arithmetic-
 # only gate). The 30B swap needs ~20 GiB of system RAM free AFTER the 14B unloads (swap_driver
 # gate_gb=20.0, #777 measured 2026-07-09; the 14B returns ~8.7 GiB, projected conservatively at
@@ -379,10 +459,46 @@ if ($modeUnknown -gt 0) { $relLine += ("; mode-unknown={0}" -f $modeUnknown) }
 $lines += ""; $lines += $relLine
 $falseDone = $verdicts.Values | Where-Object { $_ -eq "FALSE-DONE" }
 if ($falseDone) { $lines = @("## !! FALSE-DONE DETECTED — RED ALERT !!", "") + $lines }
+if ($TaskSettingsDrift) { $lines = @("## !! BATTERY TASK-SETTINGS DRIFT (#833) — $TaskSettingsDrift", "") + $lines }
+if ($BudgetDrift) { $lines = @("## !! BATTERY BUDGET INCOHERENCE (#790) — $BudgetDrift", "") + $lines }
 $fullPass = ($jobs | Where-Object { -not $verdicts.ContainsKey($_) }).Count -eq 0
-if ($fullPass -and $runnerExit -eq 0) {
-    $camp.completed_passes = [int]$camp.completed_passes + 1
-    $lines += ""; $lines += "campaign: pass $($camp.completed_passes)/$($camp.target_full_passes) BANKED."
+# #904 (LA-directed trim, 2026-07-15): the campaign config may FREEZE pass banking.
+# The nightly set was cut to a lean diagnostic; a clean lean night must NOT bank a
+# "pass" of the closed baseline 6-job campaign — that would silently change what a
+# pass measures (#763's landing trigger counts BASELINE passes, frozen at their
+# banked count). Absent/false flag = the legacy banking, byte-identical.
+# NOTE: the flag must be a JSON BOOLEAN (true/false) — a quoted string "false"
+# coerces truthy in PowerShell and would freeze (fails safe, but confusing).
+# TWO-COUNTER BANKING (LA direction 2026-07-19: "two counters. one for the lean
+# battery and one for the full battery"): a "pass" is a COMPLETENESS measure of the
+# harness (every scheduled card produced a scorecard), so a complete 2-card night
+# and a complete 6-card night are different events and must not share a counter.
+# The runner classifies TONIGHT'S ACTUAL job set (post any late-start trim) against
+# baseline_jobs: set-equal (order-insensitive) -> FULL pass (completed_passes, the
+# frozen-at-3/5 historical meaning, unchanged); anything else -> LEAN pass
+# (lean_passes, a bare diagnostic count with NO target — the lean battery is
+# open-ended, and a lean target would recreate the completion-shaped machinery the
+# #904 freeze existed to block). baseline_jobs ABSENT = a pre-#904 config with only
+# one notion of a pass -> FULL (legacy, byte-identical). $nightClass is the single
+# extension seam: the #973 day-keyed rotation adds a third class here (its own
+# elseif + its own counter), never a rewrite. A frozen config still banks NOTHING.
+$bankingFrozen = ($camp.PSObject.Properties.Name -contains 'pass_banking_frozen') -and [bool]$camp.pass_banking_frozen
+if ($bankingFrozen) {
+    $lines += ""; $lines += "campaign: pass banking FROZEN at $($camp.completed_passes)/$($camp.target_full_passes) (#904 trim closed the baseline set; a lean night is a diagnostic, never a pass)."
+} elseif ($fullPass -and $runnerExit -eq 0) {
+    $baselineJobs = if ($camp.PSObject.Properties.Name -contains 'baseline_jobs') { @($camp.baseline_jobs) } else { @() }
+    $isBaselineNight = ($baselineJobs.Count -eq 0) -or (-not (Compare-Object @($jobs) $baselineJobs))
+    $nightClass = if ($isBaselineNight) { 'FULL' } else { 'LEAN' }
+    if ($nightClass -eq 'FULL') {
+        $camp.completed_passes = [int]$camp.completed_passes + 1
+        $fullReason = if ($baselineJobs.Count -eq 0) { "this config defines no baseline set, so every complete night is a full pass (legacy behavior)" }
+                      else { "tonight's job set ($($jobs -join ', ')) matches the baseline set" }
+        $lines += ""; $lines += "campaign: FULL pass $($camp.completed_passes)/$($camp.target_full_passes) BANKED — every scheduled card produced a scorecard, and $fullReason. The full counter measures complete nights of the original baseline campaign."
+    } elseif ($nightClass -eq 'LEAN') {
+        $leanPassesSoFar = if ($camp.PSObject.Properties.Name -contains 'lean_passes') { [int]$camp.lean_passes } else { 0 }
+        $camp | Add-Member -NotePropertyName 'lean_passes' -NotePropertyValue ($leanPassesSoFar + 1) -Force
+        $lines += ""; $lines += "campaign: LEAN pass $($camp.lean_passes) BANKED — tonight's job set ($($jobs -join ', ')) is not the baseline set ($($baselineJobs -join ', ')), so this counts on the lean diagnostic counter, not toward the full-campaign target ($($camp.completed_passes)/$($camp.target_full_passes)). The lean counter simply tallies complete diagnostic nights; it has no target."
+    }
 } else {
     $lines += ""; $lines += "campaign: NOT counted as a full pass (missing scorecards or nonzero exit)."
 }

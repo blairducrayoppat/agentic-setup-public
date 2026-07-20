@@ -48,6 +48,10 @@ function Assert-NotNull($Val, $Msg) { if ($null -ne $Val) { _pass $Msg } else { 
 Section 'Unit tests: Resolve-BuildProfile (surface -> scaffold)'
 Assert-Eq 'winui'      (Resolve-BuildProfile -Surface 'desktop-gui').scaffold  'BP1 desktop-gui -> winui'
 Assert-Eq 'web'        (Resolve-BuildProfile -Surface 'web').scaffold          'BP2 web -> web'
+# #886: the refiner-only static surface -> a lone self-contained index.html scaffold (no server seed)
+Assert-Eq 'web-static' (Resolve-BuildProfile -Surface 'web-static').scaffold   'BP2b web-static -> web-static (static page seed, not the server skeleton)'
+Assert-Null ((Resolve-BuildProfile -Surface 'web-static').structural_contract) 'BP2b web-static -> structural_contract $null'
+Assert-False ((Resolve-BuildProfile -Surface 'web-static').staged)             'BP2b web-static -> staged $false'
 Assert-Eq 'android'    (Resolve-BuildProfile -Surface 'mobile').scaffold       'BP3 mobile -> android'
 Assert-Eq 'powershell' (Resolve-BuildProfile -Surface 'automation').scaffold   'BP4 automation -> powershell'
 # command-line: default + language_hint refinement
@@ -162,6 +166,7 @@ Assert-True ([regex]::IsMatch($runFleet, '\$params\.LanguageHint\s*=\s*\$t\.lang
 
 $addTask = Get-Content "$PSScriptRoot\add-fleet-task.ps1" -Raw
 Assert-True ([regex]::IsMatch($addTask, '\[ValidateSet\([^)]*\bdesktop-gui\b[^)]*\)\]\[string\]\$Surface')) 'W11 add-fleet-task accepts a VALIDATED -Surface (mirrors the -Complexity ValidateSet)'
+Assert-True ([regex]::IsMatch($addTask, '\[ValidateSet\([^)]*\bweb-static\b[^)]*\)\]\[string\]\$Surface')) 'W11b [#886] the -Surface ValidateSet includes web-static (the manual CLI can express the surface the refiner produces; N1 cohesion)'
 Assert-True ([regex]::IsMatch($addTask, '\$item\.surface\s*=\s*\$Surface'))                                 'W12 [kill] add-fleet-task persists the surface into the queued task'
 Assert-True ([regex]::IsMatch($addTask, '\$item\.language_hint\s*=\s*\$LanguageHint'))                       'W13 add-fleet-task persists the language_hint into the queued task'
 

@@ -71,6 +71,12 @@ Assert-Eq 'android' (Resolve-TaskScaffold -Prompt 'Build an Android app that tra
 Assert-Eq 'android' (Resolve-TaskScaffold -Prompt 'Make an Android calculator app.' -HasProject $false) 'S24 Android calculator app -> android'
 Assert-Eq 'powershell' (Resolve-TaskScaffold -Prompt 'A PowerShell script to back up my Android phone photos.' -HasProject $false) 'S25 [kill] a mere "android" mention (no app-build noun) does NOT hijack PowerShell -> powershell'
 Assert-Eq 'android' (Resolve-TaskScaffold -Prompt 'Build a .NET MAUI Android app.' -HasProject $false) 'S26 [kill] a MAUI ANDROID app -> android (ordered before winui, so "maui" does not grab it for desktop)'
+# #886: the refiner-only web-static surface short-circuits the keyword heuristic to the static seed;
+# the SAME static ask WITHOUT that surface still falls to the web keyword arm -> proves the upstream
+# refiner's surface=web-static is load-bearing (P1: without it the fleet re-seeds the node server).
+$staticAsk = 'Build a static web page: one index.html file, no frameworks, no build step, opens in a browser.'
+Assert-Eq 'web-static' (Resolve-TaskScaffold -Prompt $staticAsk -HasProject $false -Surface 'web-static') 'S27 web-static surface -> web-static (profile preempts the keyword heuristic; the static index.html seed, NOT the node server)'
+Assert-Eq 'web' (Resolve-TaskScaffold -Prompt $staticAsk -HasProject $false) 'S28 [kill] the SAME static ask with NO surface still matches the web keyword arm -> web (proves surface=web-static from the upstream refiner is load-bearing; P1)'
 
 # ----------------------------------------------------------------------------
 Section 'Unit tests: Copy-ScaffoldInto (drops a compiling skeleton, with the using)'
@@ -128,6 +134,16 @@ try {
     Assert-True ($seededWeb -contains 'package.json') 'C8 web: seeds package.json'
     Assert-True (Test-Path (Join-Path $tmp 'src\server.js')) 'C8 web: nested src/server.js lands'
     Assert-True (Test-Path (Join-Path $tmp 'public\index.html')) 'C8 web: nested public/index.html lands'
+    # #886: web-static seeds ONE self-contained index.html and NOTHING that makes it a server/build
+    # project. Use a FRESH dir so the [kill] absence assertions are not polluted by the 'web' seed above.
+    $tmpWs = Join-Path $tmp 'web-static-only'
+    New-Item -ItemType Directory -Force $tmpWs | Out-Null
+    $seededWs = @(Copy-ScaffoldInto -Scaffold 'web-static' -Worktree $tmpWs)
+    Assert-True ($seededWs -contains 'index.html') 'C8c web-static: seeds a single top-level index.html (opens straight in a browser)'
+    Assert-True (Test-Path (Join-Path $tmpWs 'index.html')) 'C8c web-static: index.html actually lands on disk'
+    Assert-True (-not (Test-Path (Join-Path $tmpWs 'src\server.js'))) 'C8c [kill] web-static seeds NO src/server.js (the server seed was the #886 static-page bug)'
+    Assert-True (-not (Test-Path (Join-Path $tmpWs 'public\app.js'))) 'C8c [kill] web-static seeds NO public/app.js (no fetch wiring to hang on file://)'
+    Assert-True (-not ($seededWs -contains 'package.json')) 'C8c [kill] web-static seeds NO package.json (no build; detect_ecosystem -> unknown -> exec-smoke a correct no-op)'
     $seededNcli = @(Copy-ScaffoldInto -Scaffold 'node-cli' -Worktree $tmp)
     Assert-True ($seededNcli -contains 'package.json') 'C8b node-cli: seeds package.json'
     Assert-True (Test-Path (Join-Path $tmp 'src\core.mjs')) 'C8b node-cli: nested src/core.mjs lands (the testable helper)'
@@ -145,6 +161,42 @@ try {
     Assert-True ($seededAnd -contains 'Calculator.cs') 'C10 android: seeds the testable logic class'
     Assert-True (Test-Path (Join-Path $tmp 'Resources\values\strings.xml')) 'C10 android: nested Resources/values/strings.xml lands (recursive copy preserves the resource tree)'
     Assert-Contains (Get-Content (Join-Path $tmp 'MainActivity.cs') -Raw) 'Calculator.Add' 'C11 android: the Activity is wired to the testable logic (models the extend pattern)'
+    # ------------------------------------------------------------------------
+    # #790 sub-task 5: -PackageName seeds ONE canonical package named by the job-oracle
+    # contract -- the B4 flashcards park grew BOTH a generic app/ twin AND the oracle's
+    # flashcard_app/ because the seed and the oracle pinned different layouts.
+    $tmpCp = Join-Path $tmp 'canonical-pkg'
+    New-Item -ItemType Directory -Force $tmpCp | Out-Null
+    $seededCp = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $tmpCp -PackageName 'flashcard_app')
+    Assert-True (Test-Path (Join-Path $tmpCp 'flashcard_app\__init__.py')) 'C12 canonical: the package seeds under the contract name (flashcard_app/__init__.py lands)'
+    Assert-True (Test-Path (Join-Path $tmpCp 'flashcard_app\core.py'))     'C12 canonical: the placeholder core seeds INSIDE the canonical package'
+    Assert-True (-not (Test-Path (Join-Path $tmpCp 'app')))                'C12 [kill] NO generic app/ twin is seeded (the B4 duplicate-tree shape)'
+    # EXACTLY ONE top-level package: the canonical dir, and no other seeded dir carrying an __init__.py.
+    $topPkgs = @(Get-ChildItem -LiteralPath $tmpCp -Directory | Where-Object { Test-Path (Join-Path $_.FullName '__init__.py') })
+    Assert-Eq 1 $topPkgs.Count 'C12 [kill] a scaffolded job carries EXACTLY ONE top-level package'
+    Assert-Eq 'flashcard_app' $topPkgs[0].Name 'C12 canonical: ...and it is the contract-named one'
+    # The seeded references FOLLOW the rename (no stale app.* import/config leakage).
+    Assert-Contains (Get-Content (Join-Path $tmpCp 'tests\test_core.py') -Raw) 'from flashcard_app.core import summarize' 'C12 canonical: the seeded test imports the canonical package'
+    $pyprojCp = Get-Content (Join-Path $tmpCp 'pyproject.toml') -Raw
+    Assert-Contains $pyprojCp 'name = "flashcard_app"'    'C12 canonical: pyproject project name follows'
+    Assert-Contains $pyprojCp '"flashcard_app*"'          'C12 canonical: pyproject package discovery follows'
+    $staleApp = [regex]::IsMatch(((Get-Content (Join-Path $tmpCp 'tests\test_core.py') -Raw) + $pyprojCp + (Get-Content (Join-Path $tmpCp 'README.md') -Raw) + (Get-Content (Join-Path $tmpCp 'flashcard_app\__init__.py') -Raw)), '\bapp\b')
+    Assert-True (-not $staleApp) 'C12 [kill] NO standalone-token ''app'' survives in any seeded text file (no stale template leakage)'
+    # The seeded __init__ stays LAZY (docstring + version, no eager submodule imports) -- one broken
+    # submodule must not fail the whole package at import time.
+    Assert-True (-not ([regex]::IsMatch((Get-Content (Join-Path $tmpCp 'flashcard_app\__init__.py') -Raw), '(?m)^\s*from\s+\.\s+import\b'))) 'C12 canonical: the seeded __init__ is LAZY (no eager from-. imports)'
+    # Deny-by-default: an invalid/hyphenated/empty/'app' name -> the byte-identical legacy generic seed.
+    foreach ($bad in @('flash-card', 'app', '', '0bad', 'x.y')) {
+        $tmpBad = Join-Path $tmp ("bad-pkg-" + [math]::Abs($bad.GetHashCode()))
+        New-Item -ItemType Directory -Force $tmpBad | Out-Null
+        $null = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $tmpBad -PackageName $bad)
+        Assert-True ((Test-Path (Join-Path $tmpBad 'app\__init__.py')) -and -not (Test-Path (Join-Path $tmpBad 'flash-card'))) ("C13 [kill] invalid PackageName '" + $bad + "' -> the legacy generic app/ seed (never a guessed rename)")
+    }
+    # Non-python scaffolds ignore -PackageName entirely (no app/ package ships in them).
+    $tmpWs2 = Join-Path $tmp 'ws-pkgname'
+    New-Item -ItemType Directory -Force $tmpWs2 | Out-Null
+    $seededWs2 = @(Copy-ScaffoldInto -Scaffold 'web-static' -Worktree $tmpWs2 -PackageName 'flashcard_app')
+    Assert-True (($seededWs2 -contains 'index.html') -and -not (Test-Path (Join-Path $tmpWs2 'flashcard_app'))) 'C14 non-python scaffold ignores -PackageName (nothing to rename; byte-identical seed)'
 } finally {
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 }
@@ -160,6 +212,11 @@ Assert-True ([regex]::IsMatch($lib, 'rev-list --count "\$CodeBase\.\.HEAD"'))   
 $iScaffold = $nat.IndexOf('Resolve-TaskScaffold')
 $iEco = $nat.IndexOf('Get-ProjectEcosystem $wt')
 Assert-True ($iScaffold -gt 0 -and $iEco -gt 0 -and $iScaffold -lt $iEco) 'W4 wiring: seeding runs BEFORE ecosystem/language detection (the seed drives the language pin too)'
+# #790 sub-task 5: the canonical package rides queue task -> run-fleet -> runner -> seeder.
+Assert-True ([regex]::IsMatch($nat, 'Copy-ScaffoldInto\s+-Scaffold\s+\$scaffold\s+-Worktree\s+\$wt\s+-PackageName\s+\$CanonicalPackage')) 'W5 wiring: the runner passes -PackageName $CanonicalPackage into the seeder'
+Assert-True ([regex]::IsMatch($nat, '(?m)^\s*\[string\]\$CanonicalPackage')) 'W5 wiring: the runner declares the -CanonicalPackage parameter'
+$rf = Get-Content "$PSScriptRoot\run-fleet.ps1" -Raw
+Assert-True ([regex]::IsMatch($rf, '\$t\.canonical_package\s*\)\s*\{\s*\$params\.CanonicalPackage')) 'W6 wiring: run-fleet forwards a queue task''s .canonical_package to the runner'
 
 # ----------------------------------------------------------------------------
 Section 'Result'
