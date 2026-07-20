@@ -4,16 +4,18 @@
   Verify + validate the fleet's REVIEW-FEEDBACK loop (the review half of the unified multi-pass loop).
 
 .DESCRIPTION
-  Error-feedback fixes BUILD failures; review-feedback fixes a build that PASSES but the code reviewer
-  says FIX FIRST (logic/completeness the build gate can't see). The runner now makes multiple passes:
-  build -> verify -> (if it builds) review -> feed back whatever failed (a compile error OR the review's
-  findings) -> next pass, until it builds AND the reviewer says MERGE, or the pass budget runs out.
+  Review-feedback fixes a build that PASSES but the code reviewer says FIX FIRST (logic/completeness
+  the build gate can't see). The build dimension is now best-of-N (#689): N independent candidates, the
+  deterministic gate selects the winner. The SELECTED candidate is then REVIEWED in a separate bounded
+  loop that feeds the reviewer's FIX-FIRST findings back for another pass, until the reviewer says MERGE
+  or the review budget runs out.
 
-  The two pure pieces live in fleet-lib.ps1, so they unit-test without a model:
-    - Test-ShouldContinue : run another pass? (a build/test failure -> resample/error-feedback, OR a
-      builds-but-FIX-FIRST review -> review-feedback; bounded by the pass budget; never on timeout/secret).
-      It REUSES the proven Test-ShouldResample for the build dimension.
+  The pure piece that REMAINS lives in fleet-lib.ps1, unit-tested without a model:
     - Add-ReviewFeedback  : append the reviewer's findings to the coder's prompt for the next pass.
+  (Test-ShouldContinue, the OLD unified build+review multi-pass driver, was retired when best-of-N (#689)
+  took over the build dimension and a separate bounded loop took over review; it + its unit tests were
+  removed in #696. Its review-dimension INTENT is preserved by the post-selection review while-loop
+  asserted in the WIRING section below.)
 
   Mutation-resistant: each [kill] case fails a specific wrong implementation. Exit 0 if all pass.
 #>
@@ -44,29 +46,15 @@ Assert-True ($a3.Length -gt $base.Length) 'A3 [kill] appends (longer than origin
 Assert-True ($a3.StartsWith($base))       'A3 [kill] original prompt preserved at the front (appended, not replaced)'
 
 # ----------------------------------------------------------------------------
-Section 'Unit tests: Test-ShouldContinue (the multi-pass decision; dual budgets)'
-$RB = @{ ReviewPass = 0; MaxReviewPasses = 2 }   # a default review budget for the build-dimension cases
-Assert-True  (Test-ShouldContinue -VerifyResult 'fail' -TestResult 'none' -Verdict 'UNCLEAR'   -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 @RB) 'RC1 build FAIL, build budget left -> continue (resample/error-feedback)'
-Assert-True  (Test-ShouldContinue -VerifyResult 'pass' -TestResult 'none' -Verdict 'FIX FIRST' -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 -ReviewPass 0 -MaxReviewPasses 2) 'RC2 builds but FIX FIRST, review budget left -> continue (review-feedback)'
-Assert-False (Test-ShouldContinue -VerifyResult 'pass' -TestResult 'pass' -Verdict 'MERGE'     -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 @RB) 'RC3 builds + MERGE -> done'
-Assert-False (Test-ShouldContinue -VerifyResult 'pass' -TestResult 'none' -Verdict 'UNCLEAR'   -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 @RB) 'RC4 [kill] builds + UNCLEAR -> do NOT loop (only FIX FIRST continues the review dim)'
-Assert-False (Test-ShouldContinue -VerifyResult 'fail' -TestResult 'fail' -Verdict 'FIX FIRST' -TimedOut $true  -SecretBlocked $false -Pass 1 -MaxPasses 3 @RB) 'RC5 [kill] TIMEOUT never continues'
-Assert-False (Test-ShouldContinue -VerifyResult 'fail' -TestResult 'fail' -Verdict 'FIX FIRST' -TimedOut $false -SecretBlocked $true  -Pass 1 -MaxPasses 3 @RB) 'RC6 [kill] SECRET-block never continues'
-Assert-False (Test-ShouldContinue -VerifyResult 'fail' -TestResult 'none' -Verdict 'UNCLEAR'   -TimedOut $false -SecretBlocked $false -Pass 3 -MaxPasses 3 -ReviewPass 0 -MaxReviewPasses 0) 'RC7 [kill] build budget reached (no review budget) -> stop'
-Assert-True  (Test-ShouldContinue -VerifyResult 'pass' -TestResult 'none' -Verdict 'FIX FIRST' -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 -ReviewPass 1 -MaxReviewPasses 2) 'RC8 builds + FIX FIRST, build budget barely used + review pass 1 of 2 -> continue'
-Assert-False (Test-ShouldContinue -VerifyResult 'none' -TestResult 'none' -Verdict 'MERGE'     -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 @RB) 'RC9 nothing failed + MERGE -> done'
-Assert-False (Test-ShouldContinue -VerifyResult 'pass' -TestResult 'none' -Verdict 'FIX FIRST' -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 -ReviewPass 2 -MaxReviewPasses 2) 'RC10 [kill] review budget reached -> stop (build budget still free, but review is spent)'
-Assert-True  (Test-ShouldContinue -VerifyResult 'fail' -TestResult 'none' -Verdict 'UNCLEAR'   -TimedOut $false -SecretBlocked $false -Pass 1 -MaxPasses 3 -ReviewPass 2 -MaxReviewPasses 2) 'RC11 [kill] budgets are INDEPENDENT: a build-fail still resamples even when the review budget is spent'
-
-# ----------------------------------------------------------------------------
 Section 'Wiring: the runner reviews the SELECTED candidate + feeds FIX-FIRST findings back (#689 review loop)'
 $nat = Get-Content "$PSScriptRoot\new-agent-task.ps1" -Raw
 # #689: the BUILD is now best-of-N (Invoke-BestOfN takes N independent candidates; the gate selects). The
 # REVIEW side is a SEPARATE bounded loop AFTER selection -- the FROZEN review side, unchanged in intent. The
 # serial Test-ShouldContinue multi-pass loop + error-feedback re-fix are retired (the build dimension is
-# best-of-N now; Test-ShouldContinue's UNIT behaviour is still proven above, the function is dormant, slated
-# for cleanup -- #689 follow-up). The error-feedback-CHAINING assertions (old W11-W15) retire with it: a
-# best-of-N candidate is a FRESH independent sample, so there is no build-fix pass to chain concerns onto.
+# best-of-N now); Test-ShouldContinue + its unit tests were REMOVED in #696 (#689 follow-up), its review-
+# dimension INTENT preserved by the post-selection review while-loop asserted below. The error-feedback-
+# CHAINING assertions (old W11-W15) retire with it: a best-of-N candidate is a FRESH independent sample,
+# so there is no build-fix pass to chain concerns onto.
 Assert-True ([regex]::IsMatch($nat, '(?m)^\s*\$bon\s*=\s*Invoke-BestOfN\b')) 'W1 wiring: the build is driven by best-of-N (Invoke-BestOfN), replacing the serial multi-pass loop'
 Assert-True ([regex]::IsMatch($nat, 'while \(\$hasChanges -and -not \$dispatchCancelled -and \(Test-ShouldRunReview\b')) 'W2 wiring: the review runs in a BOUNDED loop gated by Test-ShouldRunReview (only when gates are not both green) AND skipped on a cancelled dispatch (#771)'
 Assert-True ([regex]::IsMatch($nat, 'Add-ReviewFeedback -Prompt \$Prompt -ReviewConcerns \$reviewFindings')) 'W3 wiring: a FIX-FIRST pass feeds the VERDICT-STRIPPED findings ($reviewFindings) back via Add-ReviewFeedback'
@@ -75,7 +63,6 @@ Assert-True ([regex]::IsMatch($nat, '\$reviewPass -ge \$MaxReviewPasses')) 'W5 w
 Assert-True ([regex]::IsMatch($nat, "\`$everFixFirst -and \`$verdict -ne 'MERGE'")) 'W6 wiring: a FIX FIRST verdict is made STICKY before the merge decision (no auto-merge on a later UNCLEAR/timeout)'
 Assert-True ([regex]::IsMatch($nat, '\$reviewFindings = ')) 'W7 wiring: the findings fed back are the verdict-STRIPPED review lines ($reviewFindings), not the verdict-heavy tail'
 Assert-True ([regex]::IsMatch($nat, 'if \(\$secretBlocked -or \$agentTimedOut\) \{ break \}')) 'W8 wiring: a secret/timeout DURING a review-fix pass is TERMINAL -- never refine past it (the retained "never sample/refine past a secret/timeout" posture)'
-Assert-True ([regex]::IsMatch($nat, "\`$priorReviewConcerns = ''")) 'W9 wiring: $priorReviewConcerns is initialised (the review side keeps its own state; best-of-N candidates do not chain it)'
 
 # ----------------------------------------------------------------------------
 Section 'Result'

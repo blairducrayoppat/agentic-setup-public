@@ -1699,3 +1699,63 @@ robustness line (R5) for the correlated-stall case this trade-off explicitly acc
 - → **BlarAI:** the same rule the perf-log discipline already implies — every new measurement names its
   comparable prior rows (same prompt set, same methodology tag) or explains why none exist. Before writing a
   new harness, grep `docs/performance/` + `PERFORMANCE_LOG.md` for the series it should extend.
+
+**2026-07-05 — both upstream unload issues CLOSED without fixes; on Lunar Lake GPU memory never auto-releases; watch model_server PR #4332.** *(transplanted 2026-07-19 from the dispatch brief's §10 — #945 D9)*
+openvino #11978 (a first-class GenAI unload API) closed in 2022 — destroy-the-object + `gc.collect()`
+remains the only unload path. openvino #33896 closed 2026-06-29 for inactivity, root cause never
+identified; the load-bearing nuance: the garbled-output-after-idle-release behavior belongs to
+**Panther Lake** — on **Lunar Lake GPU memory simply never auto-releases on idle**, which spares the
+corruption bug but confirms explicit full-teardown + fresh-reload is the only free-the-GPU lever. The
+swap design is confirmed correct, not merely cautious. The live thread: model_server #4141 + PR #4332
+(native `idle_unload_timeout_seconds`) is the sanctioned future replacement for the stop/restart half —
+monthly release check at Vikunja #741. No persistent/cross-swap KV cache exists or is roadmapped (batch
+the whole plan into one residency); OVMS 2026.0's compiled-model cache was absent from our launch
+(`--cache_size` without `--cache_dir`) — queued in M2 hardening to cut the 30–90 s swap-in compile.
+
+**2026-06-26 — the highest-leverage lever for a weak local coder is BEST-OF-N sampling with the gate as selector, NOT more reviewers.** *(transplanted 2026-07-19 from the brief's §10 — #945 D9)*
+The dispatch had over-invested in review surfaces — saturated (METR: added scaffolding +8pp,
+statistically insignificant) — while the biggest local lever sat unpulled. Weak models fail
+specifically at self-correction, so serial resample-on-fail fights their worst skill; the verify gate
+is already the high-precision SELECTOR best-of-N needs. Evidence: a weaker open model went 15.9% → 56%
+on SWE-bench Lite via repeated sampling (arXiv 2407.21787), beating frontier single-shot; the marginal
+local sample is electricity, not API dollars. Also accepted: feed spec-blind acceptance tests to the
+coder as INPUT (~+30pp, but the coder never authors its own oracle); right-size the task envelope.
+GUARDRAIL: freeze the review side — no fourth reviewer. (LA-accepted; epic #688 → #689–#692.)
+
+**2026-06-22 — a git worktree does NOT contain the repo's `.venv`; use the main checkout's interpreter + `PYTHONPATH`=worktree-root.** *(transplanted 2026-07-19 from the brief's §10 — #945 D9)*
+A builder in an isolated worktree hit `ModuleNotFoundError: No module named 'jwt'` — worktrees don't
+carry the gitignored `.venv`, so `python` fell through to the system interpreter. Run with the main
+checkout's interpreter by absolute path AND export `PYTHONPATH=<worktree-root>` so imports resolve to
+YOUR code, not `main`'s (critical when the package is editable-installed). Sanity-check with
+`python -c "import sys; print(sys.executable)"`. The fleet already encodes this in
+`new-agent-task.ps1` / `fleet-lib.ps1`. (Curated distillation of the same incident:
+Part A's phantom-`ModuleNotFoundError` / PYTHONPATH class near L148 — this dated entry
+is the running-log record behind it.)
+
+**2026-06-21 — scope an `edit`'s oldString to the minimal block, not the whole file.** *(transplanted 2026-07-19 from the brief's §10 — #945 D9)*
+The 30B correctly refactored 3 HTML files but took ~500 s per edit by matching each ENTIRE file as the
+edit oldString and re-emitting it as newString (~2× a 7 KB file of decode per edit). Task prompts must
+say: match ONLY the target block (e.g. the `<style>…</style>` element) — tiny old/new strings = fast
+edits and fewer match failures. Same family as minimize-tool-call-surface, applied to edit sizing.
+
+**2026-06-21 — a repair/safety wrapper must FAIL LOUD, never silently bypass the protection it exists for.** *(transplanted 2026-07-19 from the brief's §10 — #945 D9)*
+A 1387 s coding turn blew past the `:8099` proxy's hardcoded 600 s upstream timeout; the timeout threw
+into a fallback that forwarded the request UNREPAIRED — the leaked tool-call envelope reached OpenCode
+as plain text and the write never happened. Fixed in `tools/qwen-proxy.py`: `UPSTREAM_TIMEOUT` env
+(default 1800 s) + the fallback now returns a loud 504 instead of an unrepaired passthrough; every 200
+always runs salvage. Re-verified end-to-end (calculator 4 turns / investigation 9 turns / streaming,
+0 leaks). In any dispatch layer: a timed-out/failed task surfaces as a clear error, never as partial
+output masquerading as success.
+
+**2026-06-21 — context hygiene keeps the small model fast AND in-format.** *(transplanted 2026-07-19 from the brief's §10 — #945 D9)*
+In one session the coder inlined a shared `style.css` into every HTML file (after a "can't run the
+server" detour it never needed — a linked stylesheet works fine over `file://`), tripling file sizes;
+each later write then regenerated a bloated file and the context ballooned — slowing turns AND raising
+leak pressure. This is the decompose-small principle seen from the runtime side: size each fleet task
+so its output is small and self-contained, prefer shared/linked assets over duplication, and rely on
+per-task worktrees to keep each task's context tight. Small tasks aren't just easier to verify; they
+keep the model out of the degraded zone where it leaks.
+
+*(Transplant disposition, corrected 2026-07-19: the brief's §10 held SEVEN entries — six transplanted
+above, one skipped as a duplicate: "the OpenCode bash tool runs PowerShell, not Unix bash" already
+lives in this file.)*

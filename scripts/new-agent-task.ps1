@@ -51,11 +51,20 @@ param(
                                # Env override BLARAI_REPO, else the canonical default — mirrors start-llm.ps1's
                                # candidate-path-with-default convention (no config-file convention in this repo).
     # ---- #695 BEST-OF-N CONCURRENCY ----
-    [int]$Concurrency = 0      # 0 = RESOLVE from BLARAI_DISPATCH_CONCURRENCY then the built-in production
+    [int]$Concurrency = 0,     # 0 = RESOLVE from BLARAI_DISPATCH_CONCURRENCY then the built-in production
                                # default (Resolve-DispatchConcurrency, below). C=1 is EXACTLY today's
                                # sequential best-of-N; C>1 runs up to C candidates CONCURRENTLY, each in its
                                # own worktree off $codeBase via Start-Job (OVMS continuous batching, #695). An
                                # explicit value (run-fleet -Concurrency / a queue task's .concurrency) wins.
+    # ---- #790 sub-task 5: ONE canonical package, named by the job-oracle contract ----
+    [string]$CanonicalPackage = ''  # the ONE top-level python package the plan-graph job's acceptance
+                               # oracle imports (a queue task's .canonical_package, derived upstream by
+                               # blarai context_pack.canonical_package_from_contract). When set, the
+                               # python skeleton seeds its package UNDER THIS NAME so the coder extends
+                               # the oracle's layout -- the generic 'app/' seed beside the oracle's real
+                               # package grew B4's duplicate tree (both app/ AND flashcard_app/; the
+                               # stale app/core.py placeholder + tests/test_core.py rode along). Absent/
+                               # invalid -> the byte-identical legacy generic seed (a miss is safe).
 )
 # git writes normal progress (e.g. "Preparing worktree") to stderr; under Windows
 # PowerShell 5.1 with EAP=Stop that becomes a FATAL NativeCommandError. Use Continue
@@ -161,11 +170,15 @@ $structContract = $buildProfile.structural_contract
 $scaffold = Resolve-TaskScaffold -Prompt $Prompt -HasProject $hasProj -Surface $Surface -LanguageHint $LanguageHint
 if ($Surface) { Write-Host "  Build surface (upstream signal): $Surface$(if ($LanguageHint) { " / $LanguageHint" }) -> profile scaffold '$($buildProfile.scaffold)'$(if ($null -ne $structContract) { ' + structural contract' })" -ForegroundColor DarkCyan }
 if ($scaffold) {
-    $seeded = @(Copy-ScaffoldInto -Scaffold $scaffold -Worktree $wt)
+    # #790 sub-task 5: the python skeleton's package seeds under the job-oracle contract's canonical
+    # name (Copy-ScaffoldInto validates + falls back to the legacy generic seed on any miss), so the
+    # coder extends the ONE tree the oracle grades -- never the generic app/ twin beside it (B4).
+    $seeded = @(Copy-ScaffoldInto -Scaffold $scaffold -Worktree $wt -PackageName $CanonicalPackage)
     if ($seeded.Count) {
         git -C $wt add -A 2>&1 | Out-Null
         git -C $wt -c user.email='agent@local' -c user.name='coding-agent' commit -m "seed: $scaffold skeleton (coder extends this)" 2>&1 | Out-Null
-        Write-Host "  Seeded a known-good '$scaffold' skeleton ($($seeded.Count) files); the coder EXTENDS it." -ForegroundColor DarkGray
+        $pkgNote = if ($CanonicalPackage -and ($seeded -match '^' + [regex]::Escape($CanonicalPackage) + '[\\/]')) { " package '$CanonicalPackage' (oracle-contract canonical)" } else { '' }
+        Write-Host "  Seeded a known-good '$scaffold' skeleton ($($seeded.Count) files)$pkgNote; the coder EXTENDS it." -ForegroundColor DarkGray
     }
 }
 # #690 ACCEPTANCE-ORACLE SEEDING: when the PLAN step generated a shared, spec-derived oracle (python
@@ -223,7 +236,6 @@ if ($langConstraint) {
 # POLICY is the unit-tested Invoke-BestOfN / Invoke-BestOfNBatched / Test-IsCandidateGreen /
 # Get-CandidateRank (fleet-lib.ps1; see verify-bestofn.ps1 + verify-bestofn-concurrent.ps1); the real
 # MECHANISM is injected below.
-$priorReviewConcerns = ''
 $everFixFirst = $false
 $reviewPass = 0
 $MaxReviewPasses = 2   # default review budget (scaled below if an upstream complexity signal is present)
@@ -245,6 +257,13 @@ if ($buildProfile.staged) { Write-Host "  Staged build (core first, then shell):
 # mutates $Prompt above the resample loop like the other hints (survives a reset-to-base resample).
 $Prompt = Add-WebHint -Prompt $Prompt -Web ([bool]($scaffold -eq 'web'))
 if ($scaffold -eq 'web') { Write-Host "  Offline web build: the coder extends the seeded offline Node skeleton (no external assets; port-0 tests)." -ForegroundColor DarkCyan }
+# #886: the STATIC-PAGE hint for a `web-static` scaffold -- the coder EXTENDS the single seeded
+# self-contained index.html and stays static + offline (inline SVG/data: URIs, NO server, NO fetch,
+# NO package.json) instead of adding a node server that leaves a "Loading..." box hung on file://.
+# Gated on the RESOLVED scaffold (set by the surface -> profile mapping); non-static tasks are byte-
+# identical; mutates $Prompt above the resample loop like the other hints (survives a reset-to-base).
+$Prompt = Add-WebStaticHint -Prompt $Prompt -WebStatic ([bool]($scaffold -eq 'web-static'))
+if ($scaffold -eq 'web-static') { Write-Host "  Static web page: the coder extends the ONE self-contained index.html (no server, no build step, no fetch)." -ForegroundColor DarkCyan }
 # W4 (#714, UC-010 SEAM A): if BlarAI pre-generated raster image assets into the seeded worktree
 # (its on-device image generator, before the coder ran), tell the coder to USE the local files
 # (offline, relative path) instead of drawing an <svg> placeholder. DYNAMIC + gated on ACTUAL FILE

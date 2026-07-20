@@ -13,20 +13,23 @@
     so every resample failed CS0246 the same way and the task parked after burning the
     whole attempt budget.)
 
-    Error-feedback fixes that: on a verify FAIL the runner KEEPS the failing code and hands
-    the coder the EXACT build error with an instruction to fix it - the way a developer
-    iterates build -> read error -> fix -> rebuild. The two pure pieces live in fleet-lib.ps1
-    so they can be unit-tested without a model:
-      - Format-VerifyError    : pull the failing checks' captured output into one string
-      - Add-BuildErrorFeedback : append that error + a "fix the existing code" instruction
+    Error-feedback ORIGINALLY fixed that: on a verify FAIL the runner KEPT the failing code and
+    handed the coder the EXACT build error with an instruction to fix it. #689 (best-of-N) RETIRED
+    that serial self-correction re-fix -- the weak local model is worst at self-correcting (it
+    enters error traps and stays stuck), so the runner now resamples N fresh INDEPENDENT candidates
+    and the deterministic gate selects. What REMAINS is the capture piece in fleet-lib.ps1, unit-
+    tested without a model:
+      - Format-VerifyError : pull the failing checks' captured output into one string (still used
+        for the report/diagnostics AND fed to the best-of-N candidate pipeline).
+    (The prompt-augmentation piece, Add-BuildErrorFeedback, retired with the re-fix and was removed
+    in #696; its unit tests went with it.)
 
   This script proves the behaviour deterministically (no model / no OVMS needed, ~1s):
-    UNIT TESTS drive the REAL functions with scripted inputs and assert they extract,
-    format, and augment EXACTLY as specified - including the empty/none cases that must
-    leave the prompt untouched. WIRING tests regex-assert that new-agent-task.ps1 actually
-    INVOKES both functions on real (non-comment) lines AND passes the AUGMENTED prompt to
-    the coder (a substring match would pass on the explanatory comment alone). The suite is
-    built to be mutation-resistant: each [MUTATION-KILL] case fails a specific wrong impl.
+    UNIT TESTS drive the REAL Format-VerifyError with scripted inputs and assert it extracts +
+    formats EXACTLY as specified - including the empty/none cases. WIRING tests regex-assert that
+    the runner captures the verify error via Format-VerifyError AND drives best-of-N fresh
+    resampling on a build failure (a substring match would pass on the explanatory comment alone).
+    The suite is built to be mutation-resistant: each [MUTATION-KILL] case fails a specific wrong impl.
 
   Exit code is 0 if everything passed, 1 if any check failed.
   Run it normally ( .\verify-errorfeedback.ps1 ) - do NOT dot-source it.
@@ -94,40 +97,18 @@ $f5c = Format-VerifyError -Checks @(New-Check 'dotnet:build' 'fail' $null)
 Assert-Contains $f5c '[dotnet:build]' 'F5c null detail: still labels the check, no throw'
 
 # ----------------------------------------------------------------------------
-# UNIT TESTS: Add-BuildErrorFeedback - augment the prompt with the error
-# ----------------------------------------------------------------------------
-Section 'Unit tests: Add-BuildErrorFeedback'
-$basePrompt = 'Build a WinUI calculator.'
-
-# A1: with an error -> contains the ORIGINAL prompt + the error + the fix instruction.
-$a1 = Add-BuildErrorFeedback -Prompt $basePrompt -BuildError 'error CS0246: RoutedEventArgs'
-Assert-Contains $a1 $basePrompt       'A1: preserves the original prompt'
-Assert-Contains $a1 'RoutedEventArgs' 'A1: includes the build error'
-Assert-Contains $a1 'FIX IT'          'A1: includes the fix-it banner'
-Assert-Contains $a1 'SMALLEST change' 'A1: instructs the smallest change to existing code'
-
-# A2 [MUTATION-KILL]: empty / whitespace error -> prompt returned UNCHANGED. Fails a mutation
-#     that always augments (which would corrupt attempt 1 and no-error resamples).
-Assert-Eq $basePrompt (Add-BuildErrorFeedback -Prompt $basePrompt -BuildError '')      'A2a empty error: prompt unchanged'
-Assert-Eq $basePrompt (Add-BuildErrorFeedback -Prompt $basePrompt -BuildError "  `n ") 'A2b whitespace error: prompt unchanged'
-
-# A3 [MUTATION-KILL]: the augmented prompt is STRICTLY LONGER than the original and still
-#     STARTS WITH it - fails a mutation that REPLACES the prompt with just the error.
-$a3 = Add-BuildErrorFeedback -Prompt $basePrompt -BuildError 'BOOM'
-Assert-True ($a3.Length -gt $basePrompt.Length) 'A3: augmentation appends (longer than the original)'
-Assert-True ($a3.StartsWith($basePrompt))       'A3: the original prompt is preserved at the front (appended, not replaced)'
-
-# ----------------------------------------------------------------------------
-# WIRING: the runner must INVOKE both functions on real (non-comment) lines AND
-# actually pass the AUGMENTED prompt to the coder.
+# WIRING: on a build failure the runner drives best-of-N fresh resampling (#689);
+# Format-VerifyError still CAPTURES the failing checks' output for the report + the
+# best-of-N candidate pipeline. (The prompt-augmentation re-fix, Add-BuildErrorFeedback,
+# was retired + removed in #696 -- there is no augmented-prompt wiring to assert anymore.)
 # ----------------------------------------------------------------------------
 Section 'Wiring: build failures are handled by best-of-N fresh resampling (#689 -- error-feedback retired)'
 $nat = Get-Content "$PSScriptRoot\new-agent-task.ps1" -Raw
 # #689: the serial error-feedback re-fix (Add-BuildErrorFeedback) is RETIRED from the runner -- it asked the
 # weak model to SELF-CORRECT (its worst skill; it enters error traps and stays stuck). The runner now takes
-# up to N INDEPENDENT, diverse candidates and lets the deterministic gate SELECT (best-of-N). The
-# Format-VerifyError / Add-BuildErrorFeedback FUNCTIONS remain defined + unit-tested above; only the WIRING
-# changed. (The now-dormant Add-BuildErrorFeedback function is slated for cleanup -- #689 follow-up.)
+# up to N INDEPENDENT, diverse candidates and lets the deterministic gate SELECT (best-of-N). Format-VerifyError
+# REMAINS (it captures the verify error for the report + the best-of-N candidate pipeline; unit-tested above);
+# the dormant Add-BuildErrorFeedback augmentation function + its unit tests were REMOVED in #696 (#689 follow-up).
 $lib = Get-Content "$PSScriptRoot\fleet-lib.ps1" -Raw   # #700: the per-candidate gate body moved to Invoke-CandidateBuild
 Assert-True ([regex]::IsMatch($lib, 'Format-VerifyError\s+-Checks\s+\$vobj\.checks')) `
     'W1 wiring: the candidate pipeline (Invoke-CandidateBuild) CAPTURES the verify error via Format-VerifyError'
@@ -151,6 +132,6 @@ if ($script:Fail) {
     exit 1
 } else {
     Write-Host ''
-    Write-Host '  ERROR-FEEDBACK functions VALIDATED + best-of-N replacement WIRED (#689): on a verify fail the runner now takes fresh INDEPENDENT candidates and the gate selects (Add-BuildErrorFeedback is retired-but-correct).' -ForegroundColor Green
+    Write-Host '  ERROR-FEEDBACK capture VALIDATED (Format-VerifyError) + best-of-N replacement WIRED (#689): on a verify fail the runner takes fresh INDEPENDENT candidates and the gate selects (the Add-BuildErrorFeedback augmentation was retired + removed, #696).' -ForegroundColor Green
     exit 0
 }

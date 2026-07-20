@@ -190,10 +190,11 @@ Assert-True ([regex]::IsMatch($lib, 'Format-VerifyError\s+-Checks\s+\$vobj\.chec
 Assert-True ([regex]::IsMatch($nat, '\$Prompt = Add-StagedHint -Prompt \$Prompt -Staged')) 'W10 wiring: the WinUI structural rules reach every candidate up front via Add-StagedHint (each best-of-N candidate starts from the contract-compliant seed)'
 Assert-True ([regex]::IsMatch($nat, '(?m)^\s*\$bon\s*=\s*Invoke-BestOfN\b'))                'W10b wiring: a build/struct failure is handled by best-of-N fresh resampling + gate selection (Invoke-BestOfN), not error-feedback re-fix'
 
-Section 'Function proof: the Format-VerifyError -> Add-BuildErrorFeedback pipeline still works (now DORMANT)'
-# #689: error-feedback is RETIRED from the production runner (best-of-N replaced it), but the FUNCTIONS remain
-# defined + correct (slated for cleanup, #689 follow-up). This drives them directly to prove a struct:contract
-# violation WOULD route to actionable WinUI guidance -- validating the functions, NOT the live production path.
+Section 'Function proof: Format-VerifyError surfaces a struct:contract violation as actionable guidance'
+# #689: error-feedback is RETIRED from the production runner (best-of-N replaced it); the dormant
+# Add-BuildErrorFeedback augmentation function was REMOVED in #696. Format-VerifyError REMAINS -- it
+# captures the failing checks' detail for the report + the best-of-N candidate pipeline. This drives it
+# directly to prove a struct:contract violation is surfaced with the actionable WinUI guidance.
 $violation = Invoke-OnSeededTree { param($t) Set-Content (Join-Path $t 'Program.cs') 'class P { static void Main(){} }' }
 Assert-True ([bool]$violation) 'FB0 (precondition) the proliferated tree produced a violation string'
 $fakeChecks = @(
@@ -202,10 +203,6 @@ $fakeChecks = @(
 $captured = Format-VerifyError -Checks $fakeChecks
 Assert-Match $captured 'struct:contract' 'FB1 Format-VerifyError surfaces the struct:contract check name'
 Assert-Match $captured 'App\.xaml\.cs'   'FB2 the captured feedback carries the actionable WinUI guidance (the entry is App.xaml.cs)'
-$coderPrompt = Add-BuildErrorFeedback -Prompt 'Build a rocket calculator.' -BuildError $captured
-Assert-Match $coderPrompt 'Build a rocket calculator\.' 'FB3 the original prompt is preserved'
-Assert-Match $coderPrompt 'DID NOT PASS THE BUILD'      'FB4 the coder is told the prior attempt failed the gate'
-Assert-Match $coderPrompt 'App\.xaml\.cs'               'FB5 [kill] the coder''s next-pass prompt CONTAINS the struct guidance (the violation reached the feedback prompt)'
 
 # ----------------------------------------------------------------------------
 Section 'THE REAL SEED-BUILD PROOF: the never-live-engaged winui seed compiles AND passes the gate'
