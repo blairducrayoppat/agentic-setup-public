@@ -7,6 +7,10 @@ from the integrated GPU, drives it with a terminal coding agent, dispatches auto
 overnight coding runs through a supervised fleet, and exposes every one of those
 capabilities behind a single text menu a non-developer can operate.
 
+**&#9654; The BlarAI vision film (66 seconds):**
+
+https://github.com/user-attachments/assets/9ffd473b-93e5-4763-a9ec-e12ac6afa10c
+
 It is deliberately **PowerShell-first, Windows-native, single-operator**. There is no
 container runtime, no orchestration cluster, no second machine. Everything below is
 tuned to the one hard constraint that governs the whole design.
