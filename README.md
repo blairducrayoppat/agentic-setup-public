@@ -15,13 +15,10 @@ It is deliberately **PowerShell-first, Windows-native, single-operator**. There 
 container runtime, no orchestration cluster, no second machine. Everything below is
 tuned to the one hard constraint that governs the whole design.
 
-> **PowerShell 7+ (pwsh) only.** Every `scripts/*.ps1`, the scheduled tasks, and the fleet
-> run under PowerShell 7 — the production runtime. Windows PowerShell 5.1 is **not
-> supported**: many scripts are UTF-8 (no BOM) with non-ASCII punctuation (em-dashes,
-> arrows) that 5.1's ANSI-default parser mis-tokenizes, and re-punctuating ~37 scripts for
-> a parser nothing here uses would churn history for no benefit. Do not add 5.1 to any
-> verify matrix; if a specific file must be 5.1-parseable for an external tool, add a BOM to
-> that one file. (#785 decision (b), 2026-07-10.)
+> **PowerShell 7+ (pwsh) only.** All scripts, the scheduled tasks, and the fleet run
+> under PowerShell 7 — the production runtime. Windows PowerShell 5.1 is **not
+> supported**: the scripts are UTF-8 without a byte-order mark, which 5.1's ANSI-default
+> parser mis-tokenizes.
 
 ## The one constraint everything follows from
 
