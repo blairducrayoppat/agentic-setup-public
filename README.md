@@ -20,6 +20,27 @@ tuned to the one hard constraint that governs the whole design.
 > supported**: the scripts are UTF-8 without a byte-order mark, which 5.1's ANSI-default
 > parser mis-tokenizes.
 
+## Recent enhancements (as of July 2026)
+
+Recent work has focused on making the autonomous overnight coding fleet *fail honestly*,
+so an operator waking up to a run report can trust what it says.
+
+- **The fleet fails loud, never silent.** A failed `git` capture — a worktree that would
+  not create, an add or commit that errored — is now surfaced as an *errored* task
+  carrying git's own message, never silently misreported as "the coder produced no
+  output." A capture fault is also no longer terminal for best-of-N sampling, so one bad
+  attempt does not sink an otherwise-good run.
+- **"No change needed" is a first-class outcome.** The best-of-N retry loop no longer
+  demands a diff when the correct answer is to change nothing — it recognizes a genuine
+  no-op as success instead of retrying against an impossible expectation.
+- **Neutral, lock-verified scaffolding.** New-project scaffolding was made
+  language-neutral with a litter filter, backed by a verify suite of more than a hundred
+  locked assertions so a regression in the out-of-box template fails loudly rather than
+  drifting in unnoticed.
+- **Memory-strand containment.** A crash in a run's postlude can no longer strand the
+  resident model in memory — the single ~31 GB pool is protected against the failure mode
+  that previously left a multi-gigabyte model orphaned after a bad run.
+
 ## The one constraint everything follows from
 
 **CPU, integrated GPU, OS, VMs, and build jobs all share ONE \~31.3 GB memory pool** on
