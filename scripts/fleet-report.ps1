@@ -14,24 +14,30 @@ if (-not (Test-Path $ReportDir)) { Write-Host "No reports yet at $ReportDir (run
 $files = @(Get-ChildItem $ReportDir -Filter '*.txt' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $Last)
 if ($files.Count -eq 0) { Write-Host "No task reports found in $ReportDir." -ForegroundColor Yellow; exit 0 }
 
-$merged = 0; $parked = 0; $blocked = 0; $nochange = 0
-$testFail = 0; $verifyFail = 0; $secretBlk = 0; $anom = 0
+$merged = 0; $parked = 0; $blocked = 0; $nochange = 0; $errored = 0
+$testFail = 0; $verifyFail = 0; $secretBlk = 0; $anom = 0; $captureFault = 0
 $recent = New-Object System.Collections.ArrayList
 foreach ($f in $files) {
     $t = Get-Content $f.FullName -Raw
     $result = ([regex]::Match($t, '(?m)^RESULT:\s*(.*)$')).Groups[1].Value
     # Order matters: "-match" is case-insensitive, and the parked message contains
     # the word "merged" ("NOT merged. ... parked"), so check the specific phrases
-    # BEFORE the generic MERGED.
-    $outcome = if ($result -match 'BLOCKED') { 'blocked' }
+    # BEFORE the generic MERGED. #1074: ERRORED is checked FIRST -- a run whose
+    # stage/commit step failed produced no measurement at all, and counting it as
+    # "no change made" is the same laundering one level up: this trend is what the
+    # operator reads to judge coder capability, so a box fault must never inflate
+    # the no-op column it is most easily mistaken for.
+    $outcome = if ($result -match 'ERRORED') { 'errored' }
+               elseif ($result -match 'BLOCKED') { 'blocked' }
                elseif ($result -match 'NOT merged') { 'parked' }
                elseif ($result -match 'Nothing to merge') { 'no-change' }
                elseif ($result -match 'MERGED') { 'merged' }
                else { 'parked' }
-    switch ($outcome) { 'merged' { $merged++ } 'blocked' { $blocked++ } 'no-change' { $nochange++ } default { $parked++ } }
+    switch ($outcome) { 'merged' { $merged++ } 'blocked' { $blocked++ } 'no-change' { $nochange++ } 'errored' { $errored++ } default { $parked++ } }
     if ($t -match '(?m)^TESTS:\s*fail') { $testFail++ }
     if ($t -match '(?m)^VERIFY:\s*fail') { $verifyFail++ }
     if ($t -match '(?m)^SECRETS:\s*BLOCKED') { $secretBlk++ }
+    if ($t -match '(?m)^CAPTURE FAULT') { $captureFault++ }
     if ($t -match '(?m)^ANOMALIES:\s*(?!none)\S') { $anom++ }
     if ($recent.Count -lt 12) { [void]$recent.Add([pscustomobject]@{ when = $f.LastWriteTime.ToString('MM-dd HH:mm'); name = $f.BaseName; outcome = $outcome }) }
 }
@@ -43,8 +49,9 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("  parked (review): $parked")
 [void]$sb.AppendLine("  blocked (secret):$blocked")
 [void]$sb.AppendLine("  no change made:  $nochange")
+[void]$sb.AppendLine("  ERRORED (box):   $errored   <- the stage/commit step failed; these measure the machine, not the coder")
 [void]$sb.AppendLine('')
-[void]$sb.AppendLine("  guardrails fired -> test-fail:$testFail  verify-fail:$verifyFail  secret-block:$secretBlk  loop/anomaly:$anom")
+[void]$sb.AppendLine("  guardrails fired -> test-fail:$testFail  verify-fail:$verifyFail  secret-block:$secretBlk  loop/anomaly:$anom  capture-fault:$captureFault")
 [void]$sb.AppendLine('')
 [void]$sb.AppendLine('  recent:')
 foreach ($r in $recent) { [void]$sb.AppendLine(("    {0}  {1,-9}  {2}" -f $r.when, $r.outcome, $r.name)) }

@@ -444,7 +444,17 @@ Section 'Wiring: #700 unification -- ONE per-candidate pipeline (Invoke-Candidat
 # and concurrent (C>1) paths run the SAME function -- removing the drift hazard of two copies. These lock it.
 Assert-True ([regex]::IsMatch($nat, '\$BuildTestVerify\s*=\s*\{[\s\S]{0,500}Invoke-CandidateBuild')) 'the sequential $BuildTestVerify DELEGATES to Invoke-CandidateBuild (C=1 runs the SAME pipeline as C>1)'
 Assert-False ([regex]::IsMatch($nat, 'Format-VerifyError\s+-Checks\s+\$vobj\.checks')) '[kill] the duplicated gate body is GONE from new-agent-task -- the gate lives ONLY in Invoke-CandidateBuild (#700, no drift)'
-Assert-True ([regex]::IsMatch($lib, 'function Invoke-CandidateBuild[\s\S]{0,12000}Format-VerifyError\s+-Checks\s+\$vobj\.checks')) '[kill] the single gate body (Format-VerifyError) lives inside Invoke-CandidateBuild'
+# #1074: the char-window PROXY this replaced ('function Invoke-CandidateBuild[\s\S]{0,N}...') had to be
+# widened twice (12000 -> 18000 on 2026-07-23, and would need it again here) because ANY comment added
+# to the function pushes the gate call past N. A lock that fails on unrelated edits trains the next
+# session to widen it rather than read it, so the third adjustment ships the real property instead:
+# SLICE the function body (from its `function` line to the next top-level `function`) and assert
+# containment directly. Now it fails only if the gate body actually leaves the function.
+$icbStart = $lib.IndexOf('function Invoke-CandidateBuild')
+$icbNext  = $lib.IndexOf("`nfunction ", $icbStart + 1)
+$icbBody  = if (($icbStart -ge 0) -and ($icbNext -gt $icbStart)) { $lib.Substring($icbStart, $icbNext - $icbStart) } else { '' }
+Assert-True ($icbBody.Length -gt 0) '[kill] Invoke-CandidateBuild''s body was located (slice anchor intact)'
+Assert-True ($icbBody -match 'Format-VerifyError\s+-Checks\s+\$vobj\.checks') '[kill] the single gate body (Format-VerifyError) lives INSIDE Invoke-CandidateBuild (real containment, not a char-window proxy)'
 Assert-True ([regex]::IsMatch($lib, '\[bool\]\$ResetToBase')) 'Invoke-CandidateBuild has -ResetToBase (the sequential reuse-one-worktree reset folded in by #700)'
 
 # ----------------------------------------------------------------------------

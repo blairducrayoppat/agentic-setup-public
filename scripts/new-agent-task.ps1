@@ -135,7 +135,14 @@ $wtBase = Resolve-WorktreeBase -ScriptRoot $PSScriptRoot -Containment (Get-Fleet
 New-Item -ItemType Directory -Force $wtBase | Out-Null
 $wt = Join-Path $wtBase "$repoName-$Task"
 $branch = "agent/$Task"
-$ReportDir = 'C:\Users\mrbla\agentic-setup\state\reports'
+# #1075 F2: this MUST resolve the fleet root exactly as run-fleet.ps1 does
+# (BLARAI_FLEET_AGENTIC_SETUP_DIR - the same SSOT BlarAI's shared/fleet/dispatch.py
+# resolve_fleet_root uses on its side). run-fleet SCRAPES this directory for the RESULT: line
+# that decides whether a task is recorded done; if the two scripts disagree about where reports
+# live, the scrape finds nothing, EVERY task reads as non-delivering, and already-merged work
+# gets re-dispatched. Gate-locked by BlarAI's shared/tests/test_fleet_script_agreement.py.
+$FleetRoot = if ($env:BLARAI_FLEET_AGENTIC_SETUP_DIR) { $env:BLARAI_FLEET_AGENTIC_SETUP_DIR } else { 'C:\Users\mrbla\agentic-setup' }
+$ReportDir = Join-Path (Join-Path $FleetRoot 'state') 'reports'
 New-Item -ItemType Directory -Force $ReportDir | Out-Null
 $Report = Join-Path $ReportDir "$repoName-$Task-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 
@@ -152,8 +159,18 @@ git -C $Repo branch -D $branch 2>&1 | Out-Null
 foreach ($__br in @(git -C $Repo branch --list "agent/$Task-c*" 2>$null | ForEach-Object { ($_ -replace '^[\*\+]?\s*', '').Trim() })) {
     if ($__br) { git -C $Repo branch -D $__br 2>&1 | Out-Null }
 }
-git -C $Repo worktree add $wt -b $branch 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Could not create the isolated workspace at $wt (branch '$branch')." }
+# #1076: CAPTURE git's output instead of discarding it. Three parked runs and eight failed workspace
+# creations left git's actual reason (a locked worktree, a stale admin entry, a path already in use, ...)
+# nowhere on disk: the generic throw named the path and the branch but never WHY, and #1066 could not
+# establish it after the fact. Git's own message is the only thing that separates those causes, so it
+# rides the throw. Every prepared-statement above stays as it was -- their failures are expected and
+# idempotent (nothing to clean up is not an error); THIS one is the fail-loud seam.
+$__wtOut = @(git -C $Repo worktree add $wt -b $branch 2>&1)
+if ($LASTEXITCODE -ne 0) {
+    $__wtWhy = (($__wtOut | ForEach-Object { "$_" } | Where-Object { $_.Trim() }) -join ' | ').Trim()
+    if (-not $__wtWhy) { $__wtWhy = "git exited $LASTEXITCODE with no output" }
+    throw "Could not create the isolated workspace at $wt (branch '$branch'). git said: $__wtWhy"
+}
 # C1 SCAFFOLD SEEDING (#670): seed a known-good skeleton into a FRESH target so the coder EXTENDS a
 # compiling project instead of hand-authoring boilerplate (where a small model trips on e.g. the
 # WinUI `using Microsoft.UI.Xaml;` -> CS0246). Only when the worktree has NO project yet (never
@@ -307,9 +324,9 @@ if ($Concurrency -gt 1) {
         $bon = Invoke-BestOfNBatched -MaxCandidates $MaxVerifyAttempts -Concurrency $Concurrency `
             -ShouldCancel { Test-DispatchCancelled } `
             -OnBatch { param($idxs, $n) Write-Host "[1/5] Building $($idxs.Count) candidate(s) CONCURRENTLY ($($idxs -join ', ') of $n) in isolated worktrees ($Model, max $MaxRunMinutes min each)..." -ForegroundColor Cyan } `
-            -IsWinner { param($c) Test-IsCandidateGreen -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked } `
-            -StopSampling { param($c) Test-IsSamplingTerminal -SecretBlocked $c.SecretBlocked -TimedOut $c.TimedOut -TimeoutReason "$($c.Run.TimeoutReason)" } `
-            -ScoreCandidate { param($c) Get-CandidateRank -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -LoopSuspected $c.LoopSuspected } `
+            -IsWinner { param($c) Test-IsCandidateGreen -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -GitFailed ([bool]$c.GitFailed) } `
+            -StopSampling { param($c) Test-IsSamplingTerminal -SecretBlocked $c.SecretBlocked -TimedOut $c.TimedOut -TimeoutReason "$($c.Run.TimeoutReason)" -NoChangeDeclared ([bool]$c.NoChangeDeclared) } `
+            -ScoreCandidate { param($c) Get-CandidateRank -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -LoopSuspected $c.LoopSuspected -GitFailed ([bool]$c.GitFailed) } `
             -RunBatch {
                 param($idxs, $n)
                 # 1) Create this batch's candidate worktrees SEQUENTIALLY (fast; avoids any git ref race),
@@ -319,7 +336,20 @@ if ($Concurrency -gt 1) {
                     $wt_k = "$wtOrig-c$k"; $br_k = "agent/$Task-c$k"
                     if (Test-Path $wt_k) { git -C $Repo worktree remove $wt_k --force 2>&1 | Out-Null }
                     git -C $Repo branch -D $br_k 2>&1 | Out-Null
-                    git -C $Repo worktree add $wt_k -b $br_k $codeBase 2>&1 | Out-Null
+                    # #1076: this creation was TOTALLY silent -- output to Out-Null and no exit-code check
+                    # at all -- so a candidate whose worktree never appeared went on to "build" in a
+                    # directory that does not exist, and the run showed an empty build with no cause
+                    # anywhere on disk (the #1066 shape). Report git's own reason. Control flow is
+                    # deliberately UNCHANGED here: the candidate still proceeds and still fails its own
+                    # gate. Whether it should instead be SKIPPED (and scored as a HARNESS fault rather
+                    # than a candidate failure) is a quality question tracked in #1084 -- deciding it
+                    # inside an evidence fix would have been a scope violation.
+                    $__cOut = @(git -C $Repo worktree add $wt_k -b $br_k $codeBase 2>&1)
+                    if ($LASTEXITCODE -ne 0) {
+                        $__cWhy = (($__cOut | ForEach-Object { "$_" } | Where-Object { $_.Trim() }) -join ' | ').Trim()
+                        if (-not $__cWhy) { $__cWhy = "git exited $LASTEXITCODE with no output" }
+                        Write-Host "  [warn] candidate $k's workspace was NOT created at $wt_k. git said: $__cWhy" -ForegroundColor Yellow
+                    }
                     $meta[$k] = @{ wt = $wt_k; branch = $br_k; prompt = (Add-CandidateDiversity -Prompt $Prompt -Index $k -Total $n); log = ($Report -replace '\.txt$', ".c$k.agent.log") }
                 }
                 # 2) Launch C concurrent Start-Job CHILD PROCESSES (separate processes -> isolated
@@ -350,7 +380,7 @@ if ($Concurrency -gt 1) {
                     $raw = if ($out.Count) { $out[-1] } else { $null }
                     $cand = ConvertTo-CandidateResult -Raw $raw -Index $k -Worktree $m.wt -Branch $m.branch
                     $results += $cand
-                    Write-Host ("  candidate c{0}: verify={1} test={2} changes={3}{4}{5}" -f $k, $cand.VerifyResult, $cand.TestResult, $cand.HasChanges, $(if ($cand.SecretBlocked) { ' SECRET' }), $(if ($cand.TimedOut) { ' TIMEOUT' })) -ForegroundColor DarkGray
+                    Write-Host ("  candidate c{0}: verify={1} test={2} changes={3}{4}{5}{6}" -f $k, $cand.VerifyResult, $cand.TestResult, $cand.HasChanges, $(if ($cand.SecretBlocked) { ' SECRET' }), $(if ($cand.TimedOut) { ' TIMEOUT' }), $(if ($cand.NoChangeDeclared) { ' NO-CHANGE-DECLARED' })) -ForegroundColor DarkGray
                 }
                 return $results
             }
@@ -372,9 +402,9 @@ if ($null -eq $bon) {
     $bon = Invoke-BestOfN -MaxCandidates $MaxVerifyAttempts `
         -ShouldCancel { Test-DispatchCancelled } `
         -OnCandidate { param($k, $n) if ($k -gt 1) { Write-Host "  Candidate $($k - 1) did not pass the gate; trying a FRESH independent candidate ($k/$n)..." -ForegroundColor Yellow } } `
-        -IsWinner { param($c) Test-IsCandidateGreen -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked } `
-        -StopSampling { param($c) Test-IsSamplingTerminal -SecretBlocked $c.SecretBlocked -TimedOut $c.TimedOut -TimeoutReason "$($c.Run.TimeoutReason)" } `
-        -ScoreCandidate { param($c) Get-CandidateRank -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -LoopSuspected $c.LoopSuspected } `
+        -IsWinner { param($c) Test-IsCandidateGreen -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -GitFailed ([bool]$c.GitFailed) } `
+        -StopSampling { param($c) Test-IsSamplingTerminal -SecretBlocked $c.SecretBlocked -TimedOut $c.TimedOut -TimeoutReason "$($c.Run.TimeoutReason)" -NoChangeDeclared ([bool]$c.NoChangeDeclared) } `
+        -ScoreCandidate { param($c) Get-CandidateRank -VerifyResult $c.VerifyResult -TestResult $c.TestResult -HasChanges $c.HasChanges -TimedOut $c.TimedOut -SecretBlocked $c.SecretBlocked -LoopSuspected $c.LoopSuspected -GitFailed ([bool]$c.GitFailed) } `
         -RunCandidate {
             param($k, $n)
             $candPrompt = Add-CandidateDiversity -Prompt $Prompt -Index $k -Total $n
@@ -384,6 +414,8 @@ if ($null -eq $bon) {
             @{
                 Index = $k; VerifyResult = $btv.VerifyResult; TestResult = $btv.TestResult; HasChanges = [bool]$btv.HasChanges;
                 TimedOut = [bool]$btv.Run.TimedOut; SecretBlocked = [bool]$btv.SecretBlocked; LoopSuspected = [bool]$btv.Anomaly.LoopSuspected;
+                NoChangeDeclared = [bool]$btv.NoChangeDeclared; NoChangeEvidence = "$($btv.NoChangeEvidence)";   # #1049
+                GitFailed = [bool]$btv.GitFailed; GitError = "$($btv.GitError)"; GitFaultReason = "$($btv.GitFaultReason)";   # #1074
                 SHA = $btv.SHA; Run = $btv.Run; Secret = $btv.Secret; Anomaly = $btv.Anomaly; BuildAttempts = $btv.BuildAttempts;
                 TestError = $btv.TestError; VerifyDetail = $btv.VerifyDetail; VerifyError = $btv.VerifyError; AgentLog = $btv.LogPath
             }
@@ -430,6 +462,7 @@ if ($usedConcurrent -and $sel -and $sel.Worktree) {
 if (-not $sel) {
     # Defensive: nothing generated (N<1 -- never in practice). Treat as a no-op build.
     $sel = @{ VerifyResult='none'; TestResult='none'; HasChanges=$false; TimedOut=$false; SecretBlocked=$false;
+              NoChangeDeclared=$false; NoChangeEvidence=''; GitFailed=$false; GitError=''; GitFaultReason='';
               SHA=''; Run=@{ ExitCode=$null; TimedOut=$false; Capped=$false; CappedReason='' }; Secret=@{ status='clean'; detail='' };
               Anomaly=@{ Anomalies=@(); LoopSuspected=$false }; BuildAttempts=0; TestError=''; VerifyDetail=''; VerifyError=''; AgentLog=($Report -replace '\.txt$', '.agent.log') }
 }
@@ -457,6 +490,38 @@ $testResult = $sel.TestResult
 $verifyResult = $sel.VerifyResult
 $verifyDetail = $sel.VerifyDetail
 $AgentLog = $sel.AgentLog
+$noChangeDeclared = [bool]$sel.NoChangeDeclared   # #1049 honest no-change outcome
+$noChangeEvidence = "$($sel.NoChangeEvidence)"
+# #1074: the stage->commit CAPTURE fault. An ERRORED task, never an empty build -- it must reach the
+# report carrying git's own message, block the merge, and stop the review-FIX loop (there is nothing
+# committed to review). This pair reads the SELECTED candidate, which decides the TASK's outcome.
+$gitFailed = [bool]$sel.GitFailed
+$gitError = "$($sel.GitError)"
+$gitFaultReason = "$($sel.GitFaultReason)"
+# ...but reading ONLY the selected candidate DROPS the fault whenever a better candidate exists.
+# Get-CandidateRank sinks a faulted candidate by -50000, so it loses selection to any real attempt --
+# including a plain no-op -- and its git stderr and its uncaptured work would vanish from the report,
+# which is this ticket's own defect surviving at the multi-candidate level. The machine-level causes
+# named here (a locked index, a full disk, lock contention) plausibly hit a SUBSET of concurrent
+# candidates, and N=3 best-of-N is the battery's default; the measured B4 instance only looks fully
+# covered because all three candidates faulted together. So AGGREGATE across every candidate.
+# The rank is deliberately NOT raised -- a real attempt beating a faulted one is correct selection.
+# What changes is only that the fault stays VISIBLE.
+$faultedCandidates = @($bon.Candidates | Where-Object { $_ -and [bool]$_.GitFailed })
+$captureFaultNote = ''
+if ($faultedCandidates.Count -gt 0) {
+    $__cfLines = @($faultedCandidates | ForEach-Object {
+        $__idx = if ($null -ne $_.Index) { "candidate $($_.Index)" } else { 'a candidate' }
+        "${__idx} [$($_.GitFaultReason)]: $($_.GitError)"
+    })
+    $captureFaultNote = (($__cfLines | ForEach-Object { "  - $_" }) -join "`n")
+    foreach ($__l in $__cfLines) { Write-Host "  CAPTURE FAULT $__l" -ForegroundColor Red }
+}
+if ($gitFailed) {
+    Write-Host "  Reporting this task as ERRORED. It measures the box, NOT the model - do not read it as a coder no-op." -ForegroundColor Red
+} elseif ($faultedCandidates.Count -gt 0) {
+    Write-Host "  $($faultedCandidates.Count) candidate(s) FAULTED but a non-faulted candidate was selected. That selection stands; the faults are reported so this run is not read as a clean measurement." -ForegroundColor Yellow
+}
 
 # ---- [4/5] REVIEW + bounded review-FEEDBACK (the FROZEN review side; #687/#689). Only runs when the
 # gates are NOT both green (Test-ShouldRunReview) -- e.g. a build-only dotnet/WinUI surface with no test
@@ -468,7 +533,7 @@ $verdict = 'UNCLEAR'; $reviewTail = ''
 if ($hasChanges -and ($verifyResult -eq 'pass') -and ($testResult -eq 'pass')) {
     Write-Host "[4/5] Review SKIPPED - deterministic gates are GREEN (build + tests + verify pass); the gate decides the merge and the cross-model critic reviews post-merge." -ForegroundColor DarkGray
 }
-while ($hasChanges -and -not $dispatchCancelled -and (Test-ShouldRunReview -HasChanges $hasChanges -VerifyResult $verifyResult -TestResult $testResult)) {   # #771: a stopped run skips review-FIX (no more agent churn)
+while ($hasChanges -and -not $dispatchCancelled -and -not $gitFailed -and (Test-ShouldRunReview -HasChanges $hasChanges -VerifyResult $verifyResult -TestResult $testResult)) {   # #771: a stopped run skips review-FIX (no more agent churn). #1074: so does a capture fault - there is no captured diff to review, and a fix lap would write more work into the same broken tree.
     Write-Host "[4/5] Review agent is judging the changes (max $MaxReviewMinutes min)..." -ForegroundColor Cyan
     $ReviewLog = $Report -replace '\.txt$', '.review.log'
     # #694: gather the diff IN POWERSHELL and embed it in the prompt (the exact critic-run.ps1
@@ -547,7 +612,15 @@ while ($hasChanges -and -not $dispatchCancelled -and (Test-ShouldRunReview -HasC
     $anomaly = $btv.Anomaly; $secret = $btv.Secret; $secretBlocked = [bool]$btv.SecretBlocked
     $hasChanges = [bool]$btv.HasChanges; $testResult = $btv.TestResult; $verifyResult = $btv.VerifyResult
     $verifyDetail = $btv.VerifyDetail; $AgentLog = $btv.LogPath
-    if ($secretBlocked -or $agentTimedOut) { break }   # terminal: park (never refine past a secret/timeout)
+    $noChangeDeclared = [bool]$btv.NoChangeDeclared; $noChangeEvidence = "$($btv.NoChangeEvidence)"   # #1049
+    $gitFailed = [bool]$btv.GitFailed; $gitError = "$($btv.GitError)"; $gitFaultReason = "$($btv.GitFaultReason)"   # #1074
+    if ($gitFailed) {
+        Write-Host "  CAPTURE FAULT ($gitFaultReason) during the review-FIX lap: $gitError" -ForegroundColor Red
+        # The aggregate note was built from the best-of-N candidates; a fault that happens HERE is
+        # newer than that list, so append it or the report would carry the fault flag with no message.
+        $captureFaultNote = ($captureFaultNote, "  - review-FIX pass $reviewPass [$gitFaultReason]: $gitError" | Where-Object { $_ }) -join "`n"
+    }
+    if ($secretBlocked -or $agentTimedOut -or $gitFailed) { break }   # terminal: park (never refine past a secret/timeout/capture fault)
 }
 
 # A FIX FIRST verdict is STICKY: once flagged, a later UNCLEAR / timed-out re-review must NOT let the
@@ -563,7 +636,7 @@ $merged = $false
 $mergeDecision = Test-ShouldMerge -HasChanges $hasChanges -SecretBlocked $secretBlocked `
     -AgentTimedOut $agentTimedOut -LoopSuspected $anomaly.LoopSuspected `
     -TestResult $testResult -VerifyResult $verifyResult -Verdict $verdict `
-    -Ecosystems (Get-ProjectEcosystem $wt)
+    -Ecosystems (Get-ProjectEcosystem $wt) -GitFailed $gitFailed
 if ($mergeDecision.Merge -and $dispatchCancelled) {
     # #771: a cancelled run never auto-merges. This only bites the build-only-ecosystem UNCLEAR-merge edge
     # (a verify=pass partial whose review we deliberately skipped on the stop); a real green winner cannot be
@@ -748,15 +821,15 @@ if ($merged) {
 $summary = @"
 TASK: $Task  ($repoName)
 ASKED: $OrigPrompt
-BUILD: $(if ($agentTimedOut) { Get-TimeoutStopText -Reason "$($run.TimeoutReason)" -MaxRunMinutes $MaxRunMinutes -IdleTimeoutSec $IdleTimeoutSec } elseif ($run.Capped) {"completed (bounded - $($run.CappedReason))"} elseif ($buildExit -eq 0) {'completed'} else {"agent exited with code $buildExit"})$(if ($buildAttempt -gt 1) { " (after $buildAttempt build attempts; the local model no-op'd the earlier ones)" })
+BUILD: $(if ($agentTimedOut) { Get-TimeoutStopText -Reason "$($run.TimeoutReason)" -MaxRunMinutes $MaxRunMinutes -IdleTimeoutSec $IdleTimeoutSec } elseif ($run.Capped) {"completed (bounded - $($run.CappedReason))"} elseif ($buildExit -eq 0) {'completed'} else {"agent exited with code $buildExit"})$(if ($buildAttempt -gt 1) { if ($noChangeDeclared) { " (after $buildAttempt build attempts; the retry ended on an explicit NO CHANGE NEEDED declaration)" } else { " (after $buildAttempt build attempts; the local model no-op'd the earlier ones)" } })
 TRANSCRIPT: $AgentLog
-CHANGES: $(if ($hasChanges) {'yes'} else {'none made'})
-TESTS: $testResult
-VERIFY: $verifyResult$(if ($verifyResult -eq 'fail') { ' (build/lint/typecheck FAILED - blocked the merge)' })
-SECRETS: $(if ($secretBlocked) { "BLOCKED - $($secret.detail)" } elseif ($secret.status -eq 'unavailable') { 'scan skipped (gitleaks not installed)' } else { 'clean' })
+CHANGES: $(if ($gitFailed) {'UNKNOWN - the stage/commit step FAILED, so the coder''s output was never captured (see CAPTURE FAULT below). This is NOT a no-op and says NOTHING about the model.'} elseif ($secretBlocked) {'not committed - a potential secret blocked the commit; the work is left UNCOMMITTED in the worktree'} elseif ($hasChanges) {'yes'} elseif ($captureFaultNote) {'none made BY THE SELECTED CANDIDATE - but another candidate FAULTED (see CAPTURE FAULT below), so this run is NOT a clean no-op measurement.'} else {'none made'})$(if ($captureFaultNote) { "`nCAPTURE FAULT$(if (-not $gitFailed) { ' (a non-selected candidate; the selected result below stands)' }):`n$captureFaultNote" })$(if ($noChangeDeclared) { "`nNO-CHANGE DECLARED (#1049 honest terminal outcome; coder's evidence): $noChangeEvidence" })
+TESTS: $testResult$(if ($gitFailed) { ' (not run - nothing was captured to test)' })
+VERIFY: $verifyResult$(if ($verifyResult -eq 'fail') { ' (build/lint/typecheck FAILED - blocked the merge)' })$(if ($gitFailed) { ' (not run - nothing was captured to verify)' })
+SECRETS: $(if ($secretBlocked) { "BLOCKED - $($secret.detail)" } elseif ($secret.status -eq 'skipped') { 'NOT SCANNED - the stage step failed before the scan could run' } elseif ($secret.status -eq 'unavailable') { 'scan skipped (gitleaks not installed)' } else { 'clean' })
 ANOMALIES: $(if ($anomaly.Anomalies.Count) { ($anomaly.Anomalies -join '; ') } else { 'none' })$(if ($concurrencyNote) { "`nNOTE (concurrency): $concurrencyNote" })$(if ($dispatchCancelled) { "`nSTOPPED: a /dispatch stop was observed mid-run; best-of-N parked after the current candidate and did not start fresh candidates or auto-merge (#771)." })
 REVIEW VERDICT: $verdict$(if ($critiqueSummary) { "`nVISUAL CRITIQUE (post-merge design signal — NOT a gate, your eyeball is the verdict):`n  $($critiqueSummary -replace "`n", "`n  ")" })
-RESULT: $(if ($secretBlocked) {"BLOCKED: a potential secret was detected, so nothing was committed or merged. Your changes are left UNCOMMITTED in $wt for review."} elseif ($merged) {"MERGED into your project - just open the app and try it.$(if ($mergedVia -eq 'build-only-gate') { ' (Merged via the build-only gate: the build passed cleanly but the AI code review was inconclusive - please launch and eyeball it.)' })"} elseif (-not $hasChanges) {'Nothing to merge.'} else {"NOT merged. The work is parked safely on branch '$branch' (workspace: $wt)."})
+RESULT: $(if ($gitFailed) {"ERRORED: the stage/commit step failed ($gitFaultReason), so the coder's work was never captured - see the CAPTURE FAULT line above for git's own message. Any work is left UNCOMMITTED in $wt. This run measures the BOX, not the model: do not read it as a coder no-op."} elseif ($secretBlocked) {"BLOCKED: a potential secret was detected, so nothing was committed or merged. Your changes are left UNCOMMITTED in $wt for review."} elseif ($merged) {"MERGED into your project - just open the app and try it.$(if ($mergedVia -eq 'build-only-gate') { ' (Merged via the build-only gate: the build passed cleanly but the AI code review was inconclusive - please launch and eyeball it.)' })"} elseif (-not $hasChanges -and $noChangeDeclared) {'Nothing to merge - the coder explicitly declared NO CHANGE NEEDED: the task appears already satisfied by the current project (see the NO-CHANGE DECLARED line above; an honest no-change outcome, not a failure to produce).'} elseif (-not $hasChanges -and $captureFaultNote) {'Nothing to merge from the selected candidate - but another candidate FAULTED before its work could be captured (see CAPTURE FAULT above). Nothing was lost from the selected candidate, but do NOT read this run as a clean "the coder produced nothing" result.'} elseif (-not $hasChanges) {'Nothing to merge.'} else {"NOT merged. The work is parked safely on branch '$branch' (workspace: $wt)."})
 $(if (-not $merged -and $hasChanges) {@"
 
 WHAT TO DO (no git knowledge needed):

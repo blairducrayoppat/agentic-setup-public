@@ -109,7 +109,10 @@ Assert-True ([regex]::IsMatch($lib, 'if \(\$OracleActive\) \{ git -C \$wt checko
 # [kill] the restore MUST run BEFORE the staging/commit + the [2/5] gate, else the gate would judge a
 # TAMPERED oracle (and the merged commit would keep the tamper).
 $idxRestore = $lib.IndexOf('if ($OracleActive) { git -C $wt checkout $CodeBase -- $AcceptanceTestPath')
-$idxStage = $lib.IndexOf('# Stage, then SECRET-SCAN before committing')
+# #1074: anchor the staging point on the CODE THAT STAGES, not on the comment above it. The old
+# anchor was a comment string, so rewording that comment silently broke this ordering lock -- an
+# ordering property must be pinned to the statement it orders.
+$idxStage = $lib.IndexOf('$addOut = (git -C $wt add -A')
 $idxTests = $lib.IndexOf('[2/5] Running pytest')
 Assert-True (($idxRestore -gt 0) -and ($idxStage -gt 0) -and ($idxRestore -lt $idxStage)) 'W8 [kill] the restore runs BEFORE staging/commit (the merged candidate keeps the original oracle)'
 Assert-True (($idxRestore -gt 0) -and ($idxTests -gt 0) -and ($idxRestore -lt $idxTests)) 'W9 [kill] the restore runs BEFORE the [2/5] test gate (every candidate is judged by the byte-identical oracle)'

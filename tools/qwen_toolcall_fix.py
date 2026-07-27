@@ -148,18 +148,29 @@ def salvage_tool_calls(content):
             if calls:
                 return ("hermes", calls)
 
-        # 3) Native Qwen3-Coder XML left in content
-        blocks = re.findall(r"<function=([^>\s]+)>(.*?)</function>", content, re.S)
+        # 3) Native Qwen3-Coder XML left in content.
+        # The separator after `function` / `parameter` is `[=/]`, not just `=`.
+        # Measured 2026-07-19 (#991): the 30B emitted `<function/read>` - a SLASH -
+        # nine times across the B4 flashcards job, severing every attempt. The parameter
+        # tag in the same emissions was correct (`<parameter=filePath>`), so only the
+        # function separator was observed corrupted; `parameter` is widened alongside it
+        # as a precaution against the same substitution, since `[=/]` matches exactly one
+        # separator char and cannot mis-parse a real tag name. Closing tags were intact.
+        blocks = re.findall(r"<function[=/]([^>\s]+)>(.*?)</function>", content, re.S)
         if blocks:
             calls = []
             for name, body in blocks:
-                params = dict(re.findall(r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>", body, re.S))
+                params = dict(re.findall(r"<parameter[=/]([^>\s]+)>\s*(.*?)\s*</parameter>", body, re.S))
                 calls.append({"name": name, "arguments": json.dumps(params)})
             if calls:
                 return ("xml", calls)
 
-        # 4) Bare marker with no recoverable function body -> retry signal
-        if "<tool_call>" in content or re.search(r"<function=", content):
+        # 4) Bare marker with no recoverable function body -> retry signal.
+        # Same `[=/]` widening as branch 3: before #991 this guard was `<function=`-only,
+        # so a `<function/...>` that failed to reconstruct was not even FLAGGED as a
+        # marker - it fell through to (None, None) and shipped as prose. That is what made
+        # the severance silent. Now it is at least caught as a bare marker.
+        if "<tool_call>" in content or re.search(r"<function[=/]", content):
             return ("bare-marker", None)
 
         return (None, None)

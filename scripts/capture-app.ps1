@@ -130,6 +130,45 @@ function Find-Edge {
     return $null
 }
 
+# -- Unconditional web-tier Edge teardown (#1027) ------------------------------------------
+# A spawned-PID handle is NOT a sufficient kill key for headless Edge: the launcher exits
+# ~immediately and hands off to a DETACHED worker tree (pinned 2026-06-26 for --screenshot;
+# the CDP arm leaked 8 trees x ~9 msedge each on 2026-07-21 the same way), so a
+# `taskkill /PID <launcher> /T` reaches nothing once the launcher is gone. The reliable join
+# key is the per-capture --user-data-dir: every process in the tree carries it on its command
+# line. Pass 1 kills by that key (normal teardown, silent). Pass 2 re-scans: ANY survivor of
+# a /T /F kill is a teardown failure -- fail-loud into the tier log, kill again. A backstop,
+# never a gate: the capture verdict is already decided when this runs, and nothing here may
+# throw past the finally. Last, remove the profile dir (retried: Edge releases its file locks
+# a beat after death); a still-locked dir is logged and left, never a capture failure.
+function Stop-EdgeCapture {
+    param([string[]]$ProfileDirs)
+    foreach ($dir in $ProfileDirs) {
+        if (-not $dir) { continue }
+        for ($pass = 1; $pass -le 2; $pass++) {
+            $procs = @()
+            try {
+                $procs = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction Stop |
+                    Where-Object { $_.CommandLine -and $_.CommandLine.Contains($dir) })
+            } catch { }
+            if ($procs.Count -eq 0) { break }
+            if ($pass -eq 2) {
+                Write-Tier web "LEAK-DETECTED: $($procs.Count) msedge process(es) survived teardown (user-data-dir $dir) -- killing again"
+            }
+            foreach ($p in $procs) { try { & taskkill.exe /PID $p.ProcessId /T /F *> $null } catch {} }
+            Start-Sleep -Milliseconds 300
+        }
+        if (Test-Path $dir) {
+            $removed = $false
+            foreach ($try in 1..3) {
+                try { Remove-Item -Path $dir -Recurse -Force -ErrorAction Stop; $removed = $true; break }
+                catch { Start-Sleep -Milliseconds 500 }
+            }
+            if (-not $removed) { Write-Tier web "cleanup: could not remove profile dir $dir -- left behind (still locked)" }
+        }
+    }
+}
+
 # -- Resolve the app's real server entry, if one exists (#772) -----------------------------
 function Find-WebServerEntry {
     param([string]$Root, [string]$IndexHtml)
@@ -302,6 +341,10 @@ if (-not $resolvedExe) {
             Write-Tier web "SKIP: msedge.exe not found"
         } else {
             $edgeProfile = Join-Path ([System.IO.Path]::GetTempPath()) ("edge-capture-" + [guid]::NewGuid().ToString('N'))
+            # The CDP helper gets its OWN profile dir (Edge locks a user-data-dir per instance,
+            # and both arms may run in one capture when the helper fails). The ps1 owns BOTH
+            # names so the finally's teardown cannot depend on the helper's fate (#1027).
+            $cdpProfile = Join-Path ([System.IO.Path]::GetTempPath()) ("edge-capture-" + [guid]::NewGuid().ToString('N') + "-cdp")
             $uri = "file:///" + ($indexHtml -replace '\\', '/')   # static-page fallback
             $srvProc = $null
             $serveInfo = Find-WebServerEntry -Root $AppDir -IndexHtml $indexHtml
@@ -362,7 +405,7 @@ if (-not $resolvedExe) {
                 if ($node -and (Test-Path $cdpScript)) {
                     try {
                         & $node.Source $cdpScript --url $uri --out $OutPng --console-out $sidecar `
-                            --app-dir $AppDir --timeout-ms ($WebTimeoutSec * 1000) *> $null
+                            --app-dir $AppDir --timeout-ms ($WebTimeoutSec * 1000) --profile-dir $cdpProfile *> $null
                         if ($LASTEXITCODE -eq 0 -and (Test-Path $OutPng) -and (Get-Item $OutPng).Length -gt 100) {
                             $m = [System.IO.File]::ReadAllBytes($OutPng) | Select-Object -First 4
                             if ($m.Count -ge 4 -and $m[0] -eq 0x89 -and $m[1] -eq 0x50 -and $m[2] -eq 0x4E -and $m[3] -eq 0x47) {
@@ -424,6 +467,9 @@ if (-not $resolvedExe) {
                 if ($srvProc -and -not $srvProc.HasExited) {
                     try { & taskkill.exe /PID $srvProc.Id /T /F *> $null } catch {}
                 }
+                # Nor its Edge (#1027): both arms' trees and profile dirs die here too,
+                # whatever branch got us here -- success, fallback, throw, helper crash.
+                Stop-EdgeCapture -ProfileDirs @($edgeProfile, $cdpProfile)
             }
         }
     }

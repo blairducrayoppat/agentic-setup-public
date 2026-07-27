@@ -19,7 +19,7 @@ only forwards requests to it. Listens on 8099 (>=8081 per the agent-layer rule).
 Run:   python qwen-proxy.py        # then point the client baseURL at :8099/v3
 Env:   OVMS_BASE (default http://127.0.0.1:8000)   PROXY_PORT (default 8099)
 """
-import json, os, time, urllib.request, urllib.error
+import json, os, sys, re, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from qwen_toolcall_fix import xmlify_history, salvage_tool_calls, strip_trailing_tool_marker
 
@@ -83,9 +83,32 @@ def _fix_response(obj):
                 msg["content"] = ""
                 ch["finish_reason"] = "tool_calls"
             else:
+                # FAIL-LOUD on a probable SEVERANCE (#991). salvage found no call, yet the
+                # content still carries a tool-call marker -> the model was TRYING to call a
+                # tool in a form we cannot reconstruct. Before this, that shipped silently as
+                # prose and the agent loop read it as "the model chose to stop" - which is how
+                # a one-character `<function/read>` corruption voided a whole battery night
+                # without leaving an error. We cannot rescue an unknown form, but it must
+                # never be silent again: emit a distinctive stderr line so a severed run is
+                # visible in the log rather than scored as a clean finish. New corruption
+                # forms surface HERE instead of as an unexplained no-op.
+                if _SEVERANCE_MARKER.search(content):
+                    sys.stderr.write(
+                        "[qwen-proxy] SEVERANCE: finish=stop with an unreconstructable "
+                        "tool-call marker in content (kind=%r, %d chars) - the model was "
+                        "calling a tool in a form salvage could not parse; shipping as prose. "
+                        "First 200 chars: %r\n" % (kind, len(content), content[:200])
+                    )
+                    sys.stderr.flush()
                 msg["content"] = strip_trailing_tool_marker(content)
         ch["message"] = msg
     return obj
+
+
+#: A tool-call attempt the salvager could not turn into a call. Deliberately BROADER than
+#: the salvager's own patterns: it must catch corruption forms salvage cannot parse yet
+#: (that is the whole point of a fail-loud), so it matches the tag STEMS, any separator.
+_SEVERANCE_MARKER = re.compile(r"<tool_call>|<function[=/\s>]|<parameter[=/\s>]")
 
 
 def _sse(obj, include_usage=False):

@@ -119,9 +119,16 @@ try {
     # The Python scaffold has SUBDIRS (app/, tests/) -> proves Copy-ScaffoldInto recurses + preserves structure.
     $seededPy = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $tmp)
     Assert-True ($seededPy -contains 'pyproject.toml') 'C4 python: seeds pyproject.toml'
-    Assert-True (Test-Path (Join-Path $tmp 'app\core.py')) 'C4 python: nested app/core.py lands (recursive copy preserves subdirs)'
-    Assert-True (Test-Path (Join-Path $tmp 'tests\test_core.py')) 'C4 python: nested tests/test_core.py lands'
-    Assert-Contains (Get-Content (Join-Path $tmp 'app\core.py') -Raw) 'def summarize' 'C5 python: the seeded core carries the placeholder fn the coder extends'
+    Assert-True (Test-Path (Join-Path $tmp 'app\__init__.py')) 'C4 python: nested app/__init__.py lands (recursive copy preserves subdirs)'
+    Assert-True (Test-Path (Join-Path $tmp 'tests\test_smoke.py')) 'C4 python: nested tests/test_smoke.py lands'
+    # #1048: the python seed is NEUTRAL -- it proves the toolchain and asserts NO product logic. The
+    # old app/core.py placeholder (def summarize) shipped dead into every build: its own seeded test
+    # kept it referenced, so only the jury ever saw it (green-quality band B, three straight B4 runs).
+    Assert-True (-not (Test-Path (Join-Path $tmp 'app\core.py'))) 'C5 [kill] python seeds NO app/core.py domain placeholder (#1048: it shipped dead into every build)'
+    $smoke = Get-Content (Join-Path $tmp 'tests\test_smoke.py') -Raw
+    Assert-Contains $smoke 'import app' 'C5 python: the seeded smoke test imports the package (the toolchain proof)'
+    Assert-Contains $smoke 'tmp_path'   'C5b python: the seeded tests model tmp_path-isolated data, never a repo-root store (#1036 d)'
+    Assert-True (-not ($smoke -match 'summarize')) 'C5c [kill] no summarize residue in the seeded tests'
     $seededPs = @(Copy-ScaffoldInto -Scaffold 'powershell' -Worktree $tmp)
     Assert-True ($seededPs -contains 'AppModule.psm1') 'C6 powershell: seeds the .psm1 module'
     Assert-True ($seededPs -contains 'AppModule.psd1') 'C6 powershell: seeds the manifest'
@@ -169,18 +176,18 @@ try {
     New-Item -ItemType Directory -Force $tmpCp | Out-Null
     $seededCp = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $tmpCp -PackageName 'flashcard_app')
     Assert-True (Test-Path (Join-Path $tmpCp 'flashcard_app\__init__.py')) 'C12 canonical: the package seeds under the contract name (flashcard_app/__init__.py lands)'
-    Assert-True (Test-Path (Join-Path $tmpCp 'flashcard_app\core.py'))     'C12 canonical: the placeholder core seeds INSIDE the canonical package'
+    Assert-True (Test-Path (Join-Path $tmpCp 'tests\test_smoke.py'))       'C12 canonical: the neutral smoke test seeds beside the canonical package'
     Assert-True (-not (Test-Path (Join-Path $tmpCp 'app')))                'C12 [kill] NO generic app/ twin is seeded (the B4 duplicate-tree shape)'
     # EXACTLY ONE top-level package: the canonical dir, and no other seeded dir carrying an __init__.py.
     $topPkgs = @(Get-ChildItem -LiteralPath $tmpCp -Directory | Where-Object { Test-Path (Join-Path $_.FullName '__init__.py') })
     Assert-Eq 1 $topPkgs.Count 'C12 [kill] a scaffolded job carries EXACTLY ONE top-level package'
     Assert-Eq 'flashcard_app' $topPkgs[0].Name 'C12 canonical: ...and it is the contract-named one'
     # The seeded references FOLLOW the rename (no stale app.* import/config leakage).
-    Assert-Contains (Get-Content (Join-Path $tmpCp 'tests\test_core.py') -Raw) 'from flashcard_app.core import summarize' 'C12 canonical: the seeded test imports the canonical package'
+    Assert-Contains (Get-Content (Join-Path $tmpCp 'tests\test_smoke.py') -Raw) 'import flashcard_app' 'C12 canonical: the seeded smoke test imports the canonical package (the rename follows into the import line)'
     $pyprojCp = Get-Content (Join-Path $tmpCp 'pyproject.toml') -Raw
     Assert-Contains $pyprojCp 'name = "flashcard_app"'    'C12 canonical: pyproject project name follows'
     Assert-Contains $pyprojCp '"flashcard_app*"'          'C12 canonical: pyproject package discovery follows'
-    $staleApp = [regex]::IsMatch(((Get-Content (Join-Path $tmpCp 'tests\test_core.py') -Raw) + $pyprojCp + (Get-Content (Join-Path $tmpCp 'README.md') -Raw) + (Get-Content (Join-Path $tmpCp 'flashcard_app\__init__.py') -Raw)), '\bapp\b')
+    $staleApp = [regex]::IsMatch(((Get-Content (Join-Path $tmpCp 'tests\test_smoke.py') -Raw) + $pyprojCp + (Get-Content (Join-Path $tmpCp 'README.md') -Raw) + (Get-Content (Join-Path $tmpCp 'flashcard_app\__init__.py') -Raw)), '\bapp\b')
     Assert-True (-not $staleApp) 'C12 [kill] NO standalone-token ''app'' survives in any seeded text file (no stale template leakage)'
     # The seeded __init__ stays LAZY (docstring + version, no eager submodule imports) -- one broken
     # submodule must not fail the whole package at import time.
@@ -199,6 +206,126 @@ try {
     Assert-True (($seededWs2 -contains 'index.html') -and -not (Test-Path (Join-Path $tmpWs2 'flashcard_app'))) 'C14 non-python scaffold ignores -PackageName (nothing to rename; byte-identical seed)'
 } finally {
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+}
+
+# ----------------------------------------------------------------------------
+Section 'Hygiene locks: the python seed is neutral, green out of the box, and tmp-path-isolated (#1036/#1048)'
+# Three mechanical rules, each with a negative ([kill]) proof via the injectable -ScaffoldRoot:
+#   NEUTRAL : seeded package modules define NO functions/classes -- a def/class in the seed IS a
+#             domain placeholder (#1048's summarize survived into every shipped tree because its
+#             own seeded test kept it referenced, so dead-code tooling saw live code).
+#   ISOLATED: running the seeded tests leaves the seeded tree byte-identical -- test data goes
+#             under pytest's tmp_path, never a repo-root store (#1036 d).
+#   CLEAN   : the seeded set equals the COMMITTED reference list -- disk litter in the scaffold
+#             source (cache dirs from a stray tool run) never rides into a coder baseline.
+function Get-SeededDomainDefs {
+    # Every def/class in the seeded PACKAGE modules (tests/ excluded: test functions are the
+    # toolchain proof, not product logic -- the #1048 finding was package-side dead code).
+    param([Parameter(Mandatory)][string]$Root)
+    $hits = New-Object System.Collections.ArrayList
+    foreach ($py in Get-ChildItem -LiteralPath $Root -Recurse -Filter *.py -File) {
+        if ($py.FullName -match '[\\/]tests[\\/]') { continue }
+        foreach ($m in [regex]::Matches((Get-Content -LiteralPath $py.FullName -Raw), '(?m)^\s*(?:def|class)\s+(\w+)')) {
+            [void]$hits.Add($py.Name + ':' + $m.Groups[1].Value)
+        }
+    }
+    return ,@($hits)
+}
+function Get-TreeFingerprint {
+    # Path+hash of every file under $Root, excluding runner byproducts (pytest/hypothesis caches,
+    # __pycache__). Sorted, so two fingerprints compare as one string.
+    param([Parameter(Mandatory)][string]$Root)
+    $lines = @(Get-ChildItem -LiteralPath $Root -Recurse -File |
+        Where-Object { $_.FullName -notmatch '[\\/](\.pytest_cache|__pycache__|\.hypothesis)[\\/]' } |
+        Sort-Object FullName |
+        ForEach-Object { $_.FullName.Substring($Root.Length) + '|' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
+    return ($lines -join "`n")
+}
+$tmpH = Join-Path ([System.IO.Path]::GetTempPath()) ('fleet-scaffold-hygiene-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force $tmpH | Out-Null
+try {
+    $wtH = Join-Path $tmpH 'fresh-seed'
+    New-Item -ItemType Directory -Force $wtH | Out-Null
+    $null = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $wtH)
+
+    # H2: the neutral-seed detector over a fresh seed. (No @() re-wrap: the function's unary
+    # comma already returns a real array, same consumption idiom as Get-ProjectEcosystem.)
+    $defs = Get-SeededDomainDefs -Root $wtH
+    Assert-Eq 0 $defs.Count ('H2 [kill] the seeded package ships ZERO def/class (neutral seed; found: ' + ($defs -join ', ') + ')')
+
+    # H7: the seeded set EQUALS the committed reference list (git index truth) -- catches any
+    # litter class the Copy-ScaffoldInto filter does not name: an on-disk extra in the source
+    # fails loud here instead of riding silently into every coder baseline.
+    $committedH = @(git -C (Split-Path $PSScriptRoot -Parent) ls-files -- 'build-infra/python/reference' |
+        ForEach-Object { ($_ -replace '^build-infra/python/reference/', '') -replace '/', '\' } | Sort-Object)
+    $seededNormH = @(@(Copy-ScaffoldInto -Scaffold 'python' -Worktree (New-Item -ItemType Directory -Force (Join-Path $tmpH 'set-check')).FullName) |
+        ForEach-Object { $_ -replace '/', '\' } | Sort-Object)
+    Assert-Eq ($committedH -join ';') ($seededNormH -join ';') 'H7 [kill] the seeded file set EQUALS the committed reference list (nothing extra rides in from the source dir)'
+
+    # H1 + H3 drive the FLEET'S OWN pytest command form (Invoke-CandidateBuild's gate). uv missing
+    # is a FAIL, never a skip: the fleet gate itself cannot run without it.
+    $gateCmd = 'uv run --no-project --with pytest --with hypothesis pytest -q'
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $before = Get-TreeFingerprint -Root $wtH
+        $r = Invoke-WithTimeout -CommandLine $gateCmd -WorkDir $wtH -TimeoutSec 300
+        Assert-True ((-not $r.TimedOut) -and ($r.ExitCode -eq 0)) 'H1 [kill] a fresh python seed is GREEN out of the box under the fleet gate command'
+        Assert-True ($r.Output -match '(?m)\b\d+ passed\b') 'H1b ...and tests actually RAN (a hollow exit-0 with zero tests would prove nothing)'
+        Assert-True ($before -ceq (Get-TreeFingerprint -Root $wtH)) 'H3 [kill] the seeded tests leave the tree byte-identical (tmp_path-isolated; no repo-root data store)'
+
+        # H1c: the CANONICAL -PackageName form -- the form production plan-graph jobs actually
+        # dispatch -- is identically green out of the box under the same gate command.
+        $wtHC = Join-Path $tmpH 'fresh-seed-canonical'
+        New-Item -ItemType Directory -Force $wtHC | Out-Null
+        $null = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $wtHC -PackageName 'flashcard_app')
+        $rc = Invoke-WithTimeout -CommandLine $gateCmd -WorkDir $wtHC -TimeoutSec 300
+        Assert-True ((-not $rc.TimedOut) -and ($rc.ExitCode -eq 0)) 'H1c [kill] the canonical -PackageName seed is GREEN out of the box under the fleet gate command'
+        Assert-True ($rc.Output -match '(?m)\b\d+ passed\b') 'H1c ...with tests actually running in the canonical form too'
+
+        # H5 (negative): a seeded test that writes into the repo tree IS caught by the purity check.
+        $rootLeak = Join-Path $tmpH 'root-leak'
+        New-Item -ItemType Directory -Force $rootLeak | Out-Null
+        Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'build-infra\python') -Destination (Join-Path $rootLeak 'python') -Recurse -Force
+        Add-Content -LiteralPath (Join-Path $rootLeak 'python\reference\tests\test_smoke.py') -Value "`n`ndef test_leaks_into_the_repo():`n    with open('leaked_store.json', 'w') as f:`n        f.write('leak')`n"
+        $wtLeak = Join-Path $tmpH 'seed-leak'
+        New-Item -ItemType Directory -Force $wtLeak | Out-Null
+        $null = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $wtLeak -ScaffoldRoot $rootLeak)
+        $beforeLeak = Get-TreeFingerprint -Root $wtLeak
+        $null = Invoke-WithTimeout -CommandLine $gateCmd -WorkDir $wtLeak -TimeoutSec 300
+        Assert-True ($beforeLeak -cne (Get-TreeFingerprint -Root $wtLeak)) 'H5 [kill] a seeded test writing a repo-root store IS flagged by the tree-purity check'
+    } else {
+        _fail 'H1/H1b/H3/H5: uv is not on PATH -- the out-of-box gate proof cannot run (fail-loud, never a silent skip)'
+    }
+
+    # H4 (negative): reintroduce #1048's domain placeholder via the injectable ScaffoldRoot -> flagged.
+    $rootBad = Join-Path $tmpH 'root-domain'
+    New-Item -ItemType Directory -Force $rootBad | Out-Null
+    Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'build-infra\python') -Destination (Join-Path $rootBad 'python') -Recurse -Force
+    Set-Content -LiteralPath (Join-Path $rootBad 'python\reference\app\core.py') -Value "def summarize(numbers):`n    return {'count': len(numbers)}`n" -Encoding utf8NoBOM
+    $wtBad = Join-Path $tmpH 'seed-domain'
+    New-Item -ItemType Directory -Force $wtBad | Out-Null
+    $null = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $wtBad -ScaffoldRoot $rootBad)
+    $defsBad = Get-SeededDomainDefs -Root $wtBad
+    Assert-True (($defsBad.Count -gt 0) -and (($defsBad -join ',') -match 'summarize')) 'H4 [kill] a reintroduced domain placeholder (def summarize) IS flagged by the neutral-seed detector'
+
+    # H6 (negative): planted source litter is NOT seeded (the Copy-ScaffoldInto litter guard holds).
+    $rootLit = Join-Path $tmpH 'root-litter'
+    New-Item -ItemType Directory -Force $rootLit | Out-Null
+    Copy-Item -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'build-infra\python') -Destination (Join-Path $rootLit 'python') -Recurse -Force
+    New-Item -ItemType Directory -Force (Join-Path $rootLit 'python\reference\app\__pycache__') | Out-Null
+    Set-Content -LiteralPath (Join-Path $rootLit 'python\reference\app\__pycache__\junk.cpython-312.pyc') -Value 'junk'
+    New-Item -ItemType Directory -Force (Join-Path $rootLit 'python\reference\.pytest_cache') | Out-Null
+    Set-Content -LiteralPath (Join-Path $rootLit 'python\reference\.pytest_cache\CACHEDIR.TAG') -Value 'Signature: 8a477f597d28d172789f06886806bc55'
+    New-Item -ItemType Directory -Force (Join-Path $rootLit 'python\reference\.hypothesis\examples') | Out-Null
+    Set-Content -LiteralPath (Join-Path $rootLit 'python\reference\.hypothesis\examples\e1') -Value 'x'
+    $wtLit = Join-Path $tmpH 'seed-litter'
+    New-Item -ItemType Directory -Force $wtLit | Out-Null
+    $seededLit = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $wtLit -ScaffoldRoot $rootLit)
+    $litterSeeded = (@($seededLit) -match '__pycache__|\.pytest_cache|\.hypothesis').Count -gt 0 -or
+        (Test-Path (Join-Path $wtLit 'app\__pycache__')) -or (Test-Path (Join-Path $wtLit '.pytest_cache')) -or (Test-Path (Join-Path $wtLit '.hypothesis'))
+    Assert-True (-not $litterSeeded) 'H6 [kill] planted source litter (__pycache__/.pytest_cache/.hypothesis) is NOT seeded (the litter guard holds)'
+    Assert-Eq 4 (@($seededLit)).Count 'H6 ...and the litter-planted source still seeds exactly the 4 real files'
+} finally {
+    if (Test-Path $tmpH) { Remove-Item -Recurse -Force $tmpH -ErrorAction SilentlyContinue }
 }
 
 # ----------------------------------------------------------------------------

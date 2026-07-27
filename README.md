@@ -7,39 +7,17 @@ from the integrated GPU, drives it with a terminal coding agent, dispatches auto
 overnight coding runs through a supervised fleet, and exposes every one of those
 capabilities behind a single text menu a non-developer can operate.
 
-**&#9654; The BlarAI vision film (66 seconds):**
-
-https://github.com/user-attachments/assets/9ffd473b-93e5-4763-a9ec-e12ac6afa10c
-
 It is deliberately **PowerShell-first, Windows-native, single-operator**. There is no
 container runtime, no orchestration cluster, no second machine. Everything below is
 tuned to the one hard constraint that governs the whole design.
 
-> **PowerShell 7+ (pwsh) only.** All scripts, the scheduled tasks, and the fleet run
-> under PowerShell 7 — the production runtime. Windows PowerShell 5.1 is **not
-> supported**: the scripts are UTF-8 without a byte-order mark, which 5.1's ANSI-default
-> parser mis-tokenizes.
-
-## Recent enhancements (as of July 2026)
-
-Recent work has focused on making the autonomous overnight coding fleet *fail honestly*,
-so an operator waking up to a run report can trust what it says.
-
-- **The fleet fails loud, never silent.** A failed `git` capture — a worktree that would
-  not create, an add or commit that errored — is now surfaced as an *errored* task
-  carrying git's own message, never silently misreported as "the coder produced no
-  output." A capture fault is also no longer terminal for best-of-N sampling, so one bad
-  attempt does not sink an otherwise-good run.
-- **"No change needed" is a first-class outcome.** The best-of-N retry loop no longer
-  demands a diff when the correct answer is to change nothing — it recognizes a genuine
-  no-op as success instead of retrying against an impossible expectation.
-- **Neutral, lock-verified scaffolding.** New-project scaffolding was made
-  language-neutral with a litter filter, backed by a verify suite of more than a hundred
-  locked assertions so a regression in the out-of-box template fails loudly rather than
-  drifting in unnoticed.
-- **Memory-strand containment.** A crash in a run's postlude can no longer strand the
-  resident model in memory — the single ~31 GB pool is protected against the failure mode
-  that previously left a multi-gigabyte model orphaned after a bad run.
+> **PowerShell 7+ (pwsh) only.** Every `scripts/*.ps1`, the scheduled tasks, and the fleet
+> run under PowerShell 7 — the production runtime. Windows PowerShell 5.1 is **not
+> supported**: many scripts are UTF-8 (no BOM) with non-ASCII punctuation (em-dashes,
+> arrows) that 5.1's ANSI-default parser mis-tokenizes, and re-punctuating ~37 scripts for
+> a parser nothing here uses would churn history for no benefit. Do not add 5.1 to any
+> verify matrix; if a specific file must be 5.1-parseable for an external tool, add a BOM to
+> that one file. (#785 decision (b), 2026-07-10.)
 
 ## The one constraint everything follows from
 

@@ -50,7 +50,143 @@ $NightDir    = "$AgenticRoot\state\battery\night-$Stamp"
 New-Item -ItemType Directory -Force $NightDir | Out-Null
 Start-Transcript -Path "$NightDir\launcher.log" -Force | Out-Null
 
-function Write-Log([string]$msg) { Write-Output "[$(Get-Date -Format HH:mm:ss)] $msg" }
+# AO lifecycle ownership (2026-07-20). The night that boots an AO must also stop it:
+# three paths bring one up (this preflight, the runner's per-job AoReensurer, the swap
+# driver's swap-back relaunch after EVERY job) and none tore it down, so the last
+# relaunch of the night held the resident 14B - 11.63 GB, measured - until the operator
+# killed it by hand. See ao-ownership-lib.ps1 for the night-scoped ownership model and
+# why a per-PID claim cannot work (the swap driver replaces the process mid-night).
+. (Join-Path $PSScriptRoot 'ao-ownership-lib.ps1')
+$AoOwnerSentinel   = Get-AoOwnerSentinelPath -AgenticRoot $AgenticRoot
+$StopAssistantPath = Join-Path $PSScriptRoot 'stop-assistant.ps1'
+$AoOwnedByThisNight = $false
+
+# ---- admission provenance (2026-07-20) --------------------------------------
+# Every night must record WHICH ADMISSION PATH it took and WHO BOOTED THE AO, in its
+# own night dir, without inference. It could not before: Ensure-AoHeadless wrote
+# $NightDir\ao-boot.log ONLY inside its `if (-not $aoUp)` branch, so a night admitted
+# via the #784 probe (which RESTORES the AO itself) took the `else` branch and left no
+# boot log at all -- while FIELD_NOTES.md tells the reader to "check the prior night's
+# dir for ao-boot.log to see which topology it ran under".
+# The 2026-07-19 night is exactly that hole, and it was the A/B night: nights 07-16,
+# 07-17 and 07-18 each have an ao-boot.log; 07-19 has none. It WAS probe-admitted --
+# recoverable now only from two file mtimes in a DIFFERENT directory
+# (state/fleet-runs/start-llm.log at 23:01 showing the probe's real 30B load, and
+# probe-ao-reboot.log at 23:03 showing its AO restore). Worse, the probe's own
+# decision lines were invisible too: every Write-Log inside Test-NightAdmission went
+# into that function's return value (the Write-Output defect above), so the memory
+# numbers, the probe exit code and the AO restore were all swallowed together.
+# Same defect class as the leak: something happens and nothing records that it did.
+$script:AoBootSource      = 'not-booted'   # preflight-boot | probe-restore | already-up-preexisting
+$script:AdmissionPath     = 'not-evaluated'
+$script:AdmissionSamples  = @()
+$script:AdmissionAttempts = 0
+$script:ProbeRan          = $false
+$script:ProbeExitCode     = $null
+$script:ProbeOutcome      = ''
+$script:StaleClaimReclaimed = $null
+$script:ReclaimReason     = 'not-run'   # no-ao | claim-without-ao | stale-claim | unowned-ao | current-night
+
+function Add-AdmissionSample([double]$Avail, [double]$Projected, [bool]$AoUp, [string]$Stage) {
+    # Assignment only -- NOTHING here may emit to the success stream. These helpers are
+    # called from inside value-returning functions, and a stray emission would land in
+    # the caller's return value: the exact defect that killed the gate.
+    $script:AdmissionSamples += ,([ordered]@{
+        at = (Get-Date).ToUniversalTime().ToString('o')
+        available_gib = [math]::Round($Avail, 2)
+        projected_gib = [math]::Round($Projected, 2)
+        ao_up = $AoUp
+        stage = $Stage
+    })
+}
+
+function Write-AoBootProvenance([string]$Line) {
+    # ao-boot.log is written on EVERY path now, not just when this script boots the AO,
+    # so its ABSENCE means "the night never reached preflight" rather than the
+    # ambiguous "either it was already up or nobody recorded it". boot_launcher_detached
+    # opens the same file in APPEND mode, so a header written here survives the boot.
+    try {
+        Add-Content -Path "$NightDir\ao-boot.log" -Encoding utf8 `
+            -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Line)
+    } catch { }
+}
+
+function Write-AdmissionRecord([string]$Outcome) {
+    # The night's provenance, machine-readable, in the night dir. Answers "what topology
+    # did this night run under, and how was it admitted?" from the night directory alone.
+    # Written on the admitted path AND on both skip paths, so a night that never ran
+    # still says why. Never throws: provenance must not be able to sink a night.
+    $record = [ordered]@{
+        schema  = 'battery-admission/v1'
+        night   = $Stamp
+        outcome = $Outcome
+        admission_path = $script:AdmissionPath
+        attempts = $script:AdmissionAttempts
+        gate = [ordered]@{ lean_gate_gib = $LEAN_GATE_GIB; probe_floor_gib = $PROBE_FLOOR_GIB }
+        samples = @($script:AdmissionSamples)
+        probe = [ordered]@{
+            ran = $script:ProbeRan
+            exit_code = $script:ProbeExitCode
+            outcome = $script:ProbeOutcome
+        }
+        ao = [ordered]@{
+            boot_source = $script:AoBootSource
+            owned_by_this_night = $AoOwnedByThisNight
+            stale_claim_reclaimed = $script:StaleClaimReclaimed
+            preflight_reclaim = $script:ReclaimReason
+            boot_log = 'ao-boot.log'
+        }
+        written_utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    try {
+        $record | ConvertTo-Json -Depth 6 | Set-Content "$NightDir\admission.json" -Encoding utf8
+        Write-Log ("admission provenance: path={0} ao-boot-source={1} probe-ran={2} -> admission.json" -f `
+            $script:AdmissionPath, $script:AoBootSource, $script:ProbeRan)
+    } catch {
+        Write-Log "WARNING: could not write admission.json ($($_.Exception.Message)) - provenance is on the transcript only."
+    }
+}
+
+# Write-Host, NOT Write-Output (2026-07-20 fix). Write-Output writes to the SUCCESS
+# stream, so a Write-Log call inside a VALUE-RETURNING function was captured into that
+# function's return value instead of the transcript. Measured consequence: every
+# `lean preflight:` line was swallowed (no night dir has ever logged a GiB number),
+# and worse, Test-NightAdmission returned @("<log string>", $false) - a 2-element
+# array, which PowerShell coerces TRUE - so `while (-not (Test-NightAdmission))` was
+# ALWAYS false and the whole admission gate + 30-min retry + 04:00 skip was dead code.
+# Write-Host bypasses the success stream (it cannot pollute a return value) and is
+# still captured by Start-Transcript, so the log lines land where they always should
+# have. verify-battery-ao-lifecycle.ps1 A6/B1 lock this shut.
+function Write-Log([string]$msg) { Write-Host "[$(Get-Date -Format HH:mm:ss)] $msg" }
+
+# A skipped night must not be SILENT. Both 04:00 skip paths used to `exit 0` having
+# written only the launcher transcript, so state/battery/MORNING-REPORT.md still held
+# the PREVIOUS night's result - the operator's morning read reported a night that never
+# ran as if it had. That mattered little while the admission gate was dead code (it
+# could never fire); resurrecting the gate makes this path reachable, so it now stamps
+# its own report. Fail-loud (a control that degrades quietly is worse than none).
+function Write-SkipReport([string]$reason) {
+    $body = @(
+        # ${Stamp} braces are REQUIRED before a colon: PowerShell reads `$Stamp:` as a
+        # scope/drive qualifier (like $env:) and fails to parse the whole file.
+        "# M2 battery — night ${Stamp}: SKIPPED",
+        "",
+        "## !! THE BATTERY DID NOT RUN TONIGHT !!",
+        "",
+        $reason,
+        "",
+        "No jobs were dispatched and no scorecards exist for this night. This is NOT",
+        "counted as a pass and NOT a burned attempt - the campaign counters are unchanged.",
+        "Launcher transcript: $NightDir\launcher.log"
+    ) -join "`n"
+    try {
+        Set-Content "$NightDir\MORNING-REPORT.md" $body
+        Set-Content "$AgenticRoot\state\battery\MORNING-REPORT.md" $body
+        Write-Log "skip report written to state\battery\MORNING-REPORT.md (the morning read shows the skip, not last night's stale result)."
+    } catch {
+        Write-Log "WARNING: could not write the skip report ($($_.Exception.Message)) - the skip is on the transcript only."
+    }
+}
 
 # ---- 0. elevation check (#756) ------------------------------------------------
 # The BlarAI launcher SELF-ELEVATES when not admin (ShellExecute -> a UAC "Python"
@@ -131,6 +267,9 @@ if (-not $Now) {
     while (Test-DispatchBusy) {
         if ((Get-Date) -gt $cutoff) {
             Write-Log "Guard never cleared by 04:00 — skipping tonight (not counted as a pass)."
+            Write-SkipReport "A coding dispatch held the coder port (:8000) continuously from 23:00 to 04:00, so the battery never had the box to itself. It waited on 30-minute retries and then stood down rather than clobber a run in flight."
+            $script:AdmissionPath = 'dispatch-busy'
+            Write-AdmissionRecord 'skipped-dispatch-busy'
             Stop-Transcript | Out-Null; exit 0
         }
         Write-Log "guard: retrying in 30 min."
@@ -153,6 +292,47 @@ Write-Log ("tonight's jobs: " + ($jobs -join ", "))
 # Stale cancel file from a prior manual stop must not kill the first job.
 $cancel = "$AgenticRoot\state\fleet-swap\cancel"
 if (Test-Path $cancel) { Remove-Item $cancel -Force; Write-Log "cleared stale cancel file." }
+
+# LEG B - preflight reclaim (2026-07-20). Clear the :5001 slot before anything measures
+# memory. Reclaim it HERE: before the task-settings and budget checks, and well before
+# Measure-SwapHeadroom, so the freed RAM has settled by the time the admission gate reads
+# Available. This is the leg that makes the fix structural rather than vigilance - Leg A
+# below can be skipped by a kill -9, but the slot is re-examined every night regardless.
+#
+# The trigger is the SLOT, not a sentinel (review finding): reclaiming only sentinel-owned
+# AOs missed everything nothing ever claimed - a hand-run probe restore, an operator
+# session, a night that died before claiming - and the resurrected gate turns that miss
+# into a LOST night, because an unowned resident AO fails the fast path (Projected =
+# Available + 8.0 ~= 14 GiB < 20.5) AND the probe floor (raw Available ~= 6 GiB < 15.0).
+# See ao-ownership-lib.ps1's Invoke-AoPreflightReclaim for why this is safe.
+# Scoped to the scheduled night: under -Now a human is at the keyboard and owns the
+# box (the standing -Now posture - verify-battery-probe-admission.ps1 S5).
+if (-not $Now) {
+    try {
+        # The launcher observes the slot; the library decides whether to stop. Keeping the
+        # detection here means ao-ownership-lib.ps1 never grows a second process detector.
+        $aoHeld = [bool](Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue)
+        $reclaim = Invoke-AoPreflightReclaim -SentinelPath $AoOwnerSentinel -CurrentNight $Stamp `
+            -AoPresent $aoHeld -BlarAiRepo $BlarRoot -StopAssistantPath $StopAssistantPath -Log ${function:Write-Log}
+        if ($reclaim) {
+            $script:ReclaimReason = [string]$reclaim.Reason
+            if ($reclaim.Reclaimed) { $script:StaleClaimReclaimed = [string]$reclaim.ClaimedNight }
+        }
+    } catch {
+        Write-Log "ao-ownership: preflight reclaim errored ($($_.Exception.Message)) - non-fatal, continuing the night."
+    }
+
+    # CLAIM HERE, not after admission (same review finding). The #784 probe runs DURING
+    # admission and its always-restore discipline boots an AO; claiming only after
+    # admission left that AO unowned for the entire retry window, so a night killed
+    # mid-admission leaked it with no sentinel at all. Claiming before the measurement
+    # means the night owns the :5001 SLOT from preflight onward, whoever fills it.
+    $null = Set-AoOwner -SentinelPath $AoOwnerSentinel -Night $Stamp -OwnerPid $PID
+    $AoOwnedByThisNight = $true
+    Write-Log "ao-ownership: night $Stamp CLAIMED the :5001 slot (sentinel $AoOwnerSentinel) before the admission measurement; whatever ends up holding it is torn down at end of night."
+} else {
+    Write-Log "ao-ownership: manual (-Now) run - NOT reclaiming and NOT claiming (the operator owns the box in daylight)."
+}
 
 # #833 task-settings conformance: the scheduled task's OWN ExecutionTimeLimit must still
 # DOMINATE the runner's per-job budgets (the durable control for the 2026-07-11 PT10H
@@ -263,7 +443,37 @@ function Get-ProjectedSwapHeadroomGiB {
 }
 $LEAN_GATE_GIB   = 20.5   # fast-path projection gate: swap gate 20.0 (#777, 2026-07-09) + 0.5 margin
 $PROBE_FLOOR_GIB = 15.0   # #784: below this Available, too starved to even probe (sanity, not prediction)
-$LEAN_SAFE_PROCS = @('firefox', 'OneDrive')
+# Apps the night MAY force-stop to make room. Every entry must restart clean with no
+# operator data at risk: browsers restore their session, OneDrive re-syncs, chat/media
+# clients are stateless. (LA standing process authority, codified 2026-07-09. BROADENED
+# 2026-07-20: the original two-app list still let Chrome / Edge / Slack / Teams block a
+# night — the identical "I forgot to close it" failure firefox was already covered for.)
+$LEAN_SAFE_PROCS = @(
+    'firefox', 'OneDrive',
+    'msedge', 'chrome', 'brave', 'opera', 'vivaldi',
+    'Slack', 'Teams', 'ms-teams', 'Discord', 'Spotify', 'WhatsApp', 'Telegram', 'Steam',
+    # WINWORD added 2026-07-20 on the LA's explicit instruction: he runs Word with AutoSave
+    # to cloud ON, so a force-stop does not cost him the document, and he does not want a
+    # night skipped because Word was left open. Word's own AutoRecover is the second net.
+    # EXCEL / POWERPNT deliberately NOT added — the same AutoSave reasoning probably applies
+    # but has not been confirmed for them, and guessing with someone's spreadsheet is not ours
+    # to do. Adding them is a one-line change once confirmed.
+    'WINWORD'
+)
+
+# NEVER lean these: they can hold UNSAVED operator work with no cloud AutoSave behind it,
+# and a force-stop DESTROYS it. A night that skips because one of these is resident is the
+# CORRECT outcome — losing the operator's work to buy one battery run is never the right
+# trade. Named explicitly so a later session broadening the safe list cannot quietly add
+# one; the guard below has teeth. (Editors/IDEs especially: they hold unsaved buffers.)
+$LEAN_NEVER_PROCS = @(
+    'EXCEL', 'POWERPNT', 'OUTLOOK', 'ONENOTE', 'Acrobat', 'AcroRd32',
+    'Code', 'devenv', 'notepad', 'notepad++', 'sublime_text', 'pycharm64', 'idea64'
+)
+$__leanOverlap = @($LEAN_SAFE_PROCS | Where-Object { $LEAN_NEVER_PROCS -contains $_ })
+if ($__leanOverlap.Count -gt 0) {
+    throw "lean safe-list contains a never-lean process (would destroy unsaved work): $($__leanOverlap -join ', ')"
+}
 
 # Measure the post-unload headroom, leaning the restartable apps if the first projection is
 # short; returns @{ Avail; Projected } POST-lean. No probe, no block — the admission/-Now
@@ -272,19 +482,45 @@ function Measure-SwapHeadroom {
     $aoNow = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
     $h = Get-ProjectedSwapHeadroomGiB -AoUp $aoNow
     Write-Log ("lean preflight: available {0:N1} GiB, projected post-unload {1:N1} GiB (fast-path gate {2} GiB)" -f $h.Avail, $h.Projected, $LEAN_GATE_GIB)
-    if ($h.Projected -ge $LEAN_GATE_GIB) { return $h }
+    Add-AdmissionSample $h.Avail $h.Projected ([bool]$aoNow) 'initial'
+    # LEAN UNCONDITIONALLY at the START of every night (LA instruction 2026-07-20) rather
+    # than only when the projection already looks short. The night runs at 23:00 with the
+    # operator asleep and every safe-list entry restores itself, so the cost is nil — and it
+    # takes the threshold arithmetic OUT of the path that decides whether the night happens
+    # at all. A night must never be lost to an app someone forgot to close.
+    $stopped = 0
     foreach ($p in $LEAN_SAFE_PROCS) {
         $procs = Get-Process -Name $p -ErrorAction SilentlyContinue
         if ($procs) {
-            Write-Log "lean preflight: headroom short — stopping $p ($(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1GB | ForEach-Object { '{0:N1}' -f $_ }) GB resident, restartable)."
+            $gb = ($procs | Measure-Object WorkingSet64 -Sum).Sum / 1GB
+            Write-Log ("lean preflight: stopping {0} ({1:N1} GB resident, restartable)." -f $p, $gb)
             $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            $stopped++
         }
     }
-    Start-Sleep -Seconds 20   # let the working sets actually return
-    $aoNow2 = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
-    $h2 = Get-ProjectedSwapHeadroomGiB -AoUp $aoNow2
-    Write-Log ("lean preflight: post-lean available {0:N1} GiB, projected {1:N1} GiB" -f $h2.Avail, $h2.Projected)
-    return $h2
+    if ($stopped -gt 0) {
+        Start-Sleep -Seconds 20   # let the working sets actually return
+        $aoNow2 = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
+        $h = Get-ProjectedSwapHeadroomGiB -AoUp $aoNow2
+        Write-Log ("lean preflight: post-lean available {0:N1} GiB, projected {1:N1} GiB ({2} app(s) stopped)" -f $h.Avail, $h.Projected, $stopped)
+        Add-AdmissionSample $h.Avail $h.Projected ([bool]$aoNow2) 'post-lean'
+    } else {
+        Write-Log "lean preflight: nothing to lean — no restartable app was running."
+    }
+    # Still short? Name the never-lean holders. Turns a silent skip into an actionable
+    # morning line ("WINWORD held 0.6 GiB and was deliberately left alone") instead of an
+    # unexplained one. Assignment + Write-Log (Write-Host) ONLY — nothing here may reach the
+    # success stream or it pollutes this function's return value (the #987 defect).
+    if ($h.Projected -lt $LEAN_GATE_GIB) {
+        $held = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $LEAN_NEVER_PROCS -contains $_.ProcessName } |
+            Group-Object ProcessName |
+            ForEach-Object { '{0} ({1:N1} GiB)' -f $_.Name, (($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1GB) })
+        if ($held.Count -gt 0) {
+            Write-Log ("lean preflight: still short — these were NOT auto-closed because they can hold unsaved work: {0}" -f ($held -join ', '))
+        }
+    }
+    return $h
 }
 
 # AO headless on :5001 (production env — no debug vars). Boot via the SAME tested detached
@@ -297,13 +533,26 @@ function Measure-SwapHeadroom {
 # boot must NOT abort the night. Called at preflight AND after a successful probe (which restores
 # the AO — the runner expects it up at start).
 function Ensure-AoHeadless {
+    # $Context names WHICH call site this is, so ao-boot.log records not just "the AO was
+    # up" but who put it there: the post-probe call can only find it up because the probe
+    # restored it.
+    param([string]$Context = 'preflight')
     $aoUp = Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue
     if (-not $aoUp) {
         Write-Log "booting the AO headless (detached)..."
+        $script:AoBootSource = 'preflight-boot'
+        Write-AoBootProvenance "AO DOWN at the $Context check - this launcher is booting it (boot_launcher_detached, production, detached). Boot output follows."
         $bootPy = 'import sys; from pathlib import Path; from tools.dispatch_harness.battery import boot_launcher_detached; boot_launcher_detached(Path(sys.argv[1]), Path(sys.argv[2]))'
         Push-Location $BlarRoot
         try {
-            & $Python -c $bootPy $BlarRoot "$NightDir\ao-boot.log"
+            # Route the boot command's own output through Write-Log rather than letting it
+            # fall to the success stream. Ensure-AoHeadless is called FROM INSIDE
+            # Test-NightAdmission (the post-probe re-verify), so a bare native call here
+            # would land its stdout in that function's return value -- the same
+            # array-instead-of-bool shape that killed the admission gate. Nothing is lost:
+            # the boot's real log is the file passed as its second argument.
+            & $Python -c $bootPy $BlarRoot "$NightDir\ao-boot.log" 2>&1 |
+                ForEach-Object { Write-Log "ao-boot: $_" }
         } finally { Pop-Location }
         $deadline = (Get-Date).AddSeconds(240)   # a cold 14B load can exceed 2 min
         while (-not (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
@@ -314,19 +563,35 @@ function Ensure-AoHeadless {
             Start-Sleep -Seconds 3
         }
         if (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue) { Write-Log "AO up." }
-    } else { Write-Log "AO already up on :5001 — the runner's per-job AoReensurer verifies its mTLS health before each job and re-boots on cert-drift." }
+    } else {
+        Write-Log "AO already up on :5001 — the runner's per-job AoReensurer verifies its mTLS health before each job and re-boots on cert-drift."
+        # The ELSE branch used to record NOTHING. Attribute the AO instead of leaving the
+        # night dir silent: after a successful probe the AO can only be up because the
+        # probe restored it, so that path is named rather than inferred.
+        if ($script:AoBootSource -eq 'not-booted') {
+            $script:AoBootSource = if ($Context -eq 'post-probe') { 'probe-restore' } else { 'already-up-preexisting' }
+        }
+        Write-AoBootProvenance ("AO ALREADY UP at the $Context check - not booted by this launcher. Attributed to: {0}." -f $script:AoBootSource)
+    }
 }
 
 # ONE admission decision: $true to ADMIT (run tonight), $false to RETRY (rejoin the wait loop).
 # Fast path first; then the #784 probe in the marginal band. Only ever called under NON-$Now.
 function Test-NightAdmission {
+    # Every statement added here is an ASSIGNMENT to a $script: variable. Nothing in this
+    # function may emit to the success stream -- an emission is captured into the return
+    # value and turns the boolean into a truthy array, which is precisely how this gate
+    # came to be dead code. verify-battery-ao-lifecycle.ps1 B1 locks the return type.
+    $script:AdmissionAttempts++
     $h = Measure-SwapHeadroom
     if ($h.Projected -ge $LEAN_GATE_GIB) {
         Write-Log ("lean preflight: fast path — projected {0:N1} GiB clears the {1} GiB gate." -f $h.Projected, $LEAN_GATE_GIB)
+        $script:AdmissionPath = 'fast-path'
         return $true
     }
     if ($h.Avail -lt $PROBE_FLOOR_GIB) {
         Write-Log ("lean preflight: available {0:N1} GiB below the probe floor {1} GiB — too starved to probe; retrying." -f $h.Avail, $PROBE_FLOOR_GIB)
+        $script:AdmissionPath = 'below-probe-floor'
         return $false
     }
     Write-Log ("lean preflight: projected {0:N1} GiB short of {1} but available {2:N1} GiB >= probe floor {3} — PROBING a real 30B load (#784; ends the dead band #777 exposed)." -f $h.Projected, $LEAN_GATE_GIB, $h.Avail, $PROBE_FLOOR_GIB)
@@ -338,12 +603,19 @@ function Test-NightAdmission {
         $probeExit = $LASTEXITCODE
     } finally { Pop-Location }
     Write-Log "probe: exit $probeExit -- $probeOut"
+    $script:ProbeRan = $true
+    $script:ProbeExitCode = $probeExit
+    $script:ProbeOutcome = $probeOut
     if ($probeExit -eq 0) {
         Write-Log "probe: the 30B loaded outside any job (exit 0) — ADMITTING the night."
-        Ensure-AoHeadless   # the probe restored the AO; re-verify + re-boot if needed (non-fatal)
+        $script:AdmissionPath = 'probe-admitted'
+        # -Context 'post-probe' is what lets ao-boot.log attribute an already-up AO to the
+        # probe's restore instead of leaving the night dir silent (the 2026-07-19 hole).
+        Ensure-AoHeadless -Context 'post-probe'   # the probe restored the AO; re-verify + re-boot if needed (non-fatal)
         return $true
     }
     Write-Log "probe: did NOT admit (exit $probeExit) — rejoining the 30-min retry loop."
+    $script:AdmissionPath = 'probe-refused'
     return $false
 }
 
@@ -352,6 +624,20 @@ if (-not $Now) {
     while (-not (Test-NightAdmission)) {
         if ((Get-Date) -gt $cutoffLean) {
             Write-Log "lean preflight: never admitted by 04:00 — skipping tonight (not counted as a pass; NOT a burned attempt)."
+            Write-SkipReport "The box never had enough free memory for the 30B coder model. From 23:00 to 04:00 the admission gate re-measured every 30 minutes (and probed a real load whenever available memory cleared the $PROBE_FLOOR_GIB GiB floor) and never cleared, so the battery stood down rather than run jobs that would stall. Something large was resident all night - check what was holding RAM (see the 'lean preflight:' lines in the transcript for the measured numbers)."
+            Write-AdmissionRecord 'skipped-memory'
+            # The night claimed the slot at preflight, so it must release it even when it
+            # never ran: the #784 probe's always-restore may have left an AO resident
+            # during the retry window, and leaving it would starve tomorrow night the same
+            # way it starved this one. Same guard and same non-fatal posture as Leg A.
+            if ($AoOwnedByThisNight) {
+                try {
+                    $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRoot `
+                        -StopAssistantPath $StopAssistantPath -Context "skipped night $Stamp (never admitted)" -Log ${function:Write-Log}
+                } catch {
+                    Write-Log "ao-ownership: skip-path teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
+                }
+            }
             Stop-Transcript | Out-Null; exit 0
         }
         Write-Log "lean preflight: retrying in 30 min."
@@ -362,9 +648,16 @@ if (-not $Now) {
     # Manual/supervised runs have a human watching — measure + warn, never block, never probe.
     $h = Measure-SwapHeadroom
     Write-Log ("manual (-Now): available {0:N1} GiB, projected {1:N1} GiB (fast-path gate {2}); NOT blocking, NOT probing." -f $h.Avail, $h.Projected, $LEAN_GATE_GIB)
+    $script:AdmissionPath = 'manual-now'
 }
 
 Ensure-AoHeadless
+
+# Provenance BEFORE the run, not after: a night tree-killed mid-run (the PT10H
+# ExecutionTimeLimit class) still leaves a night dir that says how it was admitted and
+# who booted the AO. Writing it only at the end would lose exactly the nights whose
+# provenance is most worth having.
+Write-AdmissionRecord 'admitted'
 
 # Fresh sandbox repos: archive last night's (rename — zero deletion), re-init.
 $cards = Get-ChildItem "$BlarRoot\evals\battery\B*.json"
@@ -421,6 +714,19 @@ if (Get-Process -Name ovms -ErrorAction SilentlyContinue) {
 }
 
 # ---- 5. morning report + campaign accounting ---------------------------------
+# #1045: the whole postlude runs inside a try so that a throw here CANNOT skip the
+# end-of-night AO teardown at LEG A below. Ordering is unchanged and deliberate - the
+# teardown still runs after the report, so a teardown problem cannot cost the night its
+# scorecards. What changed is that the reverse is now also true: a postlude problem
+# cannot cost the night its RAM. On 2026-07-22 a single terminating error here (an
+# empty-array unroll, fixed above) skipped the teardown and left a 12.54 GB resident 14B
+# for ~50 minutes - reopening the exact failure the #987 ownership model closed. A
+# control a crash can jump over is not a control on the path that matters, so this
+# containment is deliberately BROADER than the one bug: it catches the NEXT unknown
+# throw too. Fail-loud, never silent, and $runnerExit is untouched - a completed night
+# stays a completed night even if its report could not be written.
+$__postludeError = $null
+try {
 $scorecards = Get-ChildItem "$NightDir\scorecards" -Filter "*.json" -ErrorAction SilentlyContinue
 $lines = @("# M2 battery — night $Stamp", "",
            "jobs requested: $($jobs -join ', ')  |  runner exit: $runnerExit", "")
@@ -461,7 +767,12 @@ $falseDone = $verdicts.Values | Where-Object { $_ -eq "FALSE-DONE" }
 if ($falseDone) { $lines = @("## !! FALSE-DONE DETECTED — RED ALERT !!", "") + $lines }
 if ($TaskSettingsDrift) { $lines = @("## !! BATTERY TASK-SETTINGS DRIFT (#833) — $TaskSettingsDrift", "") + $lines }
 if ($BudgetDrift) { $lines = @("## !! BATTERY BUDGET INCOHERENCE (#790) — $BudgetDrift", "") + $lines }
-$fullPass = ($jobs | Where-Object { -not $verdicts.ContainsKey($_) }).Count -eq 0
+# @() is load-bearing: ao-ownership-lib.ps1 (dot-sourced at :59, #987) sets
+# StrictMode Latest at caller scope, so on a COMPLETE night this pipeline yields
+# $null and a bare .Count is a TERMINATING error — which killed the postlude
+# (no banking, no morning report) on the first complete night after #987
+# (night-20260720, runner exit 0 then TerminatingError).
+$fullPass = @($jobs | Where-Object { -not $verdicts.ContainsKey($_) }).Count -eq 0
 # #904 (LA-directed trim, 2026-07-15): the campaign config may FREEZE pass banking.
 # The nightly set was cut to a lean diagnostic; a clean lean night must NOT bank a
 # "pass" of the closed baseline 6-job campaign — that would silently change what a
@@ -486,7 +797,13 @@ $bankingFrozen = ($camp.PSObject.Properties.Name -contains 'pass_banking_frozen'
 if ($bankingFrozen) {
     $lines += ""; $lines += "campaign: pass banking FROZEN at $($camp.completed_passes)/$($camp.target_full_passes) (#904 trim closed the baseline set; a lean night is a diagnostic, never a pass)."
 } elseif ($fullPass -and $runnerExit -eq 0) {
-    $baselineJobs = if ($camp.PSObject.Properties.Name -contains 'baseline_jobs') { @($camp.baseline_jobs) } else { @() }
+    # #1045: the @() wraps the WHOLE conditional, not the inner value. An empty array
+    # returned from an `if` is UNROLLED on assignment, so `... else { @() }` yields $null,
+    # and $null.Count is a TERMINATING error under the StrictMode ao-ownership-lib.ps1
+    # leaks at :59. That is what crashed the 2026-07-22 B1 postlude - and only for a SIDE
+    # config, since the default campaign always has baseline_jobs and never reaches the
+    # else. Correct form already in-repo at fleet-lib.ps1:2450.
+    $baselineJobs = @(if ($camp.PSObject.Properties.Name -contains 'baseline_jobs') { $camp.baseline_jobs } else { @() })
     $isBaselineNight = ($baselineJobs.Count -eq 0) -or (-not (Compare-Object @($jobs) $baselineJobs))
     $nightClass = if ($isBaselineNight) { 'FULL' } else { 'LEAN' }
     if ($nightClass -eq 'FULL') {
@@ -515,6 +832,32 @@ if ($camp.completed_passes -ge $camp.target_full_passes) {
     } else {
         Write-Log "side campaign config reached its target — NOT touching the shared scheduled task (scoping fix, 2026-07-09)."
     }
+}
+
+} catch {
+    # LOUD. The night's measurement (scorecards) is already on disk and is unaffected;
+    # what is lost is the report and/or the banking, and that must never be silent.
+    $__postludeError = $_
+    Write-Log "!! POSTLUDE FAILED (#1045): $($_.Exception.Message)"
+    Write-Log "!! line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())"
+    Write-Log "!! scorecards are intact under $NightDir\scorecards - the morning report and/or campaign banking did NOT complete. Continuing to the AO teardown so the 14B is released."
+}
+
+# LEG A - end-of-night teardown (2026-07-20). The night releases the AO it claimed, so
+# the resident 14B does not sit in RAM through the operator's whole morning. Runs AFTER
+# the morning report so a teardown problem can never cost the night its scorecards or
+# its report, and NON-FATALLY so it can never change $runnerExit - a completed night
+# stays a completed night. A failed stop deliberately KEEPS the sentinel, so the next
+# night's Leg B retries the reclaim.
+if ($AoOwnedByThisNight) {
+    try {
+        $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRoot `
+            -StopAssistantPath $StopAssistantPath -Context "end-of-night (night $Stamp)" -Log ${function:Write-Log}
+    } catch {
+        Write-Log "ao-ownership: end-of-night teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
+    }
+} else {
+    Write-Log "ao-ownership: this run claimed no AO (manual -Now run) - leaving the assistant running."
 }
 Stop-Transcript | Out-Null
 exit $runnerExit
