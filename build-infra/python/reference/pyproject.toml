@@ -23,6 +23,6 @@ include = ["app*"]
 testpaths = ["tests"]
 # Make the app package importable under the fleet's gate command -- `uv run --no-project --with
 # pytest pytest`. The console-script `pytest` (unlike `python -m pytest`) does NOT add the project
-# root to sys.path, so `from app.core import ...` in tests/ fails with ModuleNotFoundError without
+# root to sys.path, so `import app` in tests/ fails with ModuleNotFoundError without
 # this. pythonpath (pytest>=7) prepends the root so a flat app/ + tests/ layout imports cleanly.
 pythonpath = ["."]

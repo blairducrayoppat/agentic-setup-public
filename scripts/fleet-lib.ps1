@@ -693,6 +693,12 @@ function Test-IsSamplingTerminal {
     #                          wedged coder; expensive to retry). An EMPTY/UNKNOWN reason is treated as
     #                          ceiling -- the SAFE default (a pre-#740 Run object, or a reason we cannot read,
     #                          must NOT silently become resample-eligible).
+    #   - NoChangeDeclared   : #1049 candidate (b) -- the coder EXPLICITLY declared "NO CHANGE NEEDED"
+    #                          (offered on retry prompts only) after a verified zero-diff attempt. That is
+    #                          an ANSWER, not a slip: a fresh candidate re-asks the same question under the
+    #                          same produce-something pressure, and the measured outcome of that pressure
+    #                          is a manufactured junk diff that MERGES (green gates cannot tell a comment
+    #                          scribble from work -- dispatch-quality-ledger 2026-07-14, waves 2/3).
     # NOT terminal (resample-eligible):
     #   - an IDLE-reason timeout : the coder read a couple files then went silent, making ZERO changes before
     #                          the progress-aware idle breaker (#682) killed it FAST. That is a RANDOM slip --
@@ -701,13 +707,34 @@ function Test-IsSamplingTerminal {
     #                          N=1 and no-op'ing the whole run, while a re-queued fresh attempt merged --
     #                          docs/no-op-diagnosis-2026-07.md). Bounded by the EXISTING MaxCandidates budget
     #                          (no new budget): worst case is N x idle_timeout, then the run parks.
-    # Pure + ASCII; unit-tested without a model (verify-bestofn.ps1 / verify-bestofn-concurrent.ps1).
+    #   - a #1074 CAPTURE FAULT : DELIBERATELY NOT TERMINAL, and this is load-bearing -- do not "fix" it by
+    #                          adding a -GitFailed terminal here. A capture fault is per-CANDIDATE and is
+    #                          frequently a per-candidate SLIP, not a repo-wide verdict: the batch's
+    #                          worktrees are created in a loop (new-agent-task -RunBatch), and a candidate
+    #                          whose `git worktree add` silently failed then runs the whole pipeline
+    #                          against a directory that does not exist -- where `git add -A` returns 128
+    #                          (MEASURED) and every later git read returns 128 too. Making that terminal
+    #                          lets ONE bad workspace stop the entire best-of-N run, where today the run
+    #                          degrades to N-1 candidates and still merges a winner. That is the exact
+    #                          shape of the idle-stall carve-out directly above, and it is a QUALITY
+    #                          regression (fewer chances to merge good work) rather than a safety gain.
+    #                          The fault stays LOUD by every other route -- it disqualifies the candidate
+    #                          (Test-IsCandidateGreen), sinks its rank below every real attempt
+    #                          (Get-CandidateRank), hard-blocks the merge (Test-ShouldMerge), stops the
+    #                          review-FIX loop, and reports ERRORED carrying git's own message -- so
+    #                          nothing is swallowed by letting sampling continue. Cost is bounded by the
+    #                          EXISTING MaxCandidates budget, exactly as the idle carve-out is.
+    # Pure + ASCII; unit-tested without a model (verify-bestofn.ps1 / verify-bestofn-concurrent.ps1 /
+    # verify-nochange-outcome.ps1 / verify-git-capture-honesty.ps1). $NoChangeDeclared defaults $false so
+    # every pre-#1049 caller/test is byte-identical.
     param(
         [bool]$TimedOut,
         [string]$TimeoutReason = '',
-        [bool]$SecretBlocked
+        [bool]$SecretBlocked,
+        [bool]$NoChangeDeclared = $false
     )
     if ($SecretBlocked) { return $true }
+    if ($NoChangeDeclared) { return $true }
     if ($TimedOut) { return ("$TimeoutReason".Trim().ToLower() -ne 'idle') }
     return $false
 }
@@ -1512,6 +1539,14 @@ function Copy-ScaffoldInto {
     # worktree, preserving structure. WinUI's flat layout is unaffected (rel == file name).
     foreach ($f in Get-ChildItem -LiteralPath $ref -Recurse -File) {
         $rel = $f.FullName.Substring($ref.Length).TrimStart('\', '/')
+        # Litter guard (#1048 fix round): the reference tree is copied from DISK, so cache dirs a
+        # stray tool run leaves in the SOURCE (__pycache__ / .pytest_cache / .hypothesis) would
+        # seed into the worktree and be committed by the runner's add -A (the seed ships no
+        # .gitignore). Never run pytest or the gate inside build-infra/<name>/reference -- always
+        # seed into a temp dir first; this filter is the backstop, and verify-scaffold H7 locks
+        # the seeded set to the COMMITTED reference list so litter classes this filter does not
+        # name still fail loud.
+        if ($rel -match '(^|[\\/])(__pycache__|\.pytest_cache|\.hypothesis)([\\/]|$)') { continue }
         $content = $null
         if ($renameApp) {
             # Re-root the package dir in the seeded PATH (app/... -> <pkg>/...) and rewrite the
@@ -1699,12 +1734,16 @@ function Test-ShouldMerge {
         [string]$TestResult   = 'none',    # none | pass | fail
         [string]$VerifyResult = 'none',    # none | pass | fail
         [string]$Verdict      = 'UNCLEAR', # MERGE | FIX FIRST | UNCLEAR
-        [string[]]$Ecosystems = @()
+        [string[]]$Ecosystems = @(),
+        # #1074: the stage->commit CAPTURE step faulted. HARD block -- a `git add` that failed part-way
+        # can leave a PARTIAL commit, and a gate run over a tree we could not capture vouches for
+        # nothing. Defaults $false so every pre-#1074 caller/test is byte-identical.
+        [bool]$GitFailed      = $false
     )
     # HARD blocks - the work itself is bad or unsafe. ABSOLUTE, independent of the LLM review:
-    # no changes to merge, a detected secret, a FAILED test, or a FAILED verify. (A test/verify
-    # FAIL also makes the gates non-green below, so those two are belt-and-suspenders.)
-    if ((-not $HasChanges) -or $SecretBlocked -or ($TestResult -eq 'fail') -or ($VerifyResult -eq 'fail')) {
+    # no changes to merge, a detected secret, a capture fault, a FAILED test, or a FAILED verify.
+    # (A test/verify FAIL also makes the gates non-green below, so those two are belt-and-suspenders.)
+    if ((-not $HasChanges) -or $SecretBlocked -or $GitFailed -or ($TestResult -eq 'fail') -or ($VerifyResult -eq 'fail')) {
         return @{ Merge = $false; Via = '' }
     }
 
@@ -1764,6 +1803,11 @@ function Invoke-BuildWithRetry {
     #   - Retry ONLY when an attempt produced no working-tree changes.
     #   - NEVER retry a timeout (expensive, and usually means the model is genuinely
     #     stuck, not a transient slip).
+    #   - NEVER retry past an explicit "NO CHANGE NEEDED" declaration (#1049 candidate
+    #     (b)): a declaration is an ANSWER, not a failure to comply -- re-running re-asks
+    #     a question the model already answered, and the measured outcome of that
+    #     pressure is a manufactured junk diff (dispatch-quality-ledger 2026-07-14:
+    #     an oracle-file comment scribble, a create-then-delete scratch script).
     #   - Each retry starts from a CLEAN worktree (ResetWorktree) so a partial/garbled
     #     attempt cannot poison the next.
     #   - Never run more than MaxBuildAttempts attempts.
@@ -1776,21 +1820,28 @@ function Invoke-BuildWithRetry {
     #                    worktree? A multi-value result is reduced to its LAST value below.
     #   -ResetWorktree   restores a clean worktree; called BEFORE each retry (not the first).
     #   -OnRetry         optional progress callback; receives the attempt number starting.
+    #   -NoChangeDeclared returns a single [bool]: did the attempt that just ran DECLARE
+    #                    the honest no-change outcome? Consulted ONLY after a no-change
+    #                    attempt (a diff-producing attempt is graded normally). The
+    #                    default { $false } is byte-identical to the pre-#1049 loop.
     # Each scriptblock resolves its free variables ($wt, $Model, ...) against the scope it
     # was DEFINED in (PowerShell lexical scoping), so the caller passes plain closures.
     #
-    # Returns: @{ Run=<last RunAgent result>; Attempts=[int]; ProducedChanges=[bool] }
+    # Returns: @{ Run=<last RunAgent result>; Attempts=[int]; ProducedChanges=[bool];
+    #             NoChangeDeclared=[bool] }
     param(
         [Parameter(Mandatory)][scriptblock]$RunAgent,
         [Parameter(Mandatory)][scriptblock]$ProducedChanges,
         [scriptblock]$ResetWorktree = {},
         [scriptblock]$OnRetry = {},
+        [scriptblock]$NoChangeDeclared = { $false },
         [int]$MaxBuildAttempts = 3
     )
     if ($MaxBuildAttempts -lt 1) { $MaxBuildAttempts = 1 }
     $attempt = 0
     $run = $null
     $changed = $false
+    $declared = $false
     do {
         $attempt++
         if ($attempt -gt 1) {
@@ -1806,8 +1857,120 @@ function Invoke-BuildWithRetry {
         # value so a no-op that also emitted stray output (..., $false) is not misread as a change.
         $cv = & $ProducedChanges
         $changed = [bool](@($cv)[-1])
-    } while (-not $changed -and -not $run.TimedOut -and $attempt -lt $MaxBuildAttempts)
-    return @{ Run = $run; Attempts = $attempt; ProducedChanges = $changed }
+        # #1049: a declaration only matters on a VERIFIED no-change attempt -- with a diff on
+        # disk the declaration is ignored and the gate grades the diff exactly as before.
+        $declared = $false
+        if (-not $changed) { $declared = [bool](@(& $NoChangeDeclared)[-1]) }
+    } while (-not $changed -and -not $declared -and -not $run.TimedOut -and $attempt -lt $MaxBuildAttempts)
+    return @{ Run = $run; Attempts = $attempt; ProducedChanges = $changed; NoChangeDeclared = $declared }
+}
+
+function Test-NoChangeEscapeEnabled {
+    # #1049 kill-switch resolution: the no-change escape is ON by default -- this change lands in its
+    # OWN battery attribution window (the merge IS the A/B flip), so the shipped default is the
+    # behaviour under measurement. Disabled ONLY by an explicit BLARAI_NO_CHANGE_ESCAPE = 0/false/no/
+    # off (the A/B lever + the toggle-off regression proof; the env var reaches Start-Job candidate
+    # children via the inherited process environment). Pure + ASCII; the caller passes
+    # $env:BLARAI_NO_CHANGE_ESCAPE. Unit-tested without a model (verify-nochange-outcome.ps1).
+    param([string]$EnvValue = '')
+    return -not (@('0', 'false', 'no', 'off') -contains "$EnvValue".Trim().ToLower())
+}
+
+function Add-NoChangeEscape {
+    # #1049 candidate (b): give the RETRY prompt an HONEST EXIT. A retry prompt that implicitly
+    # demands a diff GETS a diff -- the measured incidents (dispatch-quality-ledger.md 2026-07-14,
+    # seed run): wave 2 scribbled a comment into the protected oracle file and wave 3 committed-then-
+    # deleted a scratch script, both existing ONLY to satisfy the produced-changes detector. Appended
+    # to RETRY attempts only (attempt >= 2, wired in Invoke-CandidateBuild): attempt 1 keeps the
+    # byte-identical primary prompt, so the escape is offered exactly when the coder has ALREADY
+    # produced one verified no-change attempt -- never as an easy first-attempt exit. ALWAYS preserves
+    # the original prompt verbatim (appended, never replaces). Pure + ASCII; unit-tested without a
+    # model (verify-nochange-outcome.ps1).
+    param([string]$Prompt)
+    return "$Prompt`n`n--- IF THE WORK IS ALREADY DONE (honest no-change outcome) ---`n" +
+        "A previous attempt at this task finished without changing any file. If, after inspecting " +
+        "the project, you conclude the task's requirements are ALREADY fully met by the current " +
+        "code, do NOT invent an edit just to have something to show -- no comment tweaks, no " +
+        "scratch/verification files, no cosmetic changes. Instead reply with one final line in " +
+        "exactly this form and stop WITHOUT editing any file:`n" +
+        "NO CHANGE NEEDED: <one line of evidence naming the file(s)/test(s) that already satisfy the task>`n" +
+        "Declining to edit is a legal, honest answer here. Only use it when the requirements are " +
+        "genuinely met; if anything is missing, build it as asked."
+}
+
+function Get-TextSha256 {
+    # #1049 F1 helper: hex SHA-256 of a string's UTF-8 bytes -- the transcript-anchor identity
+    # (see Get-TranscriptAnchor). Pure + ASCII.
+    param([string]$Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Text"))) -replace '-', '')
+    } finally { $sha.Dispose() }
+}
+
+function Get-TranscriptAnchor {
+    # #1049 F1: fingerprint the transcript BEFORE an attempt so the declaration probe can later
+    # scope itself to ONLY what that attempt wrote. Two facts identify "the file merely GREW":
+    # the recorded Length and the SHA-256 of the text up to it. At probe time, a file at least
+    # that long whose prefix still hashes identically has the current attempt's output as
+    # exactly the text AFTER Length -- the live ACP driver's shape (acp_coder.py appends every
+    # attempt into the one shared $LogPath). Anything else (a shorter file, a rewritten prefix)
+    # means the writer TRUNCATED (the stdin driver's per-attempt shape), and the whole file IS
+    # the current attempt. Length alone would NOT be safe: a truncating writer whose new
+    # transcript is LONGER than the old one passes a length test and a naive slice would cut
+    # mid-line into the current attempt's own text -- the hash is what proves the prefix is
+    # still the OLD attempts' bytes. Text units throughout (Get-Content -Raw), never raw bytes.
+    # Fail-soft empty anchor (= whole-file scope). Unit-tested (verify-nochange-outcome.ps1).
+    param([string]$LogPath)
+    $none = @{ Length = [long]0; Hash = '' }
+    if (-not $LogPath -or -not (Test-Path $LogPath)) { return $none }
+    try {
+        $t = Get-Content $LogPath -Raw -ErrorAction Stop
+        if (-not $t) { return $none }
+        return @{ Length = [long]$t.Length; Hash = (Get-TextSha256 -Text $t) }
+    } catch { return $none }
+}
+
+function Get-NoChangeDeclaration {
+    # #1049 candidate (b): did the coder DECLARE the honest no-change outcome? Reads the attempt's
+    # transcript and returns @{ Declared=[bool]; Evidence=[string] }. STRICT on purpose -- every
+    # degraded path fails CLOSED toward today's behaviour (Declared=$false, the legacy retry
+    # pressure stands): an absent/unreadable/empty log, no marker line, or only the instruction
+    # echo. Two guards distinguish a real declaration from the prompt's own text riding the
+    # transcript: the evidence must be NON-EMPTY, and an evidence beginning with '<' is the
+    # instruction's placeholder ("<one line of evidence ...>"), never a declaration. The LAST
+    # matching line wins (the final reply outranks a mid-session mention). Evidence is bounded to
+    # one line (it is surfaced in the per-task report; the RESULT: line stays fixed-vocabulary so
+    # the driver-side classifier can never misread coder-authored words like "merged").
+    #
+    # -Anchor (#1049 F1, reviewer finding): scope the read to the CURRENT attempt. The live ACP
+    # driver APPENDS all attempts into one shared transcript, so an unscoped probe on attempt 2
+    # could be satisfied by a SPONTANEOUS marker attempt 1 emitted -- an attempt whose prompt
+    # never offered the escape (the offered-gating F1 names). The caller fingerprints the
+    # transcript before each attempt (Get-TranscriptAnchor: Length + prefix SHA-256); the slice
+    # applies ONLY when the file provably merely GREW (still at least Length long AND the prefix
+    # hashes identically) -- then the text after Length is exactly this attempt's output. A
+    # shorter file or a rewritten prefix (the stdin driver truncates per attempt) scopes the
+    # WHOLE file, which is then the current attempt by construction. $null (the default) scopes
+    # the whole file (back-compat for every pre-F1 caller).
+    # Pure-over-a-file + ASCII; unit-tested without a model (verify-nochange-outcome.ps1).
+    param([string]$LogPath, $Anchor = $null)
+    $none = @{ Declared = $false; Evidence = '' }
+    if (-not $LogPath -or -not (Test-Path $LogPath)) { return $none }
+    $text = ''
+    try { $text = Get-Content $LogPath -Raw -ErrorAction Stop } catch { return $none }
+    if (-not $text) { return $none }
+    if ($Anchor -and [long]$Anchor.Length -gt 0 -and $text.Length -ge [long]$Anchor.Length -and
+        ((Get-TextSha256 -Text $text.Substring(0, [int]$Anchor.Length)) -eq "$($Anchor.Hash)")) {
+        $text = $text.Substring([int]$Anchor.Length)
+    }
+    if (-not $text) { return $none }
+    $m = [regex]::Matches($text, '(?im)^[ \t>]*NO CHANGE NEEDED:[ \t]*(?!<)(\S[^\r\n]*)')
+    if ($m.Count -eq 0) { return $none }
+    $ev = $m[$m.Count - 1].Groups[1].Value.Trim()
+    if (-not $ev) { return $none }
+    if ($ev.Length -gt 240) { $ev = $ev.Substring(0, 240) }
+    return @{ Declared = $true; Evidence = $ev }
 }
 
 function Add-CandidateDiversity {
@@ -1838,14 +2001,19 @@ function Get-CandidateRank {
     #   verify:  pass +600  none +300  fail +0      (a building attempt always outranks a non-building one)
     #   test:    pass +200  none +80   fail +0      (a failing test ranks below absent tests)
     #   changes: +20                                 (a real change outranks a no-op of the same gate class)
-    #   flags:   timeout -2000   loop -400   secret -100000  (a secret-blocked attempt is never selectable)
+    #   flags:   timeout -2000   loop -400   git-fault -50000   secret -100000
+    #            (#1074: a capture fault sinks a candidate below every real attempt -- its gate signals
+    #             describe a build the box never captured, so it must never outrank one that IS on disk.
+    #             Above a secret, so that when EVERY candidate faulted one is still selectable and the
+    #             operator gets the git message in the report instead of an empty selection.)
     param(
         [string]$VerifyResult = 'none',
         [string]$TestResult   = 'none',
         [bool]$HasChanges     = $true,
         [bool]$TimedOut       = $false,
         [bool]$SecretBlocked  = $false,
-        [bool]$LoopSuspected  = $false
+        [bool]$LoopSuspected  = $false,
+        [bool]$GitFailed      = $false
     )
     $score = 0
     switch ("$VerifyResult".Trim().ToLower()) { 'pass' { $score += 600 } 'fail' { } default { $score += 300 } }
@@ -1853,6 +2021,7 @@ function Get-CandidateRank {
     if ($HasChanges)    { $score += 20 }
     if ($TimedOut)      { $score -= 2000 }
     if ($LoopSuspected) { $score -= 400 }
+    if ($GitFailed)     { $score -= 50000 }
     if ($SecretBlocked) { $score -= 100000 }
     return $score
 }
@@ -1885,11 +2054,155 @@ function Test-IsCandidateGreen {
         [string]$TestResult   = 'none',
         [bool]$HasChanges     = $false,
         [bool]$TimedOut       = $false,
-        [bool]$SecretBlocked  = $false
+        [bool]$SecretBlocked  = $false,
+        # #1074: a candidate whose stage->commit CAPTURE step faulted is never a winner. Its gate
+        # signals describe a build we could not capture, not a build that passed. Defaults $false so
+        # every pre-#1074 caller/test is byte-identical.
+        [bool]$GitFailed      = $false
     )
-    if ((-not $HasChanges) -or $SecretBlocked -or $TimedOut) { return $false }
+    if ((-not $HasChanges) -or $SecretBlocked -or $TimedOut -or $GitFailed) { return $false }
     if ("$VerifyResult".Trim().ToLower() -ne 'pass') { return $false }
     return ("$TestResult".Trim().ToLower() -ne 'fail')
+}
+
+function Resolve-CommitCapture {
+    # #1074 FAIL-LOUD: classify the stage->commit CAPTURE step of the candidate pipeline from the
+    # git facts the caller OBSERVED, so an infrastructure failure can never be laundered into "the
+    # coder produced nothing." Pure (issues no git command itself) -> unit-testable without a repo.
+    #
+    # WHY THIS EXISTS. Invoke-CandidateBuild used to run `git add -A`, `git commit` and
+    # `rev-list --count` with all three error channels sent to Out-Null and no exit-code check, so a
+    # failed capture was INDISTINGUISHABLE from an honest no-op -- and the fail-open direction was
+    # "the coder produced nothing". That reading then skipped the tests + verify steps, so the
+    # candidate could never win the gate, and best-of-N resampled a fault it could not see. This sits
+    # inside the instrument that MEASURES coder capability (40 of 488 reports read `CHANGES: none
+    # made`), which is why it is a security_by_design principle-11 defect, not a cosmetic one.
+    #
+    # THE DISCRIMINATION -- getting this right IS the fix. `git commit` legitimately exits NON-ZERO on
+    # the honest "nothing to commit, working tree clean", so an exit code alone cannot separate an
+    # honest no-op from a real failure, and matching git's English would be locale- and version-
+    # fragile. So the caller reads the INDEX instead and only ATTEMPTS a commit when the index
+    # actually HOLDS staged paths (leaving $CommitExitCode $null otherwise). With content staged, a
+    # non-zero commit is UNAMBIGUOUSLY a real failure -- a rejecting hook, a locked or corrupt index,
+    # a full disk, a broken identity. The honest no-op never enters the failure channel at all.
+    #
+    # TWO INDEPENDENT DETECTORS, so one missed exit code cannot reopen the hole:
+    #   1. EXIT CODES on add / staged-read / commit / status -- precise, and they carry git's own
+    #      stderr through to the operator report.
+    #   2. The STATE INVARIANT: after a healthy capture the worktree is CLEAN. A DIRTY worktree with
+    #      ZERO commits means work existed and never reached a commit, whatever the cause -- which is
+    #      the measured B4 `add-card` instance (run 20260723-001147-bd: three candidates wrote real
+    #      files, `git status --porcelain` saw them, `rev-list` did not).
+    #      This invariant is ALSO how the pipeline's two "did it produce anything" predicates are
+    #      reconciled. They legitimately measure different things at different moments: the retry
+    #      loop's -ProducedChanges reads the WORKING TREE (correct DURING the build, when nothing is
+    #      committed yet), $hasChanges reads COMMITS (correct AFTER the capture). Unifying them would
+    #      break one of the two. What is not allowed is for them to DISAGREE SILENTLY at this point,
+    #      and that disagreement is exactly `dirty AND no commit` -- now a loud fault.
+    #   The ONE sanctioned dirty-with-no-commit state is a SECRET block, which deliberately unstages
+    #   and parks the work for a human; that is already a loud, first-class outcome.
+    #
+    # DETECTOR ORDER IS LOAD-BEARING. The exit-code detectors run most-specific-cause first, and
+    # `revlist-unreadable` runs LAST among them. A candidate whose workspace was never created
+    # returns 128 from EVERY git read including rev-list, so an early revlist check would reclassify
+    # it away from `add-failed` and the operator would lose the reason that actually names the cause.
+    # A fault that stays loud but starts lying about WHY is close to the original defect wearing a new
+    # label, in an instrument whose whole job is honest attribution. Locked by D4c + U1p.
+    #
+    # AN UNRESOLVABLE BASE IS NOT A CAPTURE FAULT. $CodeBase is not guaranteed to be a SHA -- the
+    # caller falls back to a branch NAME -- so a healthy repo whose branch is `trunk` while the
+    # fallback name is `main` makes `rev-list --count main..HEAD` exit 128 with HEAD fine and the tree
+    # clean (MEASURED). Faulting on that would turn every healthy build in such a repo into a
+    # permanent silent ERRORED: the widen-the-fault inverse of the defect this whole change exists to
+    # fix. So the two are told apart by whether the BASELINE resolves at all:
+    #   base does not resolve      -> a dispatch CONFIGURATION problem, its own reason, NOT a fault
+    #   base resolves, rev-list fails -> this repo's history is unreadable == the real capture fault
+    # Folding them together would produce a loud error naming the wrong cause.
+    #
+    # Returns @{ Failed=[bool]; Reason=<''|add-failed|index-unreadable|commit-failed|status-unreadable|
+    #            revlist-unreadable|base-unresolvable|uncommitted-work|secret-blocked>;
+    #            Error=<operator line carrying git's message>; HasChanges=[bool] }. HasChanges stays
+    #            HONEST (commits exist vs the baseline) even on a fault -- Failed is what blocks the
+    #            merge, so a stale prior commit can never ride out.
+    param(
+        [int]$AddExitCode          = 0,
+        [string]$AddOutput         = '',
+        [int]$StagedReadExitCode   = 0,
+        [string]$StagedReadOutput  = '',
+        [int]$StagedCount          = 0,
+        [bool]$SecretBlocked       = $false,
+        $CommitExitCode            = $null,   # $null = the commit was deliberately NOT attempted
+        [string]$CommitOutput      = '',
+        [int]$CommitCount          = 0,       # rev-list --count <baseline>..HEAD
+        [int]$CommitCountReadExitCode = 0,
+        [string]$CommitCountRaw    = '0',     # the RAW rev-list stdout, so a non-numeric answer is visible
+        [string]$CommitCountReadOutput = '',
+        [int]$StatusReadExitCode   = 0,
+        [string]$StatusReadOutput  = '',
+        [int]$WorktreeDirtyCount   = 0,       # git status --porcelain lines AFTER the capture step
+        # Did `git rev-parse --verify <base>^{commit}` resolve? Defaults $true so every pre-existing
+        # caller/test keeps its exact behaviour; only a caller that actually probed passes $false.
+        [bool]$BaseResolvable      = $true,
+        [string]$BaseRef           = '',
+        [int]$MaxDetailChars       = 600
+    )
+    # With no resolvable baseline the commit COUNT is meaningless, so "did this produce anything"
+    # falls back to the only thing still knowable: did OUR commit succeed this pass. Reporting a
+    # successful commit as "none made" merely because the baseline name was wrong would be this
+    # ticket's own laundering, re-created through the configuration path.
+    $has = if ($BaseResolvable) { ($CommitCount -gt 0) }
+           else { ($null -ne $CommitExitCode) -and ([int]$CommitExitCode -eq 0) }
+    $fmt = {
+        param([string]$What, $Code, [string]$Text)
+        $t = "$Text".Trim()
+        if (-not $t) { $t = '(git printed no message)' }
+        if ($t.Length -gt $MaxDetailChars) { $t = $t.Substring(0, $MaxDetailChars) + ' [truncated]' }
+        "$What failed (git exit $Code): $t"
+    }
+    if ($AddExitCode -ne 0) {
+        return @{ Failed = $true; Reason = 'add-failed'; HasChanges = $has
+                  Error = (& $fmt "git add -A (staging the coder's work)" $AddExitCode $AddOutput) }
+    }
+    if ($StagedReadExitCode -ne 0) {
+        return @{ Failed = $true; Reason = 'index-unreadable'; HasChanges = $has
+                  Error = (& $fmt 'git diff --cached --name-only (reading the staged set)' $StagedReadExitCode $StagedReadOutput) }
+    }
+    if (($null -ne $CommitExitCode) -and ([int]$CommitExitCode -ne 0)) {
+        # Reached ONLY with staged content, so this can never be the honest "nothing to commit".
+        return @{ Failed = $true; Reason = 'commit-failed'; HasChanges = $has
+                  Error = (& $fmt "git commit ($StagedCount path(s) were staged, so this is NOT an empty-commit refusal)" ([int]$CommitExitCode) $CommitOutput) }
+    }
+    if ($StatusReadExitCode -ne 0) {
+        return @{ Failed = $true; Reason = 'status-unreadable'; HasChanges = $has
+                  Error = (& $fmt 'git status --porcelain (confirming the worktree was captured)' $StatusReadExitCode $StatusReadOutput) }
+    }
+    # LAST among the exit-code detectors, deliberately -- see the header. A never-created workspace
+    # fails rev-list too, and it must stay classified by the cause that actually names it.
+    if (($CommitCountReadExitCode -ne 0) -or ("$CommitCountRaw".Trim() -notmatch '^\d+$')) {
+        if (-not $BaseResolvable) {
+            # Not a capture fault: the repo is fine, the BASELINE we were handed is not. Reported so
+            # the operator can fix the dispatch config, but it must never mark the task ERRORED --
+            # a healthy no-op with a mis-set base becoming ERRORED is the inverse regression.
+            return @{ Failed = $false; Reason = 'base-unresolvable'; HasChanges = $has
+                      Error = ("the baseline ref '$BaseRef' does not resolve in this repo, so changes could not be counted against it. " +
+                               "This is a DISPATCH CONFIGURATION problem (a wrong -BaseBranch, or a default branch name this repo does not use), " +
+                               "NOT a failure to capture the coder's work; the capture step itself reported success.") }
+        }
+        # The baseline DOES resolve and rev-list still failed -> this repo's history is unreadable,
+        # which is the real capture fault. Defaulting the count to 0 here is exactly how a branch
+        # holding a real commit gets reported as "none made". Refuse to guess.
+        return @{ Failed = $true; Reason = 'revlist-unreadable'; HasChanges = $has
+                  Error = (& $fmt "git rev-list --count (counting the coder's commits against the RESOLVABLE base '$BaseRef'; answered '$("$CommitCountRaw".Trim())')" $CommitCountReadExitCode $CommitCountReadOutput) }
+    }
+    # A secret block deliberately unstages and PARKS the work in the worktree for a human, so its
+    # dirty-with-no-commit state is expected, already surfaced, and must not read as a capture fault.
+    if ($SecretBlocked) { return @{ Failed = $false; Reason = 'secret-blocked'; HasChanges = $has; Error = '' } }
+    if (($WorktreeDirtyCount -gt 0) -and ($CommitCount -le 0)) {
+        return @{ Failed = $true; Reason = 'uncommitted-work'; HasChanges = $has
+                  Error = ("the worktree holds $WorktreeDirtyCount uncommitted change(s) but NO commit landed on the candidate branch -- the coder's work exists and was not captured. " +
+                           "Every git step reported success, so the cause is upstream of the exit codes; inspect the worktree before trusting any 'no changes' reading of this run.") }
+    }
+    return @{ Failed = $false; Reason = ''; HasChanges = $has; Error = '' }
 }
 
 function Invoke-BestOfN {
@@ -2266,12 +2579,34 @@ function Invoke-CandidateBuild {
     # Inner no-op retry (Invoke-BuildWithRetry): a small/quantized model intermittently produces a NO-OP
     # build; cheap independent re-runs lift ~50% per-attempt to ~85-90%. Never retries a timeout. Each retry
     # starts CLEAN (reset to HEAD == $CodeBase, since no commit has landed yet for this fresh candidate).
+    # #1049 candidate (b): $escape is the state box the three closures below share (they resolve it
+    # lexically). $escape.active flips on the FIRST retry, so attempt 1's prompt AND detection are
+    # byte-identical to legacy; the kill-switch env var is read ONCE here (it reaches Start-Job
+    # candidate children via the inherited environment). With the escape inactive the -NoChangeDeclared
+    # probe short-circuits to $false -- a declaration can only ever be honoured on a prompt that
+    # actually OFFERED the escape (an accidental marker echo on attempt 1 can never terminate the loop).
+    # F1 (reviewer): $escape.anchor is captured by RunAgent BEFORE each attempt so the probe reads
+    # ONLY the current attempt's output -- the live ACP driver APPENDS all attempts into the one
+    # shared $LogPath, and an unscoped probe on attempt 2 could be satisfied by a spontaneous
+    # marker attempt 1 emitted (whose prompt never offered the escape). The anchor (length +
+    # prefix hash, Get-TranscriptAnchor) distinguishes grew-vs-rewritten, so the stdin driver's
+    # per-attempt truncate resolves to whole-file scope even when the new transcript is longer.
+    $escape = @{ active = $false; anchor = $null; enabled = (Test-NoChangeEscapeEnabled -EnvValue $env:BLARAI_NO_CHANGE_ESCAPE) }
     $build = Invoke-BuildWithRetry -MaxBuildAttempts $MaxBuildAttempts `
-        -OnRetry { param($n) Write-Host "  Attempt $($n - 1) produced no changes; retrying ($n/$MaxBuildAttempts) from a clean worktree..." -ForegroundColor Yellow } `
+        -OnRetry { param($n) if ($escape.enabled) { $escape.active = $true }; Write-Host "  Attempt $($n - 1) produced no changes; retrying ($n/$MaxBuildAttempts) from a clean worktree$(if ($escape.active) { ' (no-change escape offered)' })..." -ForegroundColor Yellow } `
         -ResetWorktree { git -C $wt reset --hard HEAD 2>&1 | Out-Null; git -C $wt clean -fd 2>&1 | Out-Null } `
-        -RunAgent { Invoke-CoderDriver -WorkDir $wt -Model $Model -Prompt $AttemptPrompt -LogPath $LogPath -TimeoutSec ($MaxRunMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec -ScriptRoot $ScriptRoot } `
-        -ProducedChanges { (@(git -C $wt status --porcelain 2>$null).Count -gt 0) -or (([int](git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null)) -gt 0) }
+        -RunAgent { $escape.anchor = Get-TranscriptAnchor -LogPath $LogPath; Invoke-CoderDriver -WorkDir $wt -Model $Model -Prompt $(if ($escape.active) { Add-NoChangeEscape -Prompt $AttemptPrompt } else { $AttemptPrompt }) -LogPath $LogPath -TimeoutSec ($MaxRunMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec -ScriptRoot $ScriptRoot } `
+        -ProducedChanges { (@(git -C $wt status --porcelain 2>$null).Count -gt 0) -or (([int](git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null)) -gt 0) } `
+        -NoChangeDeclared { if ($escape.active) { (Get-NoChangeDeclaration -LogPath $LogPath -Anchor $escape.anchor).Declared } else { $false } }
     $run = $build.Run
+    $noChangeDeclared = [bool]$build.NoChangeDeclared
+    $noChangeEvidence = ''
+    if ($noChangeDeclared) {
+        # F1: the evidence read rides the SAME attempt scope the probe fired on -- never an
+        # earlier attempt's accumulated text.
+        $noChangeEvidence = (Get-NoChangeDeclaration -LogPath $LogPath -Anchor $escape.anchor).Evidence
+        Write-Host "  NO CHANGE NEEDED declared by the coder -- honest terminal outcome; retries stopped, no diff manufactured (#1049). Evidence: $noChangeEvidence" -ForegroundColor Yellow
+    }
     if ($run.Error) { Write-Host "  $($run.Error)" -ForegroundColor Red }
     if ($run.TimedOut) {
         $why = switch ($run.TimeoutReason) {
@@ -2317,19 +2652,96 @@ function Invoke-CandidateBuild {
     } catch {
         Write-Host "  test-gate scoping skipped (non-fatal; whole-tree gate stands): $($_.Exception.Message)" -ForegroundColor Yellow
     }
-    # Stage, then SECRET-SCAN before committing (a detected secret never enters history + never merges).
-    git -C $wt add -A 2>&1 | Out-Null
-    $secret = & "$ScriptRoot\secret-scan.ps1" -Repo $wt
-    $secretBlocked = ($secret -and $secret.status -eq 'blocked')
-    if ($secretBlocked) {
-        Write-Host "  SECRET SCAN: BLOCKED - $($secret.detail)" -ForegroundColor Red
-        git -C $wt reset 2>&1 | Out-Null   # unstage; leave the work in the worktree for human review
-    } else {
-        if ($secret.status -eq 'unavailable') { Write-Host "  SECRET SCAN: skipped (gitleaks not installed - run install-gitleaks.ps1)" -ForegroundColor Yellow }
-        else { Write-Host "  SECRET SCAN: clean" -ForegroundColor Green }
-        git -C $wt -c user.email='agent@local' -c user.name='coding-agent' commit -m "agent: $Task" 2>&1 | Out-Null
+    # ---- CAPTURE the coder's work: stage -> SECRET-SCAN -> commit (a detected secret never enters
+    # history + never merges). #1074 FAIL-LOUD: every git command in this step is EXIT-CODE CHECKED
+    # and its stderr KEPT. Before #1074 all three channels were `2>&1 | Out-Null` with no exit check,
+    # so a failed add/commit was indistinguishable from an honest no-op and fell open to "the coder
+    # produced nothing" -- an infrastructure fault laundered into the capability measurement. The
+    # classification (and the reasoning behind the honest-no-op discrimination) lives in the pure
+    # Resolve-CommitCapture; this block's only job is to OBSERVE accurately and hand it the facts.
+    $addOut = (git -C $wt add -A 2>&1 | Out-String); $addRc = $LASTEXITCODE
+    # Read the INDEX, not git's English: the staged set is what tells an honest "nothing to commit"
+    # apart from a real commit failure, so a commit is only ATTEMPTED when something is staged.
+    # STDOUT ONLY for the two reads whose output is COUNTED. git writes warnings and advice to stderr
+    # ("warning: LF will be replaced by CRLF", "warning: ignoring broken ref", ...), and merging those
+    # into the stream would let a DIAGNOSTIC STRING be counted as a staged path or a dirty entry --
+    # which would turn an honest no-op into a false capture fault, the same class of defect as #1074
+    # itself pointed the other way. git's stderr is re-read separately, and only on the error path,
+    # where it is a MESSAGE rather than data. (The add/commit captures below merge freely: their
+    # output is never counted, only reported.)
+    $stagedOut = @(); $stagedRaw = ''; $stagedRc = 0
+    if ($addRc -eq 0) {
+        $stagedOut = @(git -C $wt diff --cached --name-only 2>$null | Where-Object { "$_".Trim() })
+        $stagedRc = $LASTEXITCODE
+        if ($stagedRc -ne 0) { $stagedOut = @(); $stagedRaw = (git -C $wt diff --cached --name-only 2>&1 | Out-String) }
     }
-    $hasChanges = (git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null) -gt 0
+    $commitRc = $null; $commitOut = ''
+    $secret = $null; $secretBlocked = $false
+    if (($addRc -ne 0) -or ($stagedRc -ne 0)) {
+        # FAIL-CLOSED: the index is not in a state we can trust, so nothing is scanned and nothing is
+        # committed. The scan's verdict would be about a stale/empty index, not about this build.
+        $secret = [pscustomobject]@{ status = 'skipped'; count = 0; detail = "the stage step failed, so the staged set was never scanned and nothing was committed" }
+        Write-Host "  SECRET SCAN: NOT RUN - the staging step failed before it (see the CAPTURE FAULT below)." -ForegroundColor Red
+    } else {
+        $secret = & "$ScriptRoot\secret-scan.ps1" -Repo $wt
+        $secretBlocked = ($secret -and $secret.status -eq 'blocked')
+        if ($secretBlocked) {
+            Write-Host "  SECRET SCAN: BLOCKED - $($secret.detail)" -ForegroundColor Red
+            git -C $wt reset 2>&1 | Out-Null   # unstage; leave the work in the worktree for human review
+        } else {
+            if ($secret.status -eq 'unavailable') { Write-Host "  SECRET SCAN: skipped (gitleaks not installed - run install-gitleaks.ps1)" -ForegroundColor Yellow }
+            else { Write-Host "  SECRET SCAN: clean" -ForegroundColor Green }
+            if (@($stagedOut).Count -gt 0) {
+                $commitOut = (git -C $wt -c user.email='agent@local' -c user.name='coding-agent' commit -m "agent: $Task" 2>&1 | Out-String)
+                $commitRc = $LASTEXITCODE
+            }
+            # else: nothing staged == the honest no-op. Skipping the commit keeps that case OUT of the
+            # failure channel entirely, which is what makes a non-zero $commitRc unambiguous above.
+        }
+    }
+    # The THIRD swallowed channel the ticket names. stdout only (this is COUNTED data), exit code
+    # CHECKED, and the value must actually BE a number. An unresolvable base ref makes rev-list fail,
+    # and a bare `else { 0 }` would then report a branch that HOLDS the coder's commit as "none
+    # made" -- the same laundering by a different route, which is why moving this line was never the
+    # same thing as fixing it.
+    $__rl = "$(git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null)".Trim()
+    $rlRc = $LASTEXITCODE
+    $rlRaw = ''
+    $baseResolvable = $true
+    if (($rlRc -ne 0) -or ($__rl -notmatch '^\d+$')) {
+        $rlRaw = (git -C $wt rev-list --count "$CodeBase..HEAD" 2>&1 | Out-String)
+        # Only when the count already failed: is the BASELINE itself resolvable here? $CodeBase is not
+        # guaranteed to be a SHA (the caller falls back to a branch NAME), so an unresolvable base is a
+        # dispatch-config problem on a perfectly healthy repo -- not a failure to capture anything.
+        git -C $wt rev-parse --verify --quiet "$CodeBase^{commit}" 2>&1 | Out-Null
+        $baseResolvable = ($LASTEXITCODE -eq 0)
+    }
+    $commitCount = if ($__rl -match '^\d+$') { [int]$__rl } else { 0 }
+    # The invariant read must stay HERE -- immediately after the commit, BEFORE the [2/5] test and
+    # [3/5] verify steps. Those steps legitimately litter the tree (a python verify leaves
+    # app/__pycache__/), so a status read taken later would turn every healthy python build into a
+    # false capture fault. Locked by verify-git-capture-honesty.ps1 D5f.
+    $dirtyLines = @(git -C $wt status --porcelain 2>$null | Where-Object { "$_".Trim() })   # stdout only -- see above
+    $statusRc = $LASTEXITCODE
+    $statusRaw = ''
+    $dirtyCount = if ($statusRc -eq 0) { $dirtyLines.Count } else { $statusRaw = (git -C $wt status --porcelain 2>&1 | Out-String); 0 }
+    $capture = Resolve-CommitCapture -AddExitCode $addRc -AddOutput $addOut `
+        -StagedReadExitCode $stagedRc -StagedReadOutput $stagedRaw -StagedCount (@($stagedOut).Count) `
+        -SecretBlocked $secretBlocked -CommitExitCode $commitRc -CommitOutput $commitOut `
+        -CommitCount $commitCount -CommitCountReadExitCode $rlRc -CommitCountRaw $__rl -CommitCountReadOutput $rlRaw `
+        -StatusReadExitCode $statusRc -StatusReadOutput $statusRaw `
+        -WorktreeDirtyCount $dirtyCount -BaseResolvable $baseResolvable -BaseRef "$CodeBase"
+    $gitFailed = [bool]$capture.Failed
+    $gitError = "$($capture.Error)"
+    $hasChanges = [bool]$capture.HasChanges
+    if ($gitFailed) {
+        # LOUD: this is an ERRORED task, never an empty build. The work (if any) stays in the worktree.
+        Write-Host "  CAPTURE FAULT ($($capture.Reason)): $gitError" -ForegroundColor Red
+        Write-Host "  This task is ERRORED, not a no-op: the coder's output was NOT captured, so nothing here measures the model." -ForegroundColor Red
+    } elseif ($capture.Reason -eq 'base-unresolvable') {
+        # Loud but NOT a fault: the capture worked, the baseline we were handed does not resolve.
+        Write-Host "  BASELINE UNRESOLVABLE (dispatch config, NOT a capture failure): $gitError" -ForegroundColor Yellow
+    }
     $sha = if ($hasChanges) { "$(git -C $wt rev-parse HEAD 2>$null)".Trim() } else { '' }
     # #771: a stop that landed during generation short-circuits the gate steps (tests + verify) -- the
     # candidate's work is already committed to its branch (reflog-reachable), so it PARKS rather than
@@ -2337,7 +2749,7 @@ function Invoke-CandidateBuild {
     if ([bool](@(& $ShouldCancel)[-1])) { $cancelled = $true }
     # ---- [2/5] Tests (forgiving detection: absence of tests is not failure) ----
     $testResult = 'none'; $testOut = ''
-    if ($hasChanges -and -not $cancelled) {
+    if ($hasChanges -and -not $cancelled -and -not $gitFailed) {   # #1074: never grade a build we could not capture
         if ((Test-Path (Join-Path $wt 'package.json')) -and
             (Select-String -Path (Join-Path $wt 'package.json') -Pattern '"test"\s*:' -Quiet) -and
             ((Test-Path (Join-Path $wt 'node_modules')) -or
@@ -2369,7 +2781,7 @@ function Invoke-CandidateBuild {
     # #771: re-check before the verify step (a stop may have landed during the test run above).
     if (-not $cancelled -and [bool](@(& $ShouldCancel)[-1])) { $cancelled = $true }
     $verifyResult = 'none'; $verifyDetail = ''; $verifyError = ''
-    if ($hasChanges -and -not $cancelled) {
+    if ($hasChanges -and -not $cancelled -and -not $gitFailed) {   # #1074: never grade a build we could not capture
         Write-Host "[3/5] Verifying (build/typecheck/lint)..." -ForegroundColor Cyan
         try {
             $__vpExtra = @{}
@@ -2397,6 +2809,8 @@ function Invoke-CandidateBuild {
         VerifyResult = $verifyResult; TestResult = $testResult; HasChanges = [bool]$hasChanges;
         TimedOut = [bool]$run.TimedOut; SecretBlocked = [bool]$secretBlocked; LoopSuspected = [bool]$anomaly.LoopSuspected;
         Cancelled = [bool]$cancelled;
+        NoChangeDeclared = [bool]$noChangeDeclared; NoChangeEvidence = "$noChangeEvidence";   # #1049 honest no-change outcome
+        GitFailed = [bool]$gitFailed; GitError = "$gitError"; GitFaultReason = "$($capture.Reason)";   # #1074 fail-loud capture step
         SHA = $sha; Run = $run; Secret = $secret; Anomaly = $anomaly; BuildAttempts = $build.Attempts;
         TestError = $testError; VerifyDetail = $verifyDetail; VerifyError = $verifyError;
         AgentLog = $LogPath; LogPath = $LogPath   # AgentLog: the candidate shape; LogPath: the sequential ($BuildTestVerify) callers read this
@@ -2420,6 +2834,8 @@ function ConvertTo-CandidateResult {
         return @{
             Index = $Index; Worktree = $Worktree; Branch = $Branch
             VerifyResult = 'none'; TestResult = 'none'; HasChanges = $false; TimedOut = $false; SecretBlocked = $false; LoopSuspected = $false
+            NoChangeDeclared = $false; NoChangeEvidence = ''
+            GitFailed = $false; GitError = ''; GitFaultReason = ''   # #1074 (a dead job is not a capture fault; VerifyError already names it)
             SHA = ''; BuildAttempts = 0; TestError = ''; VerifyDetail = ''; VerifyError = 'concurrent candidate produced no result (job failed or empty)'; AgentLog = ''
             Run = @{ ExitCode = $null; TimedOut = $false; TimeoutReason = ''; Capped = $false; CappedReason = ''; Seconds = 0; Error = 'job produced no result' }
             Secret = @{ status = 'clean'; detail = '' }
@@ -2431,6 +2847,8 @@ function ConvertTo-CandidateResult {
         Index = $Index; Worktree = $Worktree; Branch = $Branch
         VerifyResult = "$($Raw.VerifyResult)"; TestResult = "$($Raw.TestResult)"; HasChanges = [bool]$Raw.HasChanges
         TimedOut = [bool]$Raw.TimedOut; SecretBlocked = [bool]$Raw.SecretBlocked; LoopSuspected = [bool]$Raw.LoopSuspected
+        NoChangeDeclared = [bool]$Raw.NoChangeDeclared; NoChangeEvidence = "$($Raw.NoChangeEvidence)"   # #1049 (missing on a pre-#1049 raw -> $false/'')
+        GitFailed = [bool]$Raw.GitFailed; GitError = "$($Raw.GitError)"; GitFaultReason = "$($Raw.GitFaultReason)"   # #1074: the capture fault MUST survive the Start-Job CliXml boundary, or the concurrent path silently re-opens the swallow
         SHA = "$($Raw.SHA)"; BuildAttempts = [int]$Raw.BuildAttempts
         TestError = "$($Raw.TestError)"; VerifyDetail = "$($Raw.VerifyDetail)"; VerifyError = "$($Raw.VerifyError)"; AgentLog = "$($Raw.AgentLog)"
         Run = @{

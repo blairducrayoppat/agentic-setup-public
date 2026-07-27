@@ -56,13 +56,17 @@ $nat = Get-Content "$PSScriptRoot\new-agent-task.ps1" -Raw
 # CHAINING assertions (old W11-W15) retire with it: a best-of-N candidate is a FRESH independent sample,
 # so there is no build-fix pass to chain concerns onto.
 Assert-True ([regex]::IsMatch($nat, '(?m)^\s*\$bon\s*=\s*Invoke-BestOfN\b')) 'W1 wiring: the build is driven by best-of-N (Invoke-BestOfN), replacing the serial multi-pass loop'
-Assert-True ([regex]::IsMatch($nat, 'while \(\$hasChanges -and -not \$dispatchCancelled -and \(Test-ShouldRunReview\b')) 'W2 wiring: the review runs in a BOUNDED loop gated by Test-ShouldRunReview (only when gates are not both green) AND skipped on a cancelled dispatch (#771)'
+# #1074: the two guard-list assertions here (W2, W8) pinned the guard list EXACTLY, so ADDING a guard
+# broke them even though every property they lock still held and the loop had become stricter. They now
+# pin the guards they care about while tolerating additional ones -- a lock on "these conditions gate
+# the loop", not on "these are the only conditions that may ever gate it".
+Assert-True ([regex]::IsMatch($nat, 'while \(\$hasChanges -and -not \$dispatchCancelled -and [^\r\n]*\(Test-ShouldRunReview\b')) 'W2 wiring: the review runs in a BOUNDED loop gated by Test-ShouldRunReview (only when gates are not both green) AND skipped on a cancelled dispatch (#771)'
 Assert-True ([regex]::IsMatch($nat, 'Add-ReviewFeedback -Prompt \$Prompt -ReviewConcerns \$reviewFindings')) 'W3 wiring: a FIX-FIRST pass feeds the VERDICT-STRIPPED findings ($reviewFindings) back via Add-ReviewFeedback'
 Assert-True ([regex]::IsMatch($nat, '\$reviewPass\+\+')) 'W4 wiring: each review-feedback pass spends the review budget ($reviewPass++)'
 Assert-True ([regex]::IsMatch($nat, '\$reviewPass -ge \$MaxReviewPasses')) 'W5 wiring: the review-feedback loop is BOUNDED by the separate review budget ($MaxReviewPasses)'
 Assert-True ([regex]::IsMatch($nat, "\`$everFixFirst -and \`$verdict -ne 'MERGE'")) 'W6 wiring: a FIX FIRST verdict is made STICKY before the merge decision (no auto-merge on a later UNCLEAR/timeout)'
 Assert-True ([regex]::IsMatch($nat, '\$reviewFindings = ')) 'W7 wiring: the findings fed back are the verdict-STRIPPED review lines ($reviewFindings), not the verdict-heavy tail'
-Assert-True ([regex]::IsMatch($nat, 'if \(\$secretBlocked -or \$agentTimedOut\) \{ break \}')) 'W8 wiring: a secret/timeout DURING a review-fix pass is TERMINAL -- never refine past it (the retained "never sample/refine past a secret/timeout" posture)'
+Assert-True ([regex]::IsMatch($nat, 'if \(\$secretBlocked -or \$agentTimedOut[^\r\n]*\) \{ break \}')) 'W8 wiring: a secret/timeout DURING a review-fix pass is TERMINAL -- never refine past it (the retained "never sample/refine past a secret/timeout" posture)'
 
 # ----------------------------------------------------------------------------
 Section 'Result'

@@ -209,7 +209,10 @@ Assert-True ([regex]::IsMatch($lib, 'Remove-Item \(Join-Path \$wt \$__rf\)')) 'W
 # candidate keeps a red scratch test / a tampered baseline test, or the gate judges the un-scoped tree.
 $idxOracle  = $lib.IndexOf('if ($OracleActive) { git -C $wt checkout $CodeBase -- $AcceptanceTestPath')
 $idxScope   = $lib.IndexOf('Get-CandidateTestPartition -Worktree $wt -BaseRef $CodeBase')
-$idxStage   = $lib.IndexOf('# Stage, then SECRET-SCAN before committing')
+# #1074: anchor the staging point on the CODE THAT STAGES, not on the comment above it. The old
+# anchor was a comment string, so rewording that comment silently broke this ordering lock -- an
+# ordering property must be pinned to the statement it orders.
+$idxStage   = $lib.IndexOf('$addOut = (git -C $wt add -A')
 $idxTests   = $lib.IndexOf('[2/5] Running pytest')
 Assert-True (($idxOracle -gt 0) -and ($idxScope -gt $idxOracle)) 'W5 [kill] scoping runs AFTER the #690 oracle restore'
 Assert-True (($idxScope -gt 0) -and ($idxStage -gt $idxScope))   'W6 [kill] scoping runs BEFORE staging/commit (the merged candidate keeps baseline tests, drops red scratch)'

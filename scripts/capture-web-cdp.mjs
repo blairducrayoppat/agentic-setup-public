@@ -22,14 +22,19 @@
 // Usage:
 //   node capture-web-cdp.mjs --url <http|file url> --out <png> --console-out <json>
 //                            [--app-dir <dir>] [--edge <path>] [--debug-port <n>]
-//                            [--timeout-ms 30000] [--settle-ms 1200]
+//                            [--timeout-ms 30000] [--settle-ms 1200] [--profile-dir <dir>]
+//
+// --profile-dir: the Edge --user-data-dir this capture may use. The caller should pass it and
+// own the name: it is the one join key every process in the (possibly detached) Edge tree
+// carries, so a caller that owns it can enforce teardown even if this process dies uncleanly
+// (capture-app.ps1 re-sweeps by it in its finally). Default: a self-generated temp dir.
 //
 // The behavior smoke reads an OPTIONAL declared spec from <app-dir>/blarai-smoke.json:
 //   { "click": "<css selector for the primary action>", "expectDelta": "<css selector that must change>" }
 // When absent, a heuristic picks the first visible enabled primary control. The rendered-text
 // `undefined`/`NaN` scan is ALWAYS on and needs no declaration (it is the direct B5 catch).
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -378,19 +383,57 @@ async function run() {
   const spec = readSmokeSpec(appDir);
   const edge = findEdge(typeof args.edge === 'string' ? args.edge : '');
   const port = Number(args['debug-port']) || (await freePort());
-  const profile = path.join(os.tmpdir(), 'edge-cdp-' + Math.random().toString(36).slice(2));
+  const profile = (typeof args['profile-dir'] === 'string' && args['profile-dir'])
+    ? args['profile-dir']
+    : path.join(os.tmpdir(), 'edge-cdp-' + Math.random().toString(36).slice(2));
 
   let child = null;
   let ws = null;
   const consoleEntries = [];
   const pageErrors = [];
+
+  // Teardown is EXIT-SYNCHRONOUS, never scheduled (#1027): the 2026-07-21 leak (8 Edge trees x
+  // ~9 msedge, ~7 cores, 8 profile dirs) had two causes here — `child.kill()` reaches only the
+  // launcher PID while headless Edge re-execs into a DETACHED tree that outlives it, and the
+  // profile rm was scheduled on a setTimeout that a same-tick process.exit() killed before it
+  // ever fired. `process.on('exit')` runs on EVERY exit path (success, failSoft, fatal throw);
+  // only synchronous work survives inside it. If the profile dir will not delete after the
+  // PID-tree kill, something detached still holds it: escalate once to a kill-by-user-data-dir
+  // sweep (the one join key every process in the tree carries), then retry the rm.
+  const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {} };
+  function teardownSync() {
+    try { if (ws) ws.close(); } catch {}
+    if (child && child.pid) {
+      try { spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', timeout: 10000 }); } catch {}
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
+      if (!fs.existsSync(profile)) return;
+      if (attempt === 1) {
+        const key = path.basename(profile);
+        try {
+          spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+            `Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CommandLine -like '*${key}*' } | ForEach-Object { & taskkill.exe /PID $_.ProcessId /T /F } *> $null`,
+          ], { stdio: 'ignore', timeout: 15000 });
+        } catch {}
+      }
+      sleepSync(400);
+    }
+    // Still held after three tries: leave it rather than block exit — the caller re-sweeps by
+    // this same profile-dir key (see --profile-dir above).
+  }
+  process.on('exit', teardownSync);
+
   const failSoft = (reason) => {
     writeSidecar(sidecarPath, { captured: false, error: cleanText(reason, 300), console: consoleEntries, pageErrors, findings: [] });
-    try { if (ws) ws.close(); } catch {}
-    try { if (child && !child.killed) child.kill(); } catch {}
     console.error('capture-web-cdp: ' + reason);
-    process.exit(2);
+    process.exit(2); // teardownSync (exit handler) kills the Edge tree + removes the profile dir
   };
+
+  // A wedged CDP await (Edge stops answering mid-session) previously hung node forever — and
+  // with it the calling ps1, so NO teardown ever ran anywhere. Hard wall-clock cap: the capture
+  // either finishes or fail-softs; every exit runs teardownSync.
+  setTimeout(() => failSoft('hard-deadline watchdog fired (CDP session wedged)'), timeoutMs + 15000);
 
   try {
     child = spawn(edge, [
@@ -482,11 +525,7 @@ async function run() {
       notes,
     });
 
-    try { ws.close(); } catch {}
-    try { if (child && !child.killed) child.kill(); } catch {}
-    // Give Edge a beat to release the profile dir, then best-effort clean it.
-    setTimeout(() => { try { fs.rmSync(profile, { recursive: true, force: true }); } catch {} }, 300);
-    process.exit(0);
+    process.exit(0); // teardownSync (exit handler) kills the Edge tree + removes the profile dir
   } catch (e) {
     return failSoft('CDP session error: ' + (e && e.message));
   }

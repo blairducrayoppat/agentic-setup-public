@@ -362,6 +362,7 @@ if ($edgeExe) {
         Set-Content (Join-Path $wcDir 'public\index.html') '<!doctype html><html><head><title>t</title></head><body style="background:#123;color:#fff"><h1>web card</h1><button>add</button></body></html>' -Encoding UTF8
         New-Item -ItemType Directory -Force (Join-Path $wcDir 'node_modules\pkg') | Out-Null
         Set-Content (Join-Path $wcDir 'node_modules\pkg\App.exe') 'stray' -Encoding ASCII   # the mis-route trigger
+        $preDirs = @(Get-ChildItem ([System.IO.Path]::GetTempPath()) -Directory -Filter 'edge-capture-*' -ErrorAction SilentlyContinue | ForEach-Object Name)
         $wcLines = @(& "$ScriptDir\capture-app.ps1" -AppDir $wcDir -OutPng $wcPng 2>&1)
         $wcExit  = $LASTEXITCODE
         $wcOk    = ($wcLines | Where-Object { $_ -match '^CAPTURE-OK:.*tier=web' } | Select-Object -Last 1)
@@ -370,14 +371,33 @@ if ($edgeExe) {
         Assert-True ([bool]$wcOk)     'WC10 [kill][end-to-end] a web project WITH a stray node_modules App.exe still captures CAPTURE-OK tier=web (headless; the stray exe was ignored)'
         Assert-False ([bool]$wcTier2) 'WC11 [kill][end-to-end] the run NEVER used the foreground Tier 2 (no tier=2 in output)'
         Assert-True (Test-Path $wcPng) 'WC12 [end-to-end] a real PNG was written by the headless web tier'
+        # #1027 leak locks: the capture above ran a REAL headless Edge; nothing of it may survive.
+        $postDirs  = @(Get-ChildItem ([System.IO.Path]::GetTempPath()) -Directory -Filter 'edge-capture-*' -ErrorAction SilentlyContinue | ForEach-Object Name | Where-Object { $preDirs -notcontains $_ })
+        $postProcs = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'edge-capture-' })
+        Assert-Eq 0 $postDirs.Count  'WC13 [kill][end-to-end][#1027] the capture left NO new edge-capture-* profile dir in %TEMP%'
+        Assert-Eq 0 $postProcs.Count 'WC14 [kill][end-to-end][#1027] no msedge.exe carrying an edge-capture-* user-data-dir survived the capture'
     } finally {
         Remove-Item $wcDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $wcPng -Force -ErrorAction SilentlyContinue
         Remove-Item "$wcPng.json" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$wcPng.console.json" -Force -ErrorAction SilentlyContinue
     }
 } else {
     _skip 'WC9-WC12 msedge not found -- end-to-end headless web capture is an on-hardware step (skipped, never failed)'
 }
+
+Section 'LK* -- web-tier Edge teardown is unconditional (#1027 leak regression locks, source)'
+# The 2026-07-21 leak shape: teardown keyed on a spawned-PID handle misses the DETACHED tree
+# headless Edge re-execs into, and cleanup scheduled on a timer dies with process.exit().
+# These lock the fix's load-bearing wiring; WC13/WC14 above are the behavioural proof.
+Assert-True ([regex]::IsMatch($capSrc, 'function Stop-EdgeCapture'))       'LK1 [kill] capture-app.ps1 defines Stop-EdgeCapture (kill by --user-data-dir match, not by PID handle)'
+Assert-True ([regex]::IsMatch($capSrc, '(?s)finally\s*\{.{0,600}?Stop-EdgeCapture')) 'LK2 [kill] Stop-EdgeCapture runs in the web tier finally (teardown is unconditional on every arm)'
+Assert-True ([regex]::IsMatch($capSrc, 'LEAK-DETECTED'))                   'LK3 the survivor re-scan fail-louds into the tier log'
+Assert-True ([regex]::IsMatch($capSrc, '--profile-dir \$cdpProfile'))      'LK4 [kill] the ps1 owns the CDP helper profile dir (passes --profile-dir; cleanup survives a helper crash)'
+$lkCdpSrc = Get-Content "$ScriptDir\capture-web-cdp.mjs" -Raw
+Assert-True ([regex]::IsMatch($lkCdpSrc, "process\.on\('exit', teardownSync\)")) 'LK5 [kill] capture-web-cdp.mjs registers exit-synchronous teardown (every exit path kills the tree)'
+Assert-True ([regex]::IsMatch($lkCdpSrc, "'/T', '/F'"))                    'LK6 the mjs teardown kills the process TREE (taskkill /T), not just the launcher PID'
+Assert-False ([regex]::IsMatch($lkCdpSrc, 'setTimeout\(.*rmSync'))         'LK7 [kill] the profile rm is never scheduled on a timer a process.exit() can kill (the 2026-07-21 leak shape)'
 
 # =============================================================================
 Section 'Result'
