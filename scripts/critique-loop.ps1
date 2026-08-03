@@ -100,8 +100,10 @@ param(
     [Parameter(Mandatory)][string]$VisualCriteriaJson,
     [Parameter(Mandatory)][string]$BlarAiRepo,
     [int]$Iteration = 0,
-    [int]$MaxIter = 3,
-    [string]$WorkDir = ''
+    [string]$WorkDir = '',
+    # #1171: the intake-declared surface (build_plan.surface), threaded to the Tier-3
+    # structural check so its not-applicable line states a fact, not a hypothesis.
+    [string]$DeclaredSurface = ''
 )
 $ErrorActionPreference = 'Stop'
 $ScriptDir = $PSScriptRoot
@@ -110,7 +112,94 @@ $ScriptDir = $PSScriptRoot
 # Helpers
 # ---------------------------------------------------------------------------
 
-function _FailResult([string]$Feedback, [string]$CaptureTier = '') {
+#: #1198 -- the statuses a deterministic design lint can return. A named set because the whole point of
+#: this layer is that "the lint ran and found nothing" and "the lint did not run" are DIFFERENT FACTS, and
+#: a caller that collapses them re-creates the defect one layer up.
+$script:DesignLintStatuses = @('clean', 'findings', 'not-applicable', 'unavailable')
+
+function New-DesignLintResult {
+    <#
+    .SYNOPSIS
+      The empty/degraded design-lint result shape (#1198). Every field is present at every exit, so no
+      caller ever reads a missing property as a zero. Measured=$false means NO VERDICT WAS OBTAINED --
+      never "nothing found". Hard/Messages/MessagesJson keep their prior shape and prior inert values, so
+      a caller that reads only those is unchanged.
+    #>
+    param([string]$Lint = 'layout', [string]$Status = 'unavailable', [string]$Detail = '')
+    return @{
+        Lint         = $Lint
+        Status       = $Status
+        Measured     = $false
+        Detail       = $Detail
+        Hard         = $false
+        Messages     = @()
+        MessagesJson = '[]'
+        FilesScanned = 0
+        # Files the lint opened but could NOT read or parse. They were scanned and NOT examined, which is
+        # a third thing again: the lint ran, so Measured stays true for the files it did read, but these
+        # ones are unexamined and must be disclosed rather than absorbed into the clean count.
+        Unparsed     = @()
+    }
+}
+
+function Format-DesignLintCaveat {
+    <#
+    .SYNOPSIS
+      PURE (#1198): the operator-facing line for a design lint that produced NO verdict. Returns '' for a
+      measured lint -- an empty string composes away to nothing, so the caveat channel is silent whenever
+      every lever actually reported.
+
+      The wording has exactly one job: stop an unexamined deliverable reading as an examined-and-clean one.
+      It names the lint, the cause, and the axis that is therefore UNKNOWN -- and it never implies a defect
+      was found, because none was. That distinction is the whole point.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Lint,
+        [bool]$Measured = $false,
+        [string]$Detail = '',
+        [string]$Status = '',
+        [string[]]$Unparsed = @()
+    )
+    $label = if ($Lint -eq 'pixel') { 'rendered-pixel lint' } else { 'XAML layout lint' }
+    $axis  = if ($Lint -eq 'pixel') { 'The rendered appearance' } else { 'The XAML layout' }
+    if ($Measured) {
+        # A PARTIAL examination is its own fact. The lint ran and reported on the files it could read, so
+        # its findings stand -- but a file it could not parse is unexamined, and folding those into the
+        # clean count is the same collapse at a smaller grain.
+        if (@($Unparsed).Count -gt 0) {
+            $names = (@($Unparsed) | Select-Object -First 5) -join ', '
+            if (@($Unparsed).Count -gt 5) { $names = "$names, +$(@($Unparsed).Count - 5) more" }
+            return ("DESIGN LINT: the $label SKIPPED $(@($Unparsed).Count) file(s) it could not read or parse " +
+                    "($names). Those files are UNEXAMINED - an ABSENT measurement for them, not a clean one.")
+        }
+        return ''
+    }
+    $line = if ($Status -eq 'not-applicable') {
+        "DESIGN LINT: the $label had NOTHING TO EXAMINE"
+    } else {
+        "DESIGN LINT: the $label DID NOT RUN"
+    }
+    if ($Detail) { $line = "$line - $Detail" }
+    return "$line. $axis of this deliverable is UNEXAMINED - an ABSENT measurement, not a clean one."
+}
+
+function _FailResult([string]$Feedback, [string]$CaptureTier = '', $Layout = $null, $Pixel = $null) {
+    # #1198: the design-lint fields are present on EVERY exit, so a consumer can never read their absence
+    # as a measurement. Whichever lint has already reported by the time a pass fails is threaded in as its
+    # REAL result -- an honesty channel that under-reports a lint that DID run is telling its own kind of
+    # lie. A lint that never got to run is reported as exactly that, with the reason.
+    $lay = $Layout
+    if ($null -eq $lay) {
+        $lay = New-DesignLintResult -Lint 'layout' -Detail 'this critique pass produced no layout verdict at all'
+    }
+    $pix = $Pixel
+    if ($null -eq $pix) {
+        $pix = New-DesignLintResult -Lint 'pixel' -Detail 'this critique pass produced no rendered-pixel verdict at all'
+    }
+    $caveats = @(
+        (Format-DesignLintCaveat -Lint 'layout' -Measured ([bool]$lay.Measured) -Detail "$($lay.Detail)" -Status "$($lay.Status)")
+        (Format-DesignLintCaveat -Lint 'pixel' -Measured ([bool]$pix.Measured) -Detail "$($pix.Detail)" -Status "$($pix.Status)")
+    ) | Where-Object { $_ }
     return @{
         ShouldIterate  = $false
         NeedsWork      = $false
@@ -118,6 +207,13 @@ function _FailResult([string]$Feedback, [string]$CaptureTier = '') {
         CaptureTier    = $CaptureTier
         Ok             = $false
         ScreenshotPath = ''
+        LayoutMeasured = [bool]$lay.Measured
+        LayoutStatus   = "$($lay.Status)"
+        PixelMeasured  = [bool]$pix.Measured
+        PixelStatus    = "$($pix.Status)"
+        LintsMeasured  = ([bool]$lay.Measured -and [bool]$pix.Measured)
+        Caveats        = @($caveats)
+        CaveatText     = (@($caveats) -join "`n")
     }
 }
 
@@ -133,7 +229,13 @@ function Merge-DesignSignals {
       fixes those first) then appends the VLM's notes. Pure + injectable so the core rule is
       unit-tested mutation-resistantly (see verify-critique-loop.ps1).
 
-      Returns @{ ShouldIterate=[bool]; NeedsWork=[bool]; Feedback=[string]; LayoutHard=[bool] }.
+      #1198 -- an UNMEASURED lint rides its OWN channel. It changes what the report SAYS, never what the
+      loop DECIDES: ShouldIterate/NeedsWork/Feedback are computed from the HARD signals alone, exactly as
+      before, and the absence surfaces as Caveats/CaveatText/LintsMeasured.
+
+      Returns @{ ShouldIterate=[bool]; NeedsWork=[bool]; Feedback=[string]; LayoutHard=[bool];
+      RuntimeHard=[bool]; LayoutMeasured=[bool]; PixelMeasured=[bool]; LintsMeasured=[bool];
+      Caveats=[string[]]; CaveatText=[string] }.
     #>
     param(
         [bool]$LayoutHard = $false,
@@ -146,6 +248,20 @@ function Merge-DesignSignals {
         [bool]$VlmNeedsWork = $false,
         [bool]$VlmShouldIterate = $false,
         [string]$VlmFeedback = '',
+        # #1198: whether each deterministic lint actually OBTAINED a verdict, and why not when it did not.
+        # Default $true = INERT, matching this function's standing contract that an unsupplied lever
+        # contributes nothing (Pixel*/Runtime* do the same). The FAIL-CLOSED default lives where the fact
+        # is produced -- New-DesignLintResult sets Measured=$false -- not here, where $false would mean
+        # "every caller who omits it is declared unexamined" and would bury the real absences in noise.
+        [bool]$LayoutMeasured = $true,
+        [string]$LayoutDetail = '',
+        [string]$LayoutStatus = '',
+        # Layout only: the XAML gate reads many files and can fail to parse some of them. The pixel gate
+        # reads one image and has no partial-examination state.
+        [string[]]$LayoutUnparsed = @(),
+        [bool]$PixelMeasured = $true,
+        [string]$PixelDetail = '',
+        [string]$PixelStatus = '',
         [Parameter(Mandatory)][int]$Iteration,
         [Parameter(Mandatory)][int]$MaxIter
     )
@@ -177,43 +293,110 @@ function Merge-DesignSignals {
     if ($VlmFeedback) { [void]$parts.Add($VlmFeedback) }
     $feedback = ($parts -join "`n").Trim()
 
+    # #1198: an ABSENT measurement is REPORTED, never merged into the verdict, and never put in $feedback.
+    #   * Not a hard signal: there is no finding to fix, so forcing a FIX lap would spend the iteration
+    #     budget re-running the coder against nothing -- a broken tool would become a wrecked night, and a
+    #     hard verdict asserts a defect was found when none was.
+    #   * Not silence: silence is the defect -- a missing linter reading as a clean layout, forever.
+    #   * Not in $feedback: $feedback is the coder's FIX prompt (Add-VisualFeedback). "The linter could not
+    #     run" is not something the coder can act on; it would send the model chasing the harness.
+    # So it rides its own channel to the OPERATOR, and ShouldIterate/NeedsWork/Feedback are untouched.
+    $caveats = @(
+        (Format-DesignLintCaveat -Lint 'layout' -Measured $LayoutMeasured -Detail $LayoutDetail -Status $LayoutStatus -Unparsed $LayoutUnparsed)
+        (Format-DesignLintCaveat -Lint 'pixel' -Measured $PixelMeasured -Detail $PixelDetail -Status $PixelStatus)
+    ) | Where-Object { $_ }
+
     # LayoutHard in the return means "any deterministic hard finding" so the Python _design_note
     # (which reads layout_hard) reports deterministic issues for pixel/runtime hits too. For a
     # pre-pixel/pre-runtime caller Pixel/RuntimeHard=$false, so $detHard == $LayoutHard and the return
     # is byte-identical. RuntimeHard is ALSO returned distinctly so the Python side can word the
     # operator note as a runtime error (not "layout") and gate the clean-ending reclass on it.
-    return @{ ShouldIterate = $shouldIterate; NeedsWork = $needsWork; Feedback = $feedback; LayoutHard = $detHard; RuntimeHard = [bool]$RuntimeHard }
+    return @{
+        ShouldIterate  = $shouldIterate
+        NeedsWork      = $needsWork
+        Feedback       = $feedback
+        LayoutHard     = $detHard
+        RuntimeHard    = [bool]$RuntimeHard
+        LayoutMeasured = [bool]$LayoutMeasured
+        PixelMeasured  = [bool]$PixelMeasured
+        # LintsMeasured names exactly what it covers -- the two deterministic LINTS. The browser-runtime
+        # channel reports its own availability through Read-ConsoleSidecar's Captured flag.
+        LintsMeasured  = ([bool]$LayoutMeasured -and [bool]$PixelMeasured)
+        Caveats        = @($caveats)
+        CaveatText     = (@($caveats) -join "`n")
+    }
 }
 
 function Invoke-LayoutLint {
     <#
     .SYNOPSIS
       Run the deterministic XAML layout gate (shared/fleet/layout_lint.py) over an app dir.
-      Fail-soft: ANY failure (no python, no JSON, crash) -> @{ Hard=$false; Messages=@();
-      MessagesJson='[]' } so the design loop degrades to the VLM-only signal, never errors.
-      Returns @{ Hard=[bool]; Messages=[string[]]; MessagesJson=[string] }.
+
+      FAIL-SOFT IS NOT FAIL-SILENT (#1198). The loop still degrades to the VLM-only signal and this never
+      throws -- but the ABSENCE is now a readable fact instead of a clean-looking empty result:
+        * no interpreter / crash / no JSON / unparseable JSON -> Status='unavailable', Measured=$false,
+          Detail naming the cause (python's own last words where it had any).
+        * a run that scanned ZERO .xaml files -> Status='not-applicable', Measured=$false. Zero files is
+          not a clean layout; it is no layout examined. A node/web candidate lands here by construction,
+          and so does a WinUI candidate whose XAML never reached the worktree -- both would read as
+          "clean" if this were folded into the measured branch below.
+      CALLERS GATE ON .Measured, NEVER ON .Messages.Count.
+      Returns the New-DesignLintResult shape:
+      @{ Lint; Status; Measured=[bool]; Detail; Hard=[bool]; Messages=[string[]]; MessagesJson; FilesScanned }.
     #>
     param(
         [Parameter(Mandatory)][string]$AppDir,
         [Parameter(Mandatory)][string]$BlarAiRepo
     )
-    $empty = @{ Hard = $false; Messages = @(); MessagesJson = '[]' }
     $pythonExe = Join-Path $BlarAiRepo '.venv\Scripts\python.exe'
-    if (-not (Test-Path $pythonExe)) { return $empty }
+    if (-not (Test-Path $pythonExe)) {
+        return (New-DesignLintResult -Lint 'layout' -Detail "no BlarAI python interpreter at $pythonExe")
+    }
+    $lines = @()
     try {
         $prevLoc = (Get-Location).Path
         try {
             Set-Location $BlarAiRepo
             $lines = @(& $pythonExe -m shared.fleet.layout_lint --app-dir $AppDir 2>&1)
         } finally { Set-Location $prevLoc }
-    } catch { return $empty }
+    } catch {
+        return (New-DesignLintResult -Lint 'layout' -Detail "the layout lint could not be invoked: $($_.Exception.Message)")
+    }
     $jsonLine = ($lines | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1) ?? ''
-    if (-not $jsonLine) { return $empty }
-    try { $obj = $jsonLine | ConvertFrom-Json } catch { return $empty }
-    $hard = [bool]($obj.hard)
+    if (-not $jsonLine) {
+        $tail = ((@($lines | Where-Object { "$_".Trim() }) | Select-Object -Last 3) -join ' | ')
+        if ($tail.Length -gt 300) { $tail = $tail.Substring(0, 300) + '...' }
+        return (New-DesignLintResult -Lint 'layout' -Detail "the layout lint emitted no JSON (module missing, import error or crash): $tail")
+    }
+    try { $obj = $jsonLine | ConvertFrom-Json } catch {
+        return (New-DesignLintResult -Lint 'layout' -Detail "the layout lint's output was not parseable JSON: $jsonLine")
+    }
+    $out = New-DesignLintResult -Lint 'layout'
+    $out.FilesScanned = [int]$obj.files_scanned
+    if ($out.FilesScanned -le 0) {
+        $out.Status = 'not-applicable'
+        $out.Detail = "no .xaml files under $AppDir, so this surface has no XAML layout to examine"
+        return $out
+    }
+    # A file the module could not read or parse is reported as a LOW finding, which never reaches Hard and
+    # never reaches the HIGH message filter below -- so without this it would land in the clean count as a
+    # file that was examined and found sound. It was not examined at all.
+    $out.Unparsed = @($obj.findings |
+        Where-Object { $_.rule -eq 'unparseable' -or $_.rule -eq 'unreadable' } |
+        ForEach-Object { [string]$_.file })
+    if (@($out.Unparsed).Count -ge $out.FilesScanned) {
+        $out.Status = 'not-applicable'
+        $out.Detail = "all $($out.FilesScanned) .xaml file(s) under $AppDir failed to read or parse, so no layout was examined"
+        return $out
+    }
     $msgs = @($obj.findings | Where-Object { $_.severity -eq 'high' } | ForEach-Object { [string]$_.message })
-    $msgsJson = '[' + (($msgs | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ',') + ']'
-    return @{ Hard = $hard; Messages = $msgs; MessagesJson = $msgsJson }
+    $out.Hard = [bool]($obj.hard)
+    $out.Messages = $msgs
+    $out.MessagesJson = '[' + (($msgs | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ',') + ']'
+    $out.Measured = $true
+    # Hard is the gate, not the count -- the same rule the merge applies to the messages themselves.
+    $out.Status = if ($out.Hard) { 'findings' } else { 'clean' }
+    return $out
 }
 
 function Invoke-PixelLint {
@@ -222,10 +405,18 @@ function Invoke-PixelLint {
       Run the deterministic PIXEL gate (shared/fleet/pixel_lint.py) over a captured screenshot --
       reference-free colour-presence + element-geometry, the count/colour/position axes the VLM
       hallucinates on. The complement to Invoke-LayoutLint (XAML), needing a real PNG.
-      Fail-soft: ANY failure (no python, missing PNG, no JSON, crash) -> @{ Hard=$false; Messages=@();
-      MessagesJson='[]' } so the design loop degrades to the layout+VLM signal, never errors.
-      Returns @{ Hard=[bool]; Messages=[string[]]; MessagesJson=[string] } -- same shape as
-      Invoke-LayoutLint so the caller composes both identically.
+
+      FAIL-SOFT IS NOT FAIL-SILENT (#1198). The loop still degrades to the layout+VLM signal and this never
+      throws -- but every degraded path (missing PNG, no interpreter, crash, no JSON, unparseable JSON)
+      returns Status='unavailable' + Measured=$false with a Detail naming the cause, so an unexamined
+      render can no longer read as an examined-and-clean one. CALLERS GATE ON .Measured.
+      Returns the New-DesignLintResult shape -- the same shape as Invoke-LayoutLint, so the caller
+      composes both identically.
+
+      KNOWN LIMIT OF THE MODULE'S OWN CONTRACT (#1221): shared/fleet/pixel_lint.py returns
+      {"findings": [], "hard": false} for an image it could not DECODE, which is byte-identical to a clean
+      render. This seam cannot distinguish those two, so a corrupt-but-non-empty PNG still reads as clean;
+      closing that needs a measured/undecodable flag on the module's own output.
     #>
     param(
         [Parameter(Mandatory)][string]$Png,
@@ -233,10 +424,14 @@ function Invoke-PixelLint {
         [string]$CriteriaJson = '[]',
         [string]$Goal = ''
     )
-    $empty = @{ Hard = $false; Messages = @(); MessagesJson = '[]' }
-    if (-not (Test-Path $Png)) { return $empty }
+    if (-not (Test-Path $Png)) {
+        return (New-DesignLintResult -Lint 'pixel' -Detail "no screenshot on disk at $Png")
+    }
     $pythonExe = Join-Path $BlarAiRepo '.venv\Scripts\python.exe'
-    if (-not (Test-Path $pythonExe)) { return $empty }
+    if (-not (Test-Path $pythonExe)) {
+        return (New-DesignLintResult -Lint 'pixel' -Detail "no BlarAI python interpreter at $pythonExe")
+    }
+    $lines = @()
     try {
         $prevLoc = (Get-Location).Path
         try {
@@ -244,15 +439,27 @@ function Invoke-PixelLint {
             $lines = @(& $pythonExe -m shared.fleet.pixel_lint --screenshot $Png `
                 --criteria-json $CriteriaJson --goal $Goal 2>&1)
         } finally { Set-Location $prevLoc }
-    } catch { return $empty }
+    } catch {
+        return (New-DesignLintResult -Lint 'pixel' -Detail "the pixel lint could not be invoked: $($_.Exception.Message)")
+    }
     $jsonLine = ($lines | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1) ?? ''
-    if (-not $jsonLine) { return $empty }
-    try { $obj = $jsonLine | ConvertFrom-Json } catch { return $empty }
-    $hard = [bool]($obj.hard)
+    if (-not $jsonLine) {
+        $tail = ((@($lines | Where-Object { "$_".Trim() }) | Select-Object -Last 3) -join ' | ')
+        if ($tail.Length -gt 300) { $tail = $tail.Substring(0, 300) + '...' }
+        return (New-DesignLintResult -Lint 'pixel' -Detail "the pixel lint emitted no JSON (module missing, import error or crash): $tail")
+    }
+    try { $obj = $jsonLine | ConvertFrom-Json } catch {
+        return (New-DesignLintResult -Lint 'pixel' -Detail "the pixel lint's output was not parseable JSON: $jsonLine")
+    }
+    $out = New-DesignLintResult -Lint 'pixel'
     # pixel_lint emits only HIGH findings, but filter for parity with Invoke-LayoutLint.
     $msgs = @($obj.findings | Where-Object { $_.severity -eq 'high' } | ForEach-Object { [string]$_.message })
-    $msgsJson = '[' + (($msgs | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ',') + ']'
-    return @{ Hard = $hard; Messages = $msgs; MessagesJson = $msgsJson }
+    $out.Hard = [bool]($obj.hard)
+    $out.Messages = $msgs
+    $out.MessagesJson = '[' + (($msgs | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ',') + ']'
+    $out.Measured = $true
+    $out.Status = if ($out.Hard) { 'findings' } else { 'clean' }
+    return $out
 }
 
 function Read-ConsoleSidecar {
@@ -284,6 +491,95 @@ function Read-ConsoleSidecar {
 # ---------------------------------------------------------------------------
 # Invoke-CritiquePass : ONE capture + critique pass
 # ---------------------------------------------------------------------------
+function Resolve-UnservedAssetFindings {
+    <#
+    .SYNOPSIS
+      Rewrite a browser 4xx/5xx finding into an ACTIONABLE diagnosis (#1133).
+
+      THE INCIDENT (2026-07-27, run 20260727-215338-bd). The capture stage worked: it
+      caught a 404 on `header/header.styles.css`, set hard=true, and surfaced the message
+      to the fix loop TWICE. The loop then committed five more lines of CSS *into that
+      same unreachable file*. It had the diagnosis in plain English and still edited a
+      file the page cannot load.
+
+      The cause is the WORDING, not a missing signal. The browser says "Failed to load
+      resource", which reads as "this resource is inadequate" and invites "improve it".
+      What the coder needs to hear is "this file is not being served, so editing it
+      cannot change the page" — which is a fact we can determine deterministically from
+      the worktree, not something the model should have to infer.
+
+      PURE + FAIL-SOFT: any parse/IO failure returns the ORIGINAL message untouched, so a
+      degraded environment can never lose the finding (it only loses the enrichment).
+      Messages that are not same-origin asset failures pass through verbatim.
+
+    .PARAMETER Messages
+      The runtime findings from Read-ConsoleSidecar.
+    .PARAMETER AppDir
+      The worktree root, used to locate the missing file and the served root.
+    .OUTPUTS
+      [string[]] — same length and order as $Messages, each either enriched or verbatim.
+    #>
+    param(
+        [string[]]$Messages = @(),
+        [string]$AppDir = ''
+    )
+    if (-not $Messages -or $Messages.Count -eq 0) { return @() }
+
+    # The directories a zero-dependency static server actually exposes. `public` is the
+    # seeded convention; `static`/`www`/`dist` cover the shapes a coder may choose.
+    $servedNames = @('public', 'static', 'www', 'dist')
+    $servedRoots = @()
+    if ($AppDir -and (Test-Path -LiteralPath $AppDir)) {
+        foreach ($n in $servedNames) {
+            $p = Join-Path $AppDir $n
+            if (Test-Path -LiteralPath $p) { $servedRoots += $n }
+        }
+    }
+
+    $out = @()
+    foreach ($m in $Messages) {
+        $msg = [string]$m
+        try {
+            # Only same-origin asset failures. A 4xx/5xx with a loopback URL.
+            if ($msg -notmatch '(?i)status of (4\d\d|5\d\d)') { $out += $msg; continue }
+            # Capture the status BEFORE the next -match overwrites $Matches.
+            $status = $Matches[1]
+            if ($msg -notmatch '(?i)\((https?://(127\.0\.0\.1|localhost)[^)\s]*)\)') { $out += $msg; continue }
+            $url = $Matches[1]
+            $rel = ([uri]$url).AbsolutePath.TrimStart('/')
+            if (-not $rel) { $out += $msg; continue }
+            # A missing favicon is browser noise, not a defect the coder introduced.
+            if ($rel -ieq 'favicon.ico') { $out += $msg; continue }
+
+            # Without a readable worktree we cannot tell "exists but unserved" from
+            # "does not exist" — and asserting either would be a claim we did not check.
+            # Pass the browser's message through untouched rather than invent a diagnosis.
+            if (-not $AppDir -or -not (Test-Path -LiteralPath $AppDir)) { $out += $msg; continue }
+
+            $onDisk = ''
+            $candidate = Join-Path $AppDir ($rel -replace '/', '\')
+            if (Test-Path -LiteralPath $candidate) { $onDisk = $rel }
+
+            $servedHint = if ($servedRoots.Count -gt 0) { $servedRoots -join '/ or ' } else { 'the served root' }
+
+            if ($onDisk) {
+                # THE INCIDENT'S SHAPE: the file exists, but outside what the server serves.
+                $out += ("The page requested '/$rel' and the server returned $status — " +
+                         "the file EXISTS at '$onDisk' but is NOT under the served directory ($servedHint), " +
+                         "so the server never returns it. EDITING '$onDisk' CANNOT CHANGE THE PAGE. " +
+                         "Move it under $servedHint (and update the link in the HTML), or inline its contents into the page.")
+            } else {
+                $out += ("The page requested '/$rel' and the server returned $status — nothing exists at that path " +
+                         "anywhere in the project. Create it under $servedHint, or remove the reference from the HTML. " +
+                         "Adding content elsewhere will not make this request succeed.")
+            }
+        } catch {
+            $out += $msg   # fail-soft: never lose a finding to enrichment
+        }
+    }
+    return $out
+}
+
 function Invoke-CritiquePass {
     <#
     .SYNOPSIS
@@ -297,7 +593,9 @@ function Invoke-CritiquePass {
         [Parameter(Mandatory)][string]$BlarAiRepo,
         [int]$Iteration = 0,
         [int]$MaxIter = 3,
-        [string]$WorkDir = ''
+        [string]$WorkDir = '',
+        # #1171: passed straight through to capture-app.ps1 -> check-design-structural.ps1.
+        [string]$DeclaredSurface = ''
     )
 
     # Resolve / create the scratch directory for the PNG.
@@ -315,16 +613,16 @@ function Invoke-CritiquePass {
     # ---- Step 1: capture ------------------------------------------------
     $captureScript = Join-Path $ScriptDir 'capture-app.ps1'
     if (-not (Test-Path $captureScript)) {
-        return _FailResult "capture-app.ps1 not found at '$captureScript'"
+        return _FailResult "capture-app.ps1 not found at '$captureScript'" '' $layoutResult
     }
 
     $captureLines = $null
     $captureExit = 0
     try {
-        $captureLines = @(& $captureScript -AppDir $AppDir -OutPng $pngPath 2>&1)
+        $captureLines = @(& $captureScript -AppDir $AppDir -OutPng $pngPath -DeclaredSurface $DeclaredSurface 2>&1)
         $captureExit = $LASTEXITCODE
     } catch {
-        return _FailResult "capture-app.ps1 threw: $($_.Exception.Message)"
+        return _FailResult "capture-app.ps1 threw: $($_.Exception.Message)" '' $layoutResult
     }
 
     # Extract the machine-readable result line from stdout (Write-Output lines only;
@@ -345,7 +643,14 @@ function Invoke-CritiquePass {
             } catch { $notes = "Structural JSON unreadable." }
         }
         $vlmFeedback = "No pixel capture available (Tier 3 structural floor); the VLM critique was skipped. Structural notes: $notes".Trim()
+        # #1198: on this floor the pixel lint never runs -- there is no screenshot by construction. The
+        # feedback line above says so in prose, but prose beside a field is not the field: a consumer
+        # reading PixelMeasured must get the fact, not a $true left over from a default.
         $merged = Merge-DesignSignals -LayoutHard $layoutResult.Hard -LayoutMessages $layoutResult.Messages `
+            -LayoutMeasured $layoutResult.Measured -LayoutDetail $layoutResult.Detail -LayoutStatus $layoutResult.Status `
+            -LayoutUnparsed $layoutResult.Unparsed `
+            -PixelMeasured $false -PixelStatus 'not-applicable' `
+            -PixelDetail 'no screenshot was captured (Tier 3 structural floor), so there was nothing to examine' `
             -VlmOk $false -VlmNeedsWork $false -VlmShouldIterate $false -VlmFeedback $vlmFeedback `
             -Iteration $Iteration -MaxIter $MaxIter
         return @{
@@ -355,6 +660,13 @@ function Invoke-CritiquePass {
             CaptureTier    = 'structural'
             Ok             = $false
             LayoutHard     = $merged.LayoutHard
+            LayoutMeasured = $merged.LayoutMeasured
+            LayoutStatus   = "$($layoutResult.Status)"
+            PixelMeasured  = $merged.PixelMeasured
+            PixelStatus    = 'not-applicable'
+            LintsMeasured  = $merged.LintsMeasured
+            Caveats        = $merged.Caveats
+            CaveatText     = $merged.CaveatText
             ScreenshotPath = ''
         }
     }
@@ -362,7 +674,7 @@ function Invoke-CritiquePass {
     # ---- Step 3: CAPTURE-FAIL or bad exit --------------------------------
     if ($captureExit -ne 0 -or -not ($captureSignal -match '^CAPTURE-OK:')) {
         $detail = if ($captureSignal) { $captureSignal } else { "exit $captureExit" }
-        return _FailResult "Capture failed: $detail" ''
+        return _FailResult "Capture failed: $detail" '' $layoutResult
     }
 
     # Parse the capture tier (tier=1 or tier=2) from CAPTURE-OK line.
@@ -371,7 +683,7 @@ function Invoke-CritiquePass {
 
     # Verify the PNG exists on disk.
     if (-not (Test-Path $pngPath) -or (Get-Item $pngPath).Length -eq 0) {
-        return _FailResult "Capture reported OK but PNG is missing or empty at '$pngPath'" $captureTier
+        return _FailResult "Capture reported OK but PNG is missing or empty at '$pngPath'" $captureTier $layoutResult
     }
 
     # ---- Step 3.5: deterministic PIXEL gate (Lever B) -------------------
@@ -393,11 +705,18 @@ function Invoke-CritiquePass {
     # Missing / captured:false (WinUI capture, or the msedge --screenshot fallback) -> NO runtime
     # signal, so a console-blind capture degrades to today's pixel-only behavior, honestly.
     $runtimeResult = Read-ConsoleSidecar -SidecarPath "$pngPath.console.json"
+    # #1133: turn a raw "Failed to load resource" into a diagnosis the coder can act on.
+    # The loop previously received the browser's own wording and responded by EDITING the
+    # very file that was 404ing. Fail-soft — on any trouble the original message stands.
+    if ($runtimeResult.Messages -and $runtimeResult.Messages.Count -gt 0) {
+        $runtimeResult.Messages = Resolve-UnservedAssetFindings `
+            -Messages $runtimeResult.Messages -AppDir $AppDir
+    }
 
     # ---- Step 4: VLM critique -------------------------------------------
     $pythonExe = Join-Path $BlarAiRepo '.venv\Scripts\python.exe'
     if (-not (Test-Path $pythonExe)) {
-        return _FailResult "BlarAI python not found at '$pythonExe'. Is BlarAiRepo correct?" $captureTier
+        return _FailResult "BlarAI python not found at '$pythonExe'. Is BlarAiRepo correct?" $captureTier $layoutResult $pixelResult
     }
 
     $critiqueLines = $null
@@ -419,24 +738,24 @@ function Invoke-CritiquePass {
             Set-Location $prevLoc
         }
     } catch {
-        return _FailResult "VLM critique threw: $($_.Exception.Message)" $captureTier
+        return _FailResult "VLM critique threw: $($_.Exception.Message)" $captureTier $layoutResult $pixelResult
     }
 
     if ($critiqueExit -ne 0) {
         $detail = ($critiqueLines | Select-Object -Last 3) -join ' | '
-        return _FailResult "VLM critique exited $critiqueExit (usage error): $detail" $captureTier
+        return _FailResult "VLM critique exited $critiqueExit (usage error): $detail" $captureTier $layoutResult $pixelResult
     }
 
     # Find the JSON line (the CLI prints exactly ONE JSON line to stdout).
     $jsonLine = ($critiqueLines | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1) ?? ''
     if (-not $jsonLine) {
         $detail = ($critiqueLines | Where-Object { $_ } | Select-Object -Last 3) -join ' | '
-        return _FailResult "VLM critique produced no JSON line (stdout: $detail)" $captureTier
+        return _FailResult "VLM critique produced no JSON line (stdout: $detail)" $captureTier $layoutResult $pixelResult
     }
 
     $critiqueObj = $null
     try { $critiqueObj = $jsonLine | ConvertFrom-Json } catch {
-        return _FailResult "VLM critique JSON parse failed ('$jsonLine'): $($_.Exception.Message)" $captureTier
+        return _FailResult "VLM critique JSON parse failed ('$jsonLine'): $($_.Exception.Message)" $captureTier $layoutResult $pixelResult
     }
 
     # Extract and type-coerce fields (ConvertFrom-Json gives PSCustomObject).
@@ -448,8 +767,14 @@ function Invoke-CritiquePass {
     # Combine the soft VLM signal with the HARD deterministic gates: a layout (Lever A), pixel
     # (Lever B), or browser-RUNTIME (Lever D, #823) defect forces a FIX even when the VLM passed
     # (the false-pass fix). Runtime findings LEAD the merged feedback (fix the thrown error first).
+    # #1198: each lint's MEASURED-ness travels beside its HARD signal. A lint that produced no verdict adds
+    # no hard finding (it has none) and no coder feedback (it has nothing actionable) -- it adds a caveat
+    # the operator-facing report must print, so an unexamined axis can never read as an examined-clean one.
     $merged = Merge-DesignSignals -LayoutHard $layoutResult.Hard -LayoutMessages $layoutResult.Messages `
+        -LayoutMeasured $layoutResult.Measured -LayoutDetail $layoutResult.Detail -LayoutStatus $layoutResult.Status `
+        -LayoutUnparsed $layoutResult.Unparsed `
         -PixelHard $pixelResult.Hard -PixelMessages $pixelResult.Messages `
+        -PixelMeasured $pixelResult.Measured -PixelDetail $pixelResult.Detail -PixelStatus $pixelResult.Status `
         -RuntimeHard $runtimeResult.Hard -RuntimeMessages $runtimeResult.Messages `
         -VlmOk $ok -VlmNeedsWork $needsWork -VlmShouldIterate $shouldIterate -VlmFeedback $feedback `
         -Iteration $Iteration -MaxIter $MaxIter
@@ -462,6 +787,13 @@ function Invoke-CritiquePass {
         LayoutHard      = $merged.LayoutHard
         RuntimeHard     = $merged.RuntimeHard
         RuntimeCaptured = $runtimeResult.Captured
+        LayoutMeasured  = $merged.LayoutMeasured
+        LayoutStatus    = "$($layoutResult.Status)"
+        PixelMeasured   = $merged.PixelMeasured
+        PixelStatus     = "$($pixelResult.Status)"
+        LintsMeasured   = $merged.LintsMeasured
+        Caveats         = $merged.Caveats
+        CaveatText      = $merged.CaveatText
         ScreenshotPath  = $pngPath
     }
 }
@@ -515,7 +847,9 @@ function Invoke-CritiqueLoop {
         [Parameter(Mandatory)][string]$BlarAiRepo,
         [int]$MaxIter = 3,
         [string]$WorkDir = '',
-        [scriptblock]$RebuildCallback = $null
+        [scriptblock]$RebuildCallback = $null,
+        # #1171: threaded onward to every Invoke-CritiquePass this loop drives.
+        [string]$DeclaredSurface = ''
     )
 
     $currentAppDir = $AppDir
@@ -530,7 +864,8 @@ function Invoke-CritiqueLoop {
             -BlarAiRepo $BlarAiRepo `
             -Iteration $iteration `
             -MaxIter $MaxIter `
-            -WorkDir $WorkDir
+            -WorkDir $WorkDir `
+            -DeclaredSurface $DeclaredSurface
 
         $lastResult = $result
         $iteration++
@@ -577,6 +912,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         -BlarAiRepo $BlarAiRepo `
         -Iteration $Iteration `
         -MaxIter $MaxIter `
-        -WorkDir $WorkDir
+        -WorkDir $WorkDir `
+        -DeclaredSurface $DeclaredSurface
     $result | ConvertTo-Json -Depth 3
 }

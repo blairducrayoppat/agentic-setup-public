@@ -78,7 +78,11 @@ param(
     [int]$Tier1TimeoutSec = 90,
     [int]$Tier2LaunchTimeoutSec = 40,
     [double]$Tier2SettleSec = 1.0,
-    [int]$WebTimeoutSec = 30
+    [int]$WebTimeoutSec = 30,
+    # #1171: the intake-declared surface (build_plan.surface), passed straight through to the
+    # Tier-3 structural check so its not-applicable line states a fact instead of a hypothesis.
+    # Empty = not supplied, which preserves the pre-#1171 wording exactly.
+    [string]$DeclaredSurface = ''
 )
 $ErrorActionPreference = 'Stop'
 $ScriptDir = $PSScriptRoot
@@ -500,7 +504,7 @@ if (-not (Test-Path $t3Script)) {
     Write-Tier 3 "check-design-structural.ps1 not found; wrote minimal fallback JSON"
 } else {
     try {
-        & $t3Script -AppDir $AppDir -OutJson $structJsonPath 2>&1 | ForEach-Object { Write-Tier 3 $_ }
+        & $t3Script -AppDir $AppDir -OutJson $structJsonPath -DeclaredSurface $DeclaredSurface 2>&1 | ForEach-Object { Write-Tier 3 $_ }
     } catch {
         $fallback = @{ notes = "Tier 3 structural check threw: $($_.Exception.Message)"; seed_only = $false } | ConvertTo-Json -Compress
         Set-Content -Path $structJsonPath -Value $fallback -Encoding UTF8

@@ -323,7 +323,12 @@ try {
     $litterSeeded = (@($seededLit) -match '__pycache__|\.pytest_cache|\.hypothesis').Count -gt 0 -or
         (Test-Path (Join-Path $wtLit 'app\__pycache__')) -or (Test-Path (Join-Path $wtLit '.pytest_cache')) -or (Test-Path (Join-Path $wtLit '.hypothesis'))
     Assert-True (-not $litterSeeded) 'H6 [kill] planted source litter (__pycache__/.pytest_cache/.hypothesis) is NOT seeded (the litter guard holds)'
-    Assert-Eq 4 (@($seededLit)).Count 'H6 ...and the litter-planted source still seeds exactly the 4 real files'
+    # The expected count is DERIVED from the committed reference list -- the same authority H7 uses --
+    # never hardcoded. A literal 4 was correct until #1182 added AGENTS.md to the seed, at which point
+    # this assertion failed for the one reason it must never fail for: a legitimate new seed file. What
+    # H6 asserts is "the planted litter added nothing", so the number has to track the seed itself.
+    $expectedRealH6 = @(git -C (Split-Path $PSScriptRoot -Parent) ls-files -- 'build-infra/python/reference').Count
+    Assert-Eq $expectedRealH6 (@($seededLit)).Count "H6 ...and the litter-planted source still seeds exactly the $expectedRealH6 committed files"
 } finally {
     if (Test-Path $tmpH) { Remove-Item -Recurse -Force $tmpH -ErrorAction SilentlyContinue }
 }

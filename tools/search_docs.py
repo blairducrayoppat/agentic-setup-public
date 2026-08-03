@@ -18,20 +18,45 @@ ZERO EGRESS (the runtime privacy mandate is absolute): every byte read comes fro
 local index file on disk. This module imports NO network machinery; ``shared.research``
 is itself locked incapable of egress. There is no fetch, ever.
 
-DORMANT + OPT-IN (double-gated): this tool does nothing until ``BLARAI_RESEARCH_DOCS``
-is set to a truthy value (``1``/``true``/``yes``/``on``). Unset (the default) => a clean
-"dormant" result and the index is never even opened. This is the deliberate "research
-arm switch" for the reliability campaign; it is flipped on only at an explicit
-night-boundary once the corpus is staged + the before/after battery has measured it.
-(The OpenCode tool wrapper that exposes this to the coder is ALSO staged-not-installed —
-see ``configs/opencode-tools/``.)
+DORMANT BY DEFAULT, AND THE ANSWER IS READ FROM DISK (#1206). Whether this tool is armed
+is decided by ONE committed line — ``research_docs`` in ``configs/fleet-driver.json`` —
+which this module resolves relative to its OWN location and reads AT THE POINT OF USE,
+on every invocation. It does not learn its state by environment inheritance, because a
+capability that arrives only through the environment is armed for whoever happened to be
+spawned by the right parent and silently dormant for everyone else: an already-running
+session, a crash-recovery relaunch, a hand-started process, anything after a reboot. A
+setting that has to be re-exported to survive a restart is not a setting.
+
+Only the literal JSON boolean ``true`` arms it. A string ``"true"``, a ``1``, a typo, or
+a missing key all mean dormant. Flipping it is a deliberate go-live, not a shell command.
+
+THREE STATES, never two — "off" and "cannot tell" are different answers and this reports
+them differently (both DENY; see :func:`resolve_arming`):
+  armed       the manifest says true.
+  dormant     the manifest says otherwise, or an operator forced it off (see below).
+  unresolved  the manifest could not be read. Refused fail-closed AND reported as
+              unknown, never silently downgraded to a confident "switched off".
 
 FAIL-CLOSED: if the docset index is not staged/built, this refuses with a clear message
 naming BlarAI's stager (``scripts/stage_docsets.py``) and a non-zero exit — a missing
 corpus is an operator problem, never a fabricated "answer".
 
-Environment:
-  BLARAI_RESEARCH_DOCS      truthy => enabled; unset/false => dormant (default OFF).
+Environment. This block previously opened "none of these can ARM the tool", which was
+FALSE and had already propagated into a ticket record and two review messages before an
+adversarial check caught it (2026-07-30). ``BLARAI_RESEARCH_DOCS`` cannot arm — that is
+real and toggle-tested. ``BLARAI_FLEET_DRIVER_CONFIG`` CAN, by pointing the reader at a
+different manifest, and nothing tested that it could not. Stated exactly, per variable:
+  BLARAI_RESEARCH_DOCS      CANNOT ARM. Emergency stop only: a falsy value (``0``/``false``/
+                            ``no``/``off``) forces dormant without editing a committed file
+                            — useful to kill the capability in a running process. A truthy
+                            value has NO effect; the manifest is the authority.
+  BLARAI_FLEET_DRIVER_CONFIG  CAN ARM, by overriding which manifest is read: aimed at an
+                            armed manifest it arms the tool from any parent process, and it
+                            redirects the PowerShell side too, so both halves agree while
+                            both point somewhere unintended. Intended for verify suites and
+                            tests; production leaves it unset, but nothing ENFORCES that.
+                            Whether it should be gated in production is an operator posture
+                            decision, tracked on #1206 — do not restate it as settled here.
   BLARAI_REPO               BlarAI repo root (default C:\\Users\\mrbla\\blarai) — where
                             ``shared.research`` + the staged docset index live.
   BLARAI_DOCSET_INDEX_DIR   override the index dir (default: <repo>/models/docsets/index).
@@ -56,8 +81,21 @@ from pathlib import Path
 #: Default BlarAI repo root (holds shared.research + the staged docset index).
 _DEFAULT_BLARAI_REPO = r"C:\Users\mrbla\blarai"
 
-#: Truthy spellings for the dormant gate.
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+#: Falsy spellings recognised by the BLARAI_RESEARCH_DOCS emergency stop.
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+#: The three arming states. "dormant" and "unresolved" both DENY; they are distinct
+#: because "switched off" and "I could not find out" are different facts, and reporting
+#: the second as the first is how a broken configuration comes to look like a decision.
+ARMED = "armed"
+DORMANT = "dormant"
+UNRESOLVED = "unresolved"
+
+#: The committed manifest that owns the arming decision, resolved from THIS FILE's
+#: location so it survives any cwd, any parent process, and any reboot. Overridable by
+#: path (not by value) for verify suites via BLARAI_FLEET_DRIVER_CONFIG.
+_MANIFEST_RELATIVE = ("configs", "fleet-driver.json")
+_MANIFEST_KEY = "research_docs"
 
 #: Result excerpt cap for tool output (below shared.research's 800 — a coder tool
 #: wants a tight interface card, not a paragraph).
@@ -98,9 +136,63 @@ class ResearchUnavailable(RuntimeError):
     """The local research substrate cannot be consulted (fail-closed)."""
 
 
+def manifest_path() -> Path:
+    """The manifest this process will consult, resolved from THIS FILE, not from cwd,
+    not from an inherited variable. ``<repo>/tools/search_docs.py`` ->
+    ``<repo>/configs/fleet-driver.json``."""
+    override = os.environ.get("BLARAI_FLEET_DRIVER_CONFIG", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent.joinpath(*_MANIFEST_RELATIVE)
+
+
+def resolve_arming() -> "tuple[str, str]":
+    """Read the arming decision off disk, right now. Returns ``(state, reason)`` where
+    state is :data:`ARMED`, :data:`DORMANT` or :data:`UNRESOLVED`.
+
+    This is the durability contract. Every caller — dispatched by the fleet, started by
+    hand, relaunched after a crash, first run after a reboot — resolves the SAME answer
+    from the SAME committed file, because nothing here depends on what the parent process
+    happened to export. The environment can only ever take the capability AWAY.
+    """
+    forced = os.environ.get("BLARAI_RESEARCH_DOCS")
+    if forced is not None and forced.strip().lower() in _FALSY:
+        return DORMANT, (
+            f"forced off by BLARAI_RESEARCH_DOCS={forced.strip()!r} (operator emergency "
+            f"stop; the manifest was not consulted)"
+        )
+
+    path = manifest_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return UNRESOLVED, f"arming manifest not found at {path}"
+    except OSError as exc:  # unreadable / permissions / device error
+        return UNRESOLVED, f"arming manifest at {path} could not be read: {exc}"
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return UNRESOLVED, f"arming manifest at {path} is not valid JSON: {exc}"
+    if not isinstance(data, dict):
+        return UNRESOLVED, f"arming manifest at {path} is not a JSON object"
+
+    value = data.get(_MANIFEST_KEY)
+    # `is True` and not truthiness: JSON 1 and "true" are NOT an arming decision, and
+    # `1 == True` in Python would quietly accept one of them.
+    if value is True:
+        return ARMED, f"armed by {path} {_MANIFEST_KEY}=true"
+    if _MANIFEST_KEY not in data:
+        return DORMANT, f"{path} has no {_MANIFEST_KEY} key (deny-by-default)"
+    return DORMANT, (
+        f"{path} {_MANIFEST_KEY}={value!r} — only the JSON boolean true arms it"
+    )
+
+
 def is_enabled() -> bool:
-    """The DORMANT gate: ``BLARAI_RESEARCH_DOCS`` truthy. Default OFF."""
-    return os.environ.get("BLARAI_RESEARCH_DOCS", "").strip().lower() in _TRUTHY
+    """True only when the manifest arms this tool. Convenience over
+    :func:`resolve_arming`; callers that need to tell "off" from "cannot tell" must use
+    :func:`resolve_arming` instead, because both answer False here."""
+    return resolve_arming()[0] == ARMED
 
 
 def _blarai_repo() -> Path:
@@ -225,16 +317,33 @@ def main(argv: "list[str] | None" = None) -> int:
                         help="emit a JSON result object instead of human text.")
     args = parser.parse_args(argv)
 
-    # DORMANT gate — never even open the index while off.
-    if not is_enabled():
+    # ARMING gate — resolved off disk on every call, never inherited. The index is not
+    # opened unless the manifest armed us.
+    state, why = resolve_arming()
+    if state is not ARMED:
+        if state == UNRESOLVED:
+            # NOT "switched off". We could not find out, so we deny AND say so — a
+            # broken configuration must never be reported as a decision (#1206).
+            result = {
+                "available": False,
+                "reason": UNRESOLVED,
+                "message": f"could not determine whether the local research substrate is "
+                           f"armed: {why}. Refusing fail-closed. This is an unreadable "
+                           f"configuration, NOT a 'switched off' answer — fix the "
+                           f"manifest rather than assuming either state.",
+            }
+            _log_usage(query=args.query or "", outcome=UNRESOLVED, exact_hits=0, search_hits=0)
+            print(json.dumps(result) if args.json else _render_human(result))
+            return EXIT_UNAVAILABLE
         result = {
             "available": False,
-            "reason": "dormant",
-            "message": "local research substrate is DORMANT — set BLARAI_RESEARCH_DOCS=1 "
-                       "to enable (off by default, #746). No index was consulted.",
+            "reason": DORMANT,
+            "message": f"local research substrate is DORMANT ({why}). Arm it by setting "
+                       f"{_MANIFEST_KEY}=true in the fleet manifest (#1206). No index "
+                       f"was consulted.",
         }
         print(json.dumps(result) if args.json else _render_human(result))
-        return EXIT_OK  # dormant is a clean no-op, not an error
+        return EXIT_OK  # a deliberate dormant is a clean no-op, not an error
 
     if not (args.query or "").strip():
         print("search_docs: a query is required (a concrete symbol/error/question).",

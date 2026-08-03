@@ -523,6 +523,42 @@ if ($gitFailed) {
     Write-Host "  $($faultedCandidates.Count) candidate(s) FAULTED but a non-faulted candidate was selected. That selection stands; the faults are reported so this run is not read as a clean measurement." -ForegroundColor Yellow
 }
 
+# ---- #1195 CODER-TEST QA: examine the exam the candidate wrote FOR ITSELF, before the review decision ----
+# The [4/5] skip below rests on "the deterministic gates are GREEN", and one of those gates is TESTS. On a
+# flat-queue run there is no sealed oracle, so TESTS means the tests the CODER WROTE FOR ITS OWN CODE: the
+# candidate set the exam, sat it, marked it, and this harness reported the mark to the operator as evidence.
+# Run ceremony-check-create-kitchen-conversion-helper-20260729-164936 merged a unit converter whose ounce
+# factor is wrong by 2.5x that way -- the test that should have caught it named 0.0353 in its own comment and
+# then asserted 0.01 <= result <= 0.1. Every artifact said TESTS: pass.
+# This scan asks the question the gate never asks: not did the tests pass, but COULD they have failed. A
+# PROVEN defect (a property test that never executed; a test that cannot fail) withdraws the green-gate skip
+# so the reviewer actually looks. It NEVER blocks the merge -- the module is advisory by design and a false
+# block costs the operator an unattended night; Test-ShouldMerge remains the one merge authority.
+# Placed HERE, not earlier: $wt only holds the SELECTED candidate's committed tree after the best-of-N
+# promote + reset above (in the concurrent path $wt was the baseline holder until the promotion), and it must
+# be before the skip decision, which is what it withdraws.
+$coderQaSidecar = $Report -replace '\.txt$', '.coder-test-qa.json'
+$coderQa = New-CoderTestQaResult -Status 'not-applicable' -Detail 'no captured changes to examine'
+if ($hasChanges -and -not $gitFailed -and (Test-Path $wt)) {
+    # --stats is deliberately NOT passed: the [2/5] gate runs `pytest -x -q` with no
+    # --hypothesis-show-statistics and never persists its output, so no statistics artifact exists to point
+    # at. Format-CoderTestQaBlock DISCLOSES that gap rather than letting a counts map imply it was checked.
+    # #1201: -Since $codeBase confines the scan to THIS task's own work. $codeBase is the commit every
+    # candidate branched from (the seeded skeleton + the #690 acceptance oracle are already in it, so
+    # neither is ever charged to the coder), and it is the same anchor $hasChanges and a resample measure
+    # against -- so the exam examined is exactly the exam this task wrote. Without it the scan reads the
+    # whole delivered tree, and on a five-task night task N pays the FIX laps for tasks 1..N-1.
+    $coderQa = Invoke-CoderTestQa -Repo $wt -BlarAiRepo $BlarAiRepo -Since $codeBase
+}
+$coderTestHard = [int]$coderQa.Hard
+$coderQaBlock = Format-CoderTestQaBlock -Result $coderQa `
+    -SkipWithdrawn ($coderTestHard -gt 0 -and $verifyResult -eq 'pass' -and $testResult -eq 'pass')
+$coderQaColor = 'DarkGray'
+if ($coderTestHard -gt 0) { $coderQaColor = 'Red' }
+elseif (-not [bool]$coderQa.Measured -or $coderQa.Status -eq 'findings' -or $coderQa.Status -eq 'no-tests') { $coderQaColor = 'Yellow' }
+Write-Host $coderQaBlock -ForegroundColor $coderQaColor
+[void](Write-CoderTestQaSidecar -Path $coderQaSidecar -Json (ConvertTo-CoderTestQaSidecarJson -Result $coderQa))
+
 # ---- [4/5] REVIEW + bounded review-FEEDBACK (the FROZEN review side; #687/#689). Only runs when the
 # gates are NOT both green (Test-ShouldRunReview) -- e.g. a build-only dotnet/WinUI surface with no test
 # runner, where the review verdict genuinely decides the merge. A FIX FIRST feeds the findings back for a
@@ -531,9 +567,13 @@ if ($gitFailed) {
 # entirely (the deterministic gate already decided). ----
 $verdict = 'UNCLEAR'; $reviewTail = ''
 if ($hasChanges -and ($verifyResult -eq 'pass') -and ($testResult -eq 'pass')) {
-    Write-Host "[4/5] Review SKIPPED - deterministic gates are GREEN (build + tests + verify pass); the gate decides the merge and the cross-model critic reviews post-merge." -ForegroundColor DarkGray
+    if ($coderTestHard -gt 0) {
+        Write-Host "[4/5] Review RUNS despite GREEN gates - the coder's OWN exam carries $coderTestHard PROVEN defect(s) (#1195), so the green-gate skip is withdrawn and the reviewer gets to look. The merge gate is unchanged." -ForegroundColor Yellow
+    } else {
+        Write-Host "[4/5] Review SKIPPED - deterministic gates are GREEN (build + tests + verify pass); the gate decides the merge and the cross-model critic reviews post-merge." -ForegroundColor DarkGray
+    }
 }
-while ($hasChanges -and -not $dispatchCancelled -and -not $gitFailed -and (Test-ShouldRunReview -HasChanges $hasChanges -VerifyResult $verifyResult -TestResult $testResult)) {   # #771: a stopped run skips review-FIX (no more agent churn). #1074: so does a capture fault - there is no captured diff to review, and a fix lap would write more work into the same broken tree.
+while ($hasChanges -and -not $dispatchCancelled -and -not $gitFailed -and (Test-ShouldRunReview -HasChanges $hasChanges -VerifyResult $verifyResult -TestResult $testResult -CoderTestHard $coderTestHard)) {   # #771: a stopped run skips review-FIX (no more agent churn). #1074: so does a capture fault - there is no captured diff to review, and a fix lap would write more work into the same broken tree. #1195: a PROVEN defect in the coder's own exam withdraws the green-gate skip (it does not block the merge). The loop stays bounded by $MaxReviewPasses either way.
     Write-Host "[4/5] Review agent is judging the changes (max $MaxReviewMinutes min)..." -ForegroundColor Cyan
     $ReviewLog = $Report -replace '\.txt$', '.review.log'
     # #694: gather the diff IN POWERSHELL and embed it in the prompt (the exact critic-run.ps1
@@ -614,6 +654,20 @@ while ($hasChanges -and -not $dispatchCancelled -and -not $gitFailed -and (Test-
     $verifyDetail = $btv.VerifyDetail; $AgentLog = $btv.LogPath
     $noChangeDeclared = [bool]$btv.NoChangeDeclared; $noChangeEvidence = "$($btv.NoChangeEvidence)"   # #1049
     $gitFailed = [bool]$btv.GitFailed; $gitError = "$($btv.GitError)"; $gitFaultReason = "$($btv.GitFaultReason)"   # #1074
+    # #1195: a FIX lap rewrote the tree, so RE-EXAMINE the exam. The report must describe the tree that
+    # will actually merge, not the pre-fix one -- and a coder that repaired its own test should stop being
+    # charged for it. Re-entry stays bounded by $MaxReviewPasses regardless of what this returns.
+    if ($hasChanges -and -not $gitFailed -and (Test-Path $wt)) {
+        # #1201: the SAME baseline as the pre-review scan. A FIX lap adds commits on top of the
+        # candidate; it never moves the floor the task started from, so re-anchoring here would be wrong.
+        $coderQa = Invoke-CoderTestQa -Repo $wt -BlarAiRepo $BlarAiRepo -Since $codeBase
+    } else {
+        $coderQa = New-CoderTestQaResult -Status 'not-applicable' -Detail 'no captured changes to examine after the review-FIX lap'
+    }
+    $coderTestHard = [int]$coderQa.Hard
+    $coderQaBlock = Format-CoderTestQaBlock -Result $coderQa `
+        -SkipWithdrawn ($coderTestHard -gt 0 -and $verifyResult -eq 'pass' -and $testResult -eq 'pass')
+    [void](Write-CoderTestQaSidecar -Path $coderQaSidecar -Json (ConvertTo-CoderTestQaSidecarJson -Result $coderQa))
     if ($gitFailed) {
         Write-Host "  CAPTURE FAULT ($gitFaultReason) during the review-FIX lap: $gitError" -ForegroundColor Red
         # The aggregate note was built from the best-of-N candidates; a fault that happens HERE is
@@ -789,19 +843,11 @@ if ($_critiqueActive) {
         $loop = Invoke-CritiqueLoop -AppDir $wt -Goal $critiqueGoal `
             -VisualCriteriaJson $_visualTrimmed -BlarAiRepo $_blarAiRepo `
             -MaxIter 3 -WorkDir $critiqueWork -RebuildCallback $rebuildAutoFix
-        $fr = $loop.FinalResult
-        $fixTail = if ($script:fixNotes.Count) { "`n" + (($script:fixNotes) -join "`n") } else { '' }
-        if ($null -eq $fr) {
-            $critiqueSummary = "VLM critique ran but returned no result (treated as no-op).$fixTail"
-        } elseif ($fr.CaptureTier -eq 'structural') {
-            $critiqueSummary = "No pixel capture available (structural floor); visual critique skipped. $($fr.Feedback)$fixTail"
-        } elseif (-not $fr.Ok) {
-            $critiqueSummary = "VLM critique unavailable / failed (non-blocking): $($fr.Feedback)$fixTail"
-        } elseif ($fr.NeedsWork) {
-            $critiqueSummary = "VLM still suggests visual improvements after $($script:fixCount) auto-fix pass(es) (signal only — your eyeball is the verdict):`n$($fr.Feedback)$fixTail"
-        } else {
-            $critiqueSummary = "VLM critique: visual criteria look satisfied$(if ($script:fixCount) { " after $($script:fixCount) auto-fix pass(es)" }). $($fr.Feedback)$fixTail"
-        }
+        # #1198: the wording lives in Format-VisualCritiqueSummary (fleet-lib.ps1, pure + unit-tested), so
+        # the one disclosure that must survive here -- a design lint that produced NO verdict is never
+        # composed away into "visual criteria look satisfied" -- is provable rather than merely present.
+        $critiqueSummary = Format-VisualCritiqueSummary -Result $loop.FinalResult `
+            -FixNotes @($script:fixNotes) -FixCount $script:fixCount
         Write-Host "  critique: $($critiqueSummary -split "`n" | Select-Object -First 1)" -ForegroundColor DarkGray
     } catch {
         # The merge already happened; a critique error MUST NOT fail the task. Log + continue.
@@ -825,6 +871,7 @@ BUILD: $(if ($agentTimedOut) { Get-TimeoutStopText -Reason "$($run.TimeoutReason
 TRANSCRIPT: $AgentLog
 CHANGES: $(if ($gitFailed) {'UNKNOWN - the stage/commit step FAILED, so the coder''s output was never captured (see CAPTURE FAULT below). This is NOT a no-op and says NOTHING about the model.'} elseif ($secretBlocked) {'not committed - a potential secret blocked the commit; the work is left UNCOMMITTED in the worktree'} elseif ($hasChanges) {'yes'} elseif ($captureFaultNote) {'none made BY THE SELECTED CANDIDATE - but another candidate FAULTED (see CAPTURE FAULT below), so this run is NOT a clean no-op measurement.'} else {'none made'})$(if ($captureFaultNote) { "`nCAPTURE FAULT$(if (-not $gitFailed) { ' (a non-selected candidate; the selected result below stands)' }):`n$captureFaultNote" })$(if ($noChangeDeclared) { "`nNO-CHANGE DECLARED (#1049 honest terminal outcome; coder's evidence): $noChangeEvidence" })
 TESTS: $testResult$(if ($gitFailed) { ' (not run - nothing was captured to test)' })
+$coderQaBlock
 VERIFY: $verifyResult$(if ($verifyResult -eq 'fail') { ' (build/lint/typecheck FAILED - blocked the merge)' })$(if ($gitFailed) { ' (not run - nothing was captured to verify)' })
 SECRETS: $(if ($secretBlocked) { "BLOCKED - $($secret.detail)" } elseif ($secret.status -eq 'skipped') { 'NOT SCANNED - the stage step failed before the scan could run' } elseif ($secret.status -eq 'unavailable') { 'scan skipped (gitleaks not installed)' } else { 'clean' })
 ANOMALIES: $(if ($anomaly.Anomalies.Count) { ($anomaly.Anomalies -join '; ') } else { 'none' })$(if ($concurrencyNote) { "`nNOTE (concurrency): $concurrencyNote" })$(if ($dispatchCancelled) { "`nSTOPPED: a /dispatch stop was observed mid-run; best-of-N parked after the current candidate and did not start fresh candidates or auto-merge (#771)." })

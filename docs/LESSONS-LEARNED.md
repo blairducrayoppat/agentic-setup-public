@@ -1267,6 +1267,13 @@ targeted and surfaced the next one. Four things to keep.
   live drift), so editing the repo then syncing REVERTS the repo edit. Correct workflow: edit the
   LIVE `~/.config/opencode/AGENTS.md`, then sync pulls it into the repo. → FOLLOW-UP (tracked, not
   done here): scope sync-harness's `git add` to only the synced config files (never the whole tree).
+  → **CLOSED by #1190**: staging is now scoped to the destinations that invocation actually wrote,
+  the commit uses `--only` so a concurrent session's staged index is untouched, and git failures
+  warn with git's own words instead of vanishing into `Out-Null`. Locked by
+  `scripts/verify-sync-harness-staging.ps1`, which drives the shipped script against throwaway
+  repos and runs the pre-fix form as the control. The **live->repo direction is unchanged** (#780
+  owns that half, closed by the deploy-in-merge-motion procedure) — this bullet's workflow advice
+  still stands: edit the LIVE file, never the mirror.
 
 **Next:** re-run the Inc-3 test dispatch with the no-execute fix live -- the coder should extend +
 theme instead of hanging on a runner (and since the calculator already builds, even a breaker

@@ -17,17 +17,20 @@
 // ZERO EGRESS: the CLI reads only the local index file; no network, ever. This wrapper
 // spawns a local process and nothing else.
 //
-// DOUBLE-DORMANT (opt-in): (1) this file is STAGED here, not installed into the live
-// ~/.config/opencode/tool/ (that dir is deny-edit by fleet policy — install it
-// deliberately, see README.md); AND (2) the CLI itself is dormant unless the
-// environment has BLARAI_RESEARCH_DOCS=1, in which case this tool returns a clean
-// "dormant" note. Flip it on only at an explicit night-boundary.
+// DORMANT BY DEFAULT (#1206): this wrapper passes every query through to the CLI, and the
+// CLI decides for itself whether it is armed by reading `research_docs` in
+// configs/fleet-driver.json at the point of use — not from anything this wrapper or
+// opencode exports. That is deliberate: a capability carried by process-environment
+// inheritance is armed only for whoever was spawned by the right parent, and silently
+// dormant after a reboot, a crash relaunch, or in an already-running session. When the
+// manifest says false the CLI returns a clean "dormant" note, which renders as-is below.
 //
-// Environment (all optional; sensible defaults):
+// Environment (all optional; NONE of them can arm the tool):
 //   BLARAI_RESEARCH_PYTHON   python executable (default "python")
 //   BLARAI_RESEARCH_TOOL     absolute path to tools/search_docs.py
 //                            (default resolved relative to this file's repo)
-//   BLARAI_RESEARCH_DOCS     1 => enabled; unset => the CLI reports dormant
+//   BLARAI_RESEARCH_DOCS     emergency stop ONLY: a falsy value (0/false/no/off) forces
+//                            dormant. A truthy value has no effect — see the manifest.
 //   BLARAI_REPO              BlarAI repo root (default C:\Users\mrbla\blarai)
 
 import { execFile } from "node:child_process";
