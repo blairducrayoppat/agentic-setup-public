@@ -108,6 +108,42 @@ $gradientXaml = @{
 $gradientJson = Invoke-StructCheck -XamlFiles $gradientXaml
 Assert-JsonBool $gradientJson 'uses_nondefault_styling' $true 'SC13 LinearGradientBrush -> uses_nondefault_styling=true'
 
+# =============================================================================
+Section 'SC* -- #1140: a project with NO XAML surface gets NO design verdict'
+# Every signal this check reads comes out of XAML. With none, each degenerates to its
+# absent-value and the seed-only heuristic fires on any non-WinUI project -- so a
+# python CLI was told it "appears unmodified from template". Observed twice on
+# 2026-07-28 (battery B4, runs 20260728-074047-bd and 20260728-110640-bd).
+#
+# TOGGLE-PROOF (RUN, not asserted): against the pre-fix script 6 of these 8 fail --
+# SC30 SC32 SC33 SC34 SC36 SC37. SC31 and SC35 pass vacuously on unfixed code
+# (a MISSING key casts to false, and the old SEED-ONLY note suppressed the
+# absence-findings), which is why SC30 asserts the key EXISTS: SC31 is only a lock
+# in company with it. Numbered from SC30 because SC14-SC21 are already taken further
+# down this file -- duplicate ids make a failure report ambiguous.
+#
+# The toggle-proof was RUN against the unfixed file before committing, not assumed:
+# it returned seed_only=true and the SEED-ONLY note for exactly this input. A lock
+# that passes on unfixed code is not a lock (#1139's lesson, same day) -- and running
+# it is also what exposed the two vacuous passes and the id collision above.
+$pythonProject = @{
+    'app/__init__.py'      = '__version__ = "0.1.0"'
+    'app/cli.py'           = 'def main():' + "`n" + '    print("hello")'
+    'tests/test_smoke.py'  = 'def test_ok(): assert True'
+    'pyproject.toml'       = '[project]' + "`n" + 'name = "thing"'
+}
+$noSurface = Invoke-StructCheck -XamlFiles $pythonProject
+Assert-JsonKey  $noSurface 'design_check_applicable' 'SC30 result reports whether the check applies at all'
+Assert-JsonBool $noSurface 'design_check_applicable' $false 'SC31 no XAML -> design_check_applicable=false (only meaningful with SC30: a missing key also reads false)'
+Assert-JsonBool $noSurface 'seed_only' $false 'SC32 no XAML -> NOT reported as an unmodified seed'
+Assert-Match    $noSurface 'NOT-APPLICABLE' 'SC33 notes say the check does not apply'
+Assert-NoMatch  $noSurface 'SEED-ONLY' 'SC34 notes carry no seed verdict about a project with no UI'
+Assert-NoMatch  $noSurface 'NO-IMAGE-ASSETS|NO-CUSTOM-STYLING' 'SC35 notes carry no absence-findings that only restate "no XAML"'
+
+# The gate must not be permanently off: a real WinUI surface still gets assessed.
+Assert-JsonBool $seedJson   'design_check_applicable' $true 'SC36 XAML present -> the check still applies (gate is not stuck off)'
+Assert-JsonBool $themedJson 'design_check_applicable' $true 'SC37 themed XAML -> applicable, and SC12 still distinguishes it from the seed'
+
 Section 'SC* -- check-design-structural.ps1: emoji art anti-pattern detection'
 $emojiXaml = @{
     'MainWindow.xaml' = "<Window xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><StackPanel><Button Content='&#x1F680;' /><TextBlock Text='&#x2B50;'/></StackPanel></Window>"
@@ -398,6 +434,68 @@ $lkCdpSrc = Get-Content "$ScriptDir\capture-web-cdp.mjs" -Raw
 Assert-True ([regex]::IsMatch($lkCdpSrc, "process\.on\('exit', teardownSync\)")) 'LK5 [kill] capture-web-cdp.mjs registers exit-synchronous teardown (every exit path kills the tree)'
 Assert-True ([regex]::IsMatch($lkCdpSrc, "'/T', '/F'"))                    'LK6 the mjs teardown kills the process TREE (taskkill /T), not just the launcher PID'
 Assert-False ([regex]::IsMatch($lkCdpSrc, 'setTimeout\(.*rmSync'))         'LK7 [kill] the profile rm is never scheduled on a timer a process.exit() can kill (the 2026-07-21 leak shape)'
+
+# =============================================================================
+Section 'DS* -- declared-surface routing (#1171): the check states a fact, never a hypothesis'
+# The operator ALREADY answers "on this computer / in a web browser / on my phone" as a
+# button menu at intake, and the answer is pinned on build_plan.surface. Before #1171 that
+# answer never reached this script, so a no-XAML tree produced the hedge "only a finding if
+# this project was supposed to have a WinUI front end" -- an open question aimed at the one
+# person who cannot answer it from a report. These locks pin all three routes AND the
+# no-surface fallback, because a mis-routed surface is worse than the hedge it replaced.
+function Invoke-SurfaceCheck {
+    param([string]$Surface)
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("fleet-surf-{0}" -f ([guid]::NewGuid().ToString('N')))
+    New-Item -ItemType Directory -Force $tmp | Out-Null
+    try {
+        Set-Content -Path (Join-Path $tmp 'main.py') -Value "print('hello')" -Encoding UTF8
+        return & "$ScriptDir\check-design-structural.ps1" -AppDir $tmp -DeclaredSurface $Surface 2>&1 |
+               Select-String '^\{' | Select-Object -Last 1
+    } finally {
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+$dsCli = Invoke-SurfaceCheck -Surface 'command-line'
+Assert-Match    $dsCli 'you asked for a command-line project'  'DS1 a declared command-line surface is named back to the operator in their own terms'
+Assert-NoMatch  $dsCli 'supposed to have'                      'DS2 the hypothetical hedge is GONE once the surface is known'
+Assert-JsonBool $dsCli 'surface_missing' $false                'DS3 a command-line project with no XAML is not a missing surface'
+
+$dsLib = Invoke-SurfaceCheck -Surface 'library'
+Assert-JsonBool $dsLib 'surface_missing' $false                'DS4 a library with no XAML is not a missing surface'
+
+# The web lock is the load-bearing one. A web build has HTML and NO XAML by construction --
+# it is captured by capture-app.ps1's headless browser tier, never this XAML reader. Routing
+# it with desktop-gui would convict every correctly-built website of missing its interface.
+$dsWeb = Invoke-SurfaceCheck -Surface 'web'
+Assert-JsonBool $dsWeb 'surface_missing' $false                'DS5 a WEB project with no XAML is NOT a missing surface (its interface is not XAML)'
+Assert-Match    $dsWeb 'not built from XAML'                   'DS6 the web note names WHY this check does not apply'
+Assert-NoMatch  $dsWeb 'SURFACE-MISSING'                       'DS7 a correctly-built website is never convicted by the WinUI structural check'
+
+$dsMobile = Invoke-SurfaceCheck -Surface 'mobile'
+Assert-JsonBool $dsMobile 'surface_missing' $false             'DS8 a mobile project with no XAML is not a missing surface'
+
+# The one true mismatch: a windowed desktop app was asked for and there is no XAML at all.
+$dsGui = Invoke-SurfaceCheck -Surface 'desktop-gui'
+Assert-JsonBool $dsGui 'surface_missing' $true                 'DS9 desktop-gui with NO XAML is a real, stated mismatch'
+Assert-Match    $dsGui 'SURFACE-MISSING'                       'DS10 the mismatch is named, not hypothesised'
+
+# An un-threaded caller must not silently acquire a verdict the script has no basis for.
+$dsNone = Invoke-SurfaceCheck -Surface ''
+Assert-Match    $dsNone 'supposed to have a WinUI front end'   'DS11 with NO declared surface the pre-#1171 wording is preserved byte-for-byte'
+Assert-JsonBool $dsNone 'surface_missing' $false               'DS12 no declared surface -> never claims a missing surface'
+Assert-JsonKey  $dsNone 'declared_surface'                     'DS13 declared_surface is always emitted (empty when unsupplied)'
+
+# Interface locks: the parameter must exist at EVERY hop, or the surface silently stops
+# short and the operator gets the hedge back with no signal that threading broke.
+$dsStructSrc  = Get-Content "$ScriptDir\check-design-structural.ps1" -Raw
+$dsCaptureSrc = Get-Content "$ScriptDir\capture-app.ps1" -Raw
+$dsLoopSrc    = Get-Content "$ScriptDir\critique-loop.ps1" -Raw
+Assert-Match $dsStructSrc  '\[string\]\$DeclaredSurface'                    'DS14 check-design-structural.ps1 accepts -DeclaredSurface'
+Assert-Match $dsCaptureSrc '\[string\]\$DeclaredSurface'                    'DS15 capture-app.ps1 accepts -DeclaredSurface'
+Assert-Match $dsCaptureSrc '-DeclaredSurface \$DeclaredSurface'             'DS16 capture-app.ps1 PASSES it to the structural check'
+Assert-Match $dsLoopSrc    '\[string\]\$DeclaredSurface'                    'DS17 critique-loop.ps1 accepts -DeclaredSurface'
+Assert-Match $dsLoopSrc    '-DeclaredSurface \$DeclaredSurface'             'DS18 critique-loop.ps1 PASSES it onward to capture-app.ps1'
 
 # =============================================================================
 Section 'Result'

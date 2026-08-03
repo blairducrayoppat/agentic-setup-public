@@ -4,27 +4,12 @@ $LogDir = 'C:\Users\mrbla\agentic-setup\state\logs'
 $StoppedVms = 'C:\Users\mrbla\agentic-setup\state\stopped-vms.txt'
 $KnownGoodDriver = '32.0.101.8826'
 
+. "$PSScriptRoot\ai-inventory-lib.ps1"   # the ONE model detection (assistant + OVMS + watchdog + the cannot-see notes)
+
 Write-Host "=============== AI STATUS ===============" -ForegroundColor Cyan
 
-# --- Model server ---
-$p = Get-Process ovms -ErrorAction SilentlyContinue
-if ($p) {
-    $ids = $null
-    try {
-        $r = Invoke-WebRequest 'http://127.0.0.1:8000/v3/models' -TimeoutSec 3 -UseBasicParsing
-        $ids = @((($r.Content | ConvertFrom-Json).data) | ForEach-Object { $_.id }) -join ', '
-    } catch {}
-    if ($ids) { Write-Host "Model server : RUNNING - loaded model: $ids" -ForegroundColor Green }
-    else      { Write-Host "Model server : process exists but NOT answering (may still be loading, or wedged - 'Stop AI Models' then relaunch)" -ForegroundColor Yellow }
-    Write-Host ("               process memory: {0:N1} GB (GPU-shared allocations not fully shown here)" -f ($p.WorkingSet64/1GB))
-} else {
-    Write-Host "Model server : not running (double-click a model launcher to load one)" -ForegroundColor Yellow
-    $listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($listener) {
-        $owner = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
-        Write-Host "  WARNING: port 8000 is occupied by '$($owner.Name)' - model launchers will refuse to start until it is closed." -ForegroundColor Red
-    }
-}
+# --- AI models in RAM (shared detection; VMs get their own section below) ---
+Write-AiInventoryReport (Get-AiModelInventory) -NoVmLine
 
 # --- Memory ---
 $os = Get-CimInstance Win32_OperatingSystem

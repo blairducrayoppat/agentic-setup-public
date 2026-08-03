@@ -44,7 +44,13 @@
 #>
 param(
     [Parameter(Mandatory)][string]$AppDir,
-    [string]$OutJson = ''
+    [string]$OutJson = '',
+    # #1171: the surface the OPERATOR chose at intake -- 'desktop-gui', 'web', 'mobile',
+    # 'command-line', 'automation', 'library'. Empty = not supplied (an older caller), which
+    # reproduces the pre-#1171 hedge byte-for-byte. See the applicability block below for why
+    # this parameter exists at all: the answer is already collected deterministically from a
+    # button menu at intake, and this check was the one place still guessing at it.
+    [string]$DeclaredSurface = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -162,35 +168,112 @@ foreach ($ctrl in $controlElements) {
 # ---- Custom templates -------------------------------------------------------
 $hasCustomTemplates = [bool]($allXaml -match '<(?:Control|Data)Template\b')
 
+# ---- Applicability (#1140) ---------------------------------------------------
+# EVERY signal below is read out of XAML. With no XAML there is no visual design
+# surface to assess, and each signal degenerates to its absent-value: zero images,
+# zero styling, zero templates, zero controls -- which is indistinguishable from an
+# unmodified WinUI seed. So a Python CLI, a library or a service scored as
+# "SEED-ONLY: appears unmodified from template", i.e. the check told the operator a
+# fully-built project had never been touched. Observed twice on 2026-07-28 (battery
+# runs 20260728-074047-bd and 20260728-110640-bd, card B4, a python command-line
+# flashcard app: "SEED-ONLY ...; NO-XAML-FILES: no XAML found").
+#
+# A check that cannot see its subject must SAY SO rather than report the absence of
+# evidence as evidence of absence. Same discipline as the #1133 unserved-asset fix:
+# with no way to distinguish the cases, decline instead of inventing a diagnosis.
+$designSurfacePresent = $xamlCount -gt 0
+
 # ---- Seed-only heuristic ----------------------------------------------------
 # The unmodified seed has exactly 2 XAML files (App.xaml + MainWindow.xaml),
-# one Button, one TextBlock, no styling, no images, no templates.
-$seedOnly = ($xamlCount -le 2) -and
+# one Button, one TextBlock, no styling, no images, no templates. Gated on the
+# surface existing at all -- "unmodified WinUI seed" is not a statement you can
+# make about a project that has no WinUI in it.
+$seedOnly = $designSurfacePresent -and
+            ($xamlCount -le 2) -and
             (-not $hasImageAssets) -and
             (-not $usesNonDefaultStyling) -and
             (-not $hasCustomTemplates) -and
             ($controlCount -le 3)   # seed has 1 Button + 1 TextBlock + 1 StackPanel
 
 # ---- Notes string -----------------------------------------------------------
-$notesParts = @()
-if ($seedOnly)               { $notesParts += "SEED-ONLY: appears unmodified from template (no theming, no images, seed controls only)" }
-if ($emojiArtPlaceholder)    { $notesParts += "EMOJI-ART-PLACEHOLDER: emoji used as graphic content (should use real images)" }
-if (-not $hasImageAssets -and -not $seedOnly) { $notesParts += "NO-IMAGE-ASSETS: no embedded image files found" }
-if (-not $usesNonDefaultStyling -and -not $seedOnly) { $notesParts += "NO-CUSTOM-STYLING: XAML uses no explicit colors/fonts/brushes" }
-if ($xamlCount -eq 0)        { $notesParts += "NO-XAML-FILES: no XAML found under $AppDir" }
-$notes = if ($notesParts.Count -gt 0) { $notesParts -join '; ' } else { "Design signals present: $controlCount controls, styling applied, image assets=$hasImageAssets" }
+if (-not $designSurfacePresent) {
+    # One honest line, and NO design verdict. Deliberately does not carry SEED-ONLY,
+    # NO-IMAGE-ASSETS or NO-CUSTOM-STYLING: each would read as a finding about the
+    # build when it is only a restatement of "this project has no XAML".
+    #
+    # #1171 -- and it must not GUESS whether the absence matters. The pre-#1171 line ended
+    # "only a finding if this project was supposed to have a WinUI front end", which reads
+    # as an open question to the one person who cannot answer it from a report. The
+    # question is not open: intake ALREADY asks the operator, as a button menu ("On this
+    # computer" / "In a web browser" / "On my phone"), and pins the answer on the spec's
+    # build_plan.surface. That answer simply never reached this script. So take the
+    # declared surface and say the definite thing -- no wording inference anywhere in the
+    # chain, because the person already told us.
+    # Three-way, and the split is NOT ui-vs-no-ui. THIS check reads XAML, so the only
+    # surface whose absence of XAML is a defect is the WinUI one. A `web` build has HTML
+    # and no XAML BY CONSTRUCTION -- it is captured by capture-app.ps1's headless browser
+    # tier, never this one -- so lumping it in with desktop-gui would have convicted every
+    # correctly-built website of missing its own interface. `mobile` likewise.
+    $noVisualSurfaces = @('command-line', 'library', 'automation')
+    $nonXamlVisual    = @('web', 'mobile')
+    $ds = "$DeclaredSurface".Trim().ToLowerInvariant()
+    if ($noVisualSurfaces -contains $ds) {
+        # Expected by construction: the operator chose a surface that HAS no visual front
+        # end. Not a finding, and no hedge -- an absence that was specified is just the spec.
+        $notes = "NOT-APPLICABLE: you asked for a $ds project, which has no visual " +
+                 "interface to inspect, so the structural design check does not apply " +
+                 "and draws NO conclusion about this build."
+    } elseif ($nonXamlVisual -contains $ds) {
+        # A real visual surface that this check is simply the wrong instrument for. Say
+        # which instrument owns it, so "no XAML" never reads as "no interface".
+        $notes = "NOT-APPLICABLE: you asked for a $ds project, whose interface is not " +
+                 "built from XAML, so this WinUI structural check does not apply and " +
+                 "draws NO conclusion about this build (the browser capture tier owns " +
+                 "the visual signal for this surface)."
+    } elseif ($ds -eq 'desktop-gui') {
+        # The one true mismatch: a WinUI desktop app was asked for and there is no XAML in
+        # the tree. That IS the finding the old wording could only hypothesise about.
+        $notes = "SURFACE-MISSING: you asked for a desktop app with a window, but no XAML " +
+                 "UI surface exists under $AppDir -- the build has no desktop interface. " +
+                 "This is a genuine mismatch between what was asked for and what was built."
+    } else {
+        # No surface supplied (older caller, or an 'unknown'/'ambiguous' spec that never got
+        # clarified). Keep the pre-#1171 wording EXACTLY: an un-threaded caller must not
+        # silently acquire a confident verdict this script has no basis for.
+        $notes = "NOT-APPLICABLE: no XAML UI surface under $AppDir, so the structural " +
+                 "design check has nothing to assess and draws NO conclusion about this " +
+                 "build. Expected for a command-line tool, library or service; only a " +
+                 "finding if this project was supposed to have a WinUI front end."
+    }
+} else {
+    $notesParts = @()
+    if ($seedOnly)               { $notesParts += "SEED-ONLY: appears unmodified from template (no theming, no images, seed controls only)" }
+    if ($emojiArtPlaceholder)    { $notesParts += "EMOJI-ART-PLACEHOLDER: emoji used as graphic content (should use real images)" }
+    if (-not $hasImageAssets -and -not $seedOnly) { $notesParts += "NO-IMAGE-ASSETS: no embedded image files found" }
+    if (-not $usesNonDefaultStyling -and -not $seedOnly) { $notesParts += "NO-CUSTOM-STYLING: XAML uses no explicit colors/fonts/brushes" }
+    $notes = if ($notesParts.Count -gt 0) { $notesParts -join '; ' } else { "Design signals present: $controlCount controls, styling applied, image assets=$hasImageAssets" }
+}
 
 # ---- Assemble result --------------------------------------------------------
 $result = [ordered]@{
-    has_image_assets        = $hasImageAssets
-    image_asset_count       = $imageAssetCount
-    uses_nondefault_styling = $usesNonDefaultStyling
-    emoji_art_placeholder   = $emojiArtPlaceholder
-    control_count           = $controlCount
-    xaml_file_count         = $xamlCount
-    has_custom_templates    = $hasCustomTemplates
-    seed_only               = $seedOnly
-    notes                   = $notes
+    has_image_assets          = $hasImageAssets
+    image_asset_count         = $imageAssetCount
+    uses_nondefault_styling   = $usesNonDefaultStyling
+    emoji_art_placeholder     = $emojiArtPlaceholder
+    control_count             = $controlCount
+    xaml_file_count           = $xamlCount
+    has_custom_templates      = $hasCustomTemplates
+    seed_only                 = $seedOnly
+    design_check_applicable   = $designSurfacePresent
+    # #1171: what the OPERATOR chose at intake ('' when the caller supplied nothing), and
+    # whether a declared visual surface is missing from the build. Emitted so the downstream
+    # report states the mismatch as a fact instead of restating the open question.
+    declared_surface          = "$DeclaredSurface".Trim().ToLowerInvariant()
+    # desktop-gui ONLY: it is the sole surface this XAML-reading check can convict. web /
+    # mobile have no XAML by construction and are owned by the browser capture tier.
+    surface_missing           = ((-not $designSurfacePresent) -and
+                                 ("$DeclaredSurface".Trim().ToLowerInvariant() -eq 'desktop-gui'))
+    notes                     = $notes
 }
 
 $json = $result | ConvertTo-Json -Compress

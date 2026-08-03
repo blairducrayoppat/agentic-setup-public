@@ -4,7 +4,7 @@ These seeds are NEUTRAL -- they assert nothing about the product, so they stay t
 (and green) for the life of the project. Keep them, and add the task's real tests
 beside them.
 
-House rules for the tests you add (README.md has the worked exemplar):
+House rules for the tests you add (AGENTS.md has the worked exemplar):
 - Interactive entry points take their I/O as a parameter (an answer_fn / input_fn
   argument): the cli passes input, tests pass a stub. Never read a real tty in a test.
 - Data files live under pytest's tmp_path fixture, never at the repo root: a test

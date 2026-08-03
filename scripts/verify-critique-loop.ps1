@@ -1093,6 +1093,317 @@ Assert-False $pl.Hard 'PL2 PNG present but no python.exe -> Hard=$false (fail-so
 Assert-Eq 0 @($pl.Messages).Count 'PL2 no python -> no messages'
 
 # =============================================================================
+Section 'LM* -- #1198: fail-soft is not fail-silent -- a lint that DID NOT RUN never reads as clean'
+# THE DEFECT (#1198): both lints returned @{ Hard=$false; Messages=@() } on EVERY failure path, so a
+# missing tool, an unreadable input and a crash were byte-identical to "ran, found nothing". A missing
+# layout tool meant every deliverable on the node-web/web/winui surfaces reported a clean layout, forever,
+# silently. These lock the distinction at the source -- Measured is the gate, never the message count.
+
+# LM1 [kill]: the tool is absent -> UNMEASURED, with the cause carried.
+$lm = Invoke-LayoutLint -AppDir $fakeAppDir -BlarAiRepo $fakeBlarAI
+Assert-False ([bool]$lm.Measured) 'LM1 [kill] no interpreter -> Measured=$false (an absent lint cannot certify a layout)'
+Assert-Eq 'unavailable' $lm.Status 'LM1 status is unavailable, NOT clean'
+Assert-Contains $lm.Detail 'python' 'LM1 [kill] the cause is carried, so the operator can see WHY it did not run'
+Assert-False ([bool]$lm.Hard) 'LM1 an unmeasured lint forces nothing (it found no defect -- it found nothing)'
+
+# LM2 [kill]: same for the pixel lint, both of its pre-flight refusals.
+$lm = Invoke-PixelLint -Png (Join-Path $scratch 'no-such.png') -BlarAiRepo $fakeBlarAI
+Assert-False ([bool]$lm.Measured) 'LM2 [kill] missing PNG -> Measured=$false (nothing was rendered to examine)'
+Assert-Eq 'unavailable' $lm.Status 'LM2 status is unavailable, NOT clean'
+$lm = Invoke-PixelLint -Png $fakePng -BlarAiRepo $fakeBlarAI
+Assert-False ([bool]$lm.Measured) 'LM2b [kill] PNG present but no interpreter -> Measured=$false'
+Assert-Contains $lm.Detail 'python' 'LM2b the cause is carried'
+
+# LM3: the caveat renderer is PURE and says the one thing that matters, in both degraded shapes.
+$cv = Format-DesignLintCaveat -Lint 'layout' -Measured $false -Status 'unavailable' -Detail 'no BlarAI python interpreter at X'
+Assert-Contains $cv 'DID NOT RUN'   'LM3 an unavailable lint is reported as DID NOT RUN'
+Assert-Contains $cv 'UNEXAMINED'    'LM3 [kill] and names the axis as UNEXAMINED'
+Assert-Contains $cv 'not a clean one' 'LM3 [kill] and refuses the clean reading in words'
+$cv = Format-DesignLintCaveat -Lint 'pixel' -Measured $false -Status 'not-applicable' -Detail 'no screenshot was captured'
+Assert-Contains $cv 'NOTHING TO EXAMINE' 'LM3b a not-applicable lint is distinguished from a broken one'
+Assert-Contains $cv 'rendered-pixel'     'LM3b and names which lint it is'
+Assert-Eq '' (Format-DesignLintCaveat -Lint 'layout' -Measured $true) 'LM3c [kill] a MEASURED lint emits NO caveat (the channel is silent when everything reported)'
+
+# LM4: a PARTIAL examination is its own fact -- files the lint could not parse are disclosed, not absorbed.
+$cv = Format-DesignLintCaveat -Lint 'layout' -Measured $true -Unparsed @('Broken.xaml')
+Assert-Contains $cv 'SKIPPED 1 file' 'LM4 [kill] a measured-but-partial lint still discloses what it skipped'
+Assert-Contains $cv 'Broken.xaml'    'LM4 and names the file'
+Assert-Contains $cv 'not a clean one' 'LM4 [kill] and refuses the clean reading for those files'
+
+# =============================================================================
+Section 'LMV* -- #1198: an UNMEASURED lint changes the REPORT, never the VERDICT'
+# The deliberate call (ticket item 4). Unmeasured must not silently become a hard failure -- forcing a FIX
+# lap over an absent measurement spends the iteration budget re-running the coder against nothing, and
+# asserts a defect was found when none was. Nor may it be silence. So it rides its own channel.
+
+$mMeasured = Merge-DesignSignals -LayoutHard $false -VlmOk $true -VlmNeedsWork $false -VlmShouldIterate $false `
+    -VlmFeedback 'All criteria met.' -Iteration 0 -MaxIter 3
+$mAbsent = Merge-DesignSignals -LayoutHard $false -LayoutMeasured $false -LayoutStatus 'unavailable' `
+    -LayoutDetail 'no BlarAI python interpreter at X' -VlmOk $true -VlmNeedsWork $false -VlmShouldIterate $false `
+    -VlmFeedback 'All criteria met.' -Iteration 0 -MaxIter 3
+Assert-False $mAbsent.ShouldIterate 'LMV1 [kill] an UNMEASURED lint does NOT force a FIX lap (a broken tool must not burn the iteration budget)'
+Assert-False $mAbsent.NeedsWork     'LMV1 [kill] nor does it assert a defect was found -- none was'
+Assert-Eq $mMeasured.Feedback $mAbsent.Feedback 'LMV1 [kill] the CODER-facing feedback is byte-identical (the coder cannot fix a missing interpreter)'
+Assert-False ([bool]$mAbsent.LintsMeasured) 'LMV2 [kill] but LintsMeasured is FALSE, so the report can never call this examined'
+Assert-Contains $mAbsent.CaveatText 'DID NOT RUN' 'LMV2 and the caveat channel carries the absence'
+Assert-Contains $mAbsent.CaveatText 'python'      'LMV2 [kill] with the cause, not just the fact'
+
+# LMV3 [kill]: omitting the #1198 params reproduces the prior behavior byte-for-byte (inert default).
+Assert-True  ([bool]$mMeasured.LintsMeasured) 'LMV3 [kill] omitting the measured params -> LintsMeasured true (inert default, pre-#1198 callers unchanged)'
+Assert-Eq '' $mMeasured.CaveatText            'LMV3 [kill] and NO caveat text (the channel is silent)'
+Assert-Eq 0 @($mMeasured.Caveats).Count       'LMV3 and no caveat entries'
+
+# LMV4: a HARD finding still overrides regardless -- the measured channel is orthogonal to the verdict.
+$mHardAbsent = Merge-DesignSignals -LayoutHard $false -PixelHard $true -PixelMessages @('blue is absent.') `
+    -LayoutMeasured $false -LayoutStatus 'unavailable' -LayoutDetail 'gone' `
+    -VlmOk $true -VlmNeedsWork $false -VlmShouldIterate $false -VlmFeedback '' -Iteration 0 -MaxIter 3
+Assert-True $mHardAbsent.ShouldIterate 'LMV4 [kill] an unmeasured layout lint does not suppress a hard PIXEL finding'
+Assert-Contains $mHardAbsent.Feedback 'blue is absent' 'LMV4 the real finding still reaches the coder'
+Assert-False ([bool]$mHardAbsent.LintsMeasured) 'LMV4 and the absence is still disclosed alongside it'
+
+# =============================================================================
+Section 'LMR* -- #1198: the REAL layout lint, tested ON and toggled OFF (principle 12)'
+# Principle 12: a control ships with a test proving it FIRES when engaged and a toggle proving the probe
+# FAILS when the lock is off -- otherwise "secure" and "the test cannot reach it" are indistinguishable.
+# These run the REAL shared/fleet/layout_lint.py over REAL crafted XAML through the REAL Invoke-LayoutLint.
+$lmrRepo = $(if ($env:BLARAI_REPO) { $env:BLARAI_REPO } else { 'C:\Users\mrbla\blarai' })
+$lmrRoot = Join-Path $scratch 'lmr'
+$lmrBroken = Join-Path $lmrRoot 'broken'; $lmrClean = Join-Path $lmrRoot 'clean'
+$lmrNoXaml = Join-Path $lmrRoot 'web';    $lmrUnparse = Join-Path $lmrRoot 'unparse'
+foreach ($d in @($lmrBroken, $lmrClean, $lmrNoXaml, $lmrUnparse)) { New-Item -ItemType Directory -Force $d | Out-Null }
+$lmrNs = 'xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"'
+# A Grid with 2 rows and a child at Grid.Row=5 -> the grid-index-out-of-range HIGH rule.
+Set-Content -Encoding UTF8 -Path (Join-Path $lmrBroken 'MainWindow.xaml') -Value @"
+<Window $lmrNs>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+    <TextBlock x:Name="Display" Grid.Row="0" Text="0" />
+    <Button x:Name="Keypad" Grid.Row="5" Content="7" />
+  </Grid>
+</Window>
+"@
+Set-Content -Encoding UTF8 -Path (Join-Path $lmrClean 'MainWindow.xaml') -Value @"
+<Window $lmrNs>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+    <TextBlock x:Name="Display" Grid.Row="0" Text="0" />
+    <Button x:Name="Keypad" Grid.Row="1" Content="7" />
+  </Grid>
+</Window>
+"@
+Set-Content -Encoding UTF8 -Path (Join-Path $lmrNoXaml 'index.html') -Value '<!doctype html><html><body>hi</body></html>'
+Set-Content -Encoding UTF8 -Path (Join-Path $lmrUnparse 'MainWindow.xaml') -Value '<Window><Grid>'
+
+$lmrOn = Invoke-LayoutLint -AppDir $lmrBroken -BlarAiRepo $lmrRepo
+if ($lmrOn.Measured) {
+    # ---- the control ON: the real module, the real defect, a real verdict --------------------------
+    Assert-Eq 'findings' $lmrOn.Status "LMR1 [kill] the REAL lint FIRES on a real geometry defect (status findings)"
+    Assert-True ([bool]$lmrOn.Hard) 'LMR1 and reports it hard'
+    Assert-Contains ($lmrOn.Messages -join ' | ') 'Grid.Row=5' 'LMR1 the real finding is carried verbatim'
+    Assert-Eq 1 $lmrOn.FilesScanned 'LMR1 and the file count is real'
+
+    $lmrClean1 = Invoke-LayoutLint -AppDir $lmrClean -BlarAiRepo $lmrRepo
+    Assert-True ([bool]$lmrClean1.Measured) 'LMR2 a sound layout is MEASURED...'
+    Assert-Eq 'clean' $lmrClean1.Status    'LMR2 [kill] ...and reads clean -- so clean and unmeasured are now distinguishable in the same run'
+    Assert-Eq '' (Format-DesignLintCaveat -Lint 'layout' -Measured $lmrClean1.Measured -Unparsed $lmrClean1.Unparsed) `
+        'LMR2 a genuinely clean lint prints no caveat (no crying wolf)'
+
+    # The node-web / web surfaces the ticket names: zero XAML is NOT a clean layout, it is no layout.
+    $lmrWeb = Invoke-LayoutLint -AppDir $lmrNoXaml -BlarAiRepo $lmrRepo
+    Assert-False ([bool]$lmrWeb.Measured) 'LMR3 [kill] zero .xaml files -> UNMEASURED, not clean (the node-web/web surface case)'
+    Assert-Eq 'not-applicable' $lmrWeb.Status 'LMR3 and it is not-applicable, distinguishable from a broken tool'
+    Assert-Eq 0 $lmrWeb.FilesScanned 'LMR3 the real count is zero'
+
+    # An input the module could not read: LOW severity, so it never reaches Hard or the HIGH filter.
+    $lmrUnp = Invoke-LayoutLint -AppDir $lmrUnparse -BlarAiRepo $lmrRepo
+    Assert-False ([bool]$lmrUnp.Measured) 'LMR4 [kill] a XAML file that will not parse -> UNMEASURED (it was scanned, never examined)'
+    Assert-Contains $lmrUnp.Detail 'failed to read or parse' 'LMR4 and the cause is named'
+
+    # ---- the TOGGLE OFF: same tree, same call, tool removed -> the probe must FAIL ------------------
+    $lmrOff = Invoke-LayoutLint -AppDir $lmrBroken -BlarAiRepo (Join-Path $scratch 'no-such-blarai-root')
+    Assert-False ([bool]$lmrOff.Measured) 'LMR5 [kill] TOGGLE: with the tool removed the SAME tree is UNMEASURED...'
+    Assert-Eq 'unavailable' $lmrOff.Status 'LMR5 ...and unavailable, not clean'
+    Assert-False ([bool]$lmrOff.Hard) 'LMR5 the real hard finding is GONE -- proving LMR1 measured something rather than asserting it'
+    Assert-Eq 0 @($lmrOff.Messages).Count 'LMR5 and carries no findings'
+} else {
+    # shared/fleet/layout_lint.py is not reachable from this checkout. That is not a skip: it IS the
+    # degraded path, and the property that matters is asserted HERE instead, so this section has teeth in
+    # both environments and goes quiet in neither.
+    Write-Host "  NOTE: shared/fleet/layout_lint.py is not runnable from $lmrRepo -- asserting the DEGRADED contract instead." -ForegroundColor Yellow
+    Assert-False ([bool]$lmrOn.Measured) 'LMR1-alt [kill] an unreachable module -> Measured=$false, NEVER a clean layout'
+    Assert-Eq 'unavailable' $lmrOn.Status 'LMR2-alt status is unavailable'
+    Assert-True ([bool]$lmrOn.Detail) 'LMR3-alt [kill] and python own last words are carried, so the operator can see WHY'
+    Assert-Contains (Format-DesignLintCaveat -Lint 'layout' -Measured $lmrOn.Measured -Detail $lmrOn.Detail -Status $lmrOn.Status) `
+        'UNEXAMINED' 'LMR4-alt and the caveat says the layout is unexamined'
+}
+
+# =============================================================================
+Section 'LMB* -- #1198: the tool is PRESENT but BROKEN (the degraded paths that actually ship)'
+# "The tool is missing" is the EASY degraded path. The ones that ship broken are the tool that runs and
+# returns garbage, exits non-zero, or writes bytes the parser rejects -- a sibling verification on
+# 2026-07-30 found a live PowerShell/Python divergence caused by nothing but a UTF-8 BOM, invisible to a
+# test whose fixture came from `Set-Content -Encoding UTF8` (no BOM under pwsh 7, BOM under 5.1). So
+# these drive the REAL Invoke-LayoutLint against a REAL python process running a CONTROLLED module, and
+# demand the same answer from every shape of misbehaviour: UNMEASURED, never clean.
+$lmbRoot = Join-Path $scratch 'fakerepo'
+$realPy  = Join-Path $lmrRepo '.venv\Scripts\python.exe'
+if (Test-Path $realPy) {
+    New-Item -ItemType Directory -Force (Join-Path $lmbRoot '.venv\Scripts') | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $lmbRoot 'shared\fleet') | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $lmbRoot 'app') | Out-Null
+    Copy-Item $realPy (Join-Path $lmbRoot '.venv\Scripts\python.exe') -Force
+    $realCfg = Join-Path $lmrRepo '.venv\pyvenv.cfg'
+    if (Test-Path $realCfg) { Copy-Item $realCfg (Join-Path $lmbRoot '.venv\pyvenv.cfg') -Force }
+    Set-Content -Encoding UTF8 -Path (Join-Path $lmbRoot 'shared\__init__.py') -Value ''
+    Set-Content -Encoding UTF8 -Path (Join-Path $lmbRoot 'shared\fleet\__init__.py') -Value ''
+    # A stand-in for the real module whose MISBEHAVIOUR is selected by an env var. Written through an
+    # explicit no-BOM encoder, so this fixture's own encoding cannot silently become the thing under test.
+    $lmbMod = @'
+import os, sys, json
+mode = os.environ.get("FAKE_LINT_MODE", "ok")
+payload = {"findings": [{"rule": "grid-index-out-of-range", "severity": "high",
+                         "message": "A REAL HARD FINDING", "element": "X", "file": "MainWindow.xaml"}],
+           "hard": True, "files_scanned": 1}
+if mode == "ok":
+    print(json.dumps(payload))
+elif mode == "garbage":
+    print("Traceback (most recent call last):")
+    print("  ValueError: everything is fine actually")
+elif mode == "exit1-with-json":
+    print(json.dumps(payload)); sys.exit(1)
+elif mode == "exit2-no-json":
+    sys.stderr.write("ERROR: bad usage\n"); sys.exit(2)
+elif mode == "bom":
+    sys.stdout.buffer.write(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8") + b"\n")
+elif mode == "utf16":
+    sys.stdout.buffer.write(json.dumps(payload).encode("utf-16"))
+elif mode == "empty":
+    pass
+'@
+    [System.IO.File]::WriteAllText((Join-Path $lmbRoot 'shared\fleet\layout_lint.py'), $lmbMod,
+        (New-Object System.Text.UTF8Encoding($false)))
+    $lmbApp = Join-Path $lmbRoot 'app'
+    $lmbPrev = $env:FAKE_LINT_MODE
+    try {
+        # LMB0: the fixture is REAL -- if the control cannot fire here, nothing below it has teeth.
+        $env:FAKE_LINT_MODE = 'ok'
+        $b = Invoke-LayoutLint -AppDir $lmbApp -BlarAiRepo $lmbRoot
+        Assert-True ([bool]$b.Measured) 'LMB0 [kill] the controlled tool RUNS and is measured (a real process, not a stub)'
+        Assert-Eq 'findings' $b.Status  'LMB0 and its hard finding is read'
+
+        # Each of these is a tool that RAN. None may report a clean layout.
+        foreach ($case in @(
+            @{ Mode = 'garbage';       Msg = 'returns a traceback instead of JSON' }
+            @{ Mode = 'exit2-no-json'; Msg = 'exits non-zero with no JSON' }
+            @{ Mode = 'bom';           Msg = 'emits a UTF-8 BOM before its JSON (the sibling divergence)' }
+            @{ Mode = 'utf16';         Msg = 'emits UTF-16 the parser cannot read' }
+            @{ Mode = 'empty';         Msg = 'prints nothing at all' })) {
+            $env:FAKE_LINT_MODE = $case.Mode
+            $b = Invoke-LayoutLint -AppDir $lmbApp -BlarAiRepo $lmbRoot
+            Assert-False ([bool]$b.Measured) "LMB [kill] a tool that $($case.Msg) -> UNMEASURED, never clean"
+            Assert-Eq 'unavailable' $b.Status "LMB and its status is unavailable ($($case.Mode))"
+            Assert-False ([bool]$b.Hard) "LMB and it forces nothing ($($case.Mode))"
+            Assert-True ((Format-DesignLintCaveat -Lint 'layout' -Measured $b.Measured -Detail $b.Detail -Status $b.Status) -ne '') `
+                "LMB and the operator gets a caveat ($($case.Mode))"
+        }
+
+        # LMB6: the ONE case that is deliberately measured. The verdict is the JSON on stdout, never the
+        # exit code -- the same rule verify-coder-test-qa.ps1 X1 locks for the coder-QA scanner, whose
+        # module exits 0 by design. A lint that PRINTED its verdict and then died still delivered one.
+        $env:FAKE_LINT_MODE = 'exit1-with-json'
+        $b = Invoke-LayoutLint -AppDir $lmbApp -BlarAiRepo $lmbRoot
+        Assert-True ([bool]$b.Measured) 'LMB6 a tool that printed valid JSON and THEN exited non-zero is measured (the verdict is the JSON, never the exit code)'
+        Assert-True ([bool]$b.Hard) 'LMB6 [kill] and its real finding is NOT discarded on the strength of an exit code'
+    } finally {
+        if ($null -eq $lmbPrev) { Remove-Item Env:\FAKE_LINT_MODE -ErrorAction SilentlyContinue }
+        else { $env:FAKE_LINT_MODE = $lmbPrev }
+    }
+} else {
+    Write-Host "  NOTE: no interpreter at $realPy -- the present-but-broken cases cannot be driven; asserting the absent-tool contract instead." -ForegroundColor Yellow
+    $b = Invoke-LayoutLint -AppDir $fakeAppDir -BlarAiRepo $lmbRoot
+    Assert-False ([bool]$b.Measured) 'LMB0-alt [kill] with no interpreter the lint is UNMEASURED, never clean'
+}
+
+# =============================================================================
+Section 'VS* -- #1198: the REPORT the operator reads (Format-VisualCritiqueSummary, pure)'
+# The ticket's own observable lives here: with the layout tool removed from PATH, the design-critique
+# report must say the lint could not run, and the deliverable must not read as having a clean layout.
+# The wording is a function precisely so that sentence is provable rather than merely present.
+
+$vsClean = @{ CaptureTier = '1'; Ok = $true; NeedsWork = $false; Feedback = 'All criteria met.'
+              LintsMeasured = $true; CaveatText = '' }
+$vs = Format-VisualCritiqueSummary -Result $vsClean
+Assert-Contains $vs 'visual criteria look satisfied' 'VS1 a fully-measured clean pass still reads as clean (no crying wolf)'
+
+# VS0 [kill]: FIXTURE REALISM. On 2026-07-30 a sibling suite ran 1416 green over a live defect because
+# its fixtures built a shape the production parser forbids. The hand-built results below are read by the
+# REAL formatter, so every key they use must be a key the REAL producer actually emits -- otherwise these
+# tests describe a result shape that cannot occur and prove nothing about the one that does.
+$vsRealKeys = @((Invoke-CritiquePass -AppDir $fakeAppDir -Goal 'g' -VisualCriteriaJson '[]' `
+    -BlarAiRepo (Join-Path $scratch 'no-such-blarai-root') -Iteration 0 -MaxIter 3 `
+    -WorkDir (Join-Path $scratch 'vs0')).Keys)
+foreach ($k in @('CaptureTier', 'Ok', 'NeedsWork', 'Feedback', 'LintsMeasured', 'CaveatText')) {
+    Assert-True ($vsRealKeys -contains $k) "VS0 [kill] the fixtures' '$k' is a field Invoke-CritiquePass really emits (fixture realism, not a shape we invented)"
+}
+
+# VS2 is THE case. Same VLM verdict, same everything -- only the layout lint is missing.
+$vsAbsentMerge = Merge-DesignSignals -LayoutHard $false -LayoutMeasured $false -LayoutStatus 'unavailable' `
+    -LayoutDetail 'no BlarAI python interpreter at C:\nope\.venv\Scripts\python.exe' `
+    -VlmOk $true -VlmNeedsWork $false -VlmShouldIterate $false -VlmFeedback 'All criteria met.' -Iteration 0 -MaxIter 3
+$vsAbsent = @{ CaptureTier = '1'; Ok = $true; NeedsWork = $false; Feedback = $vsAbsentMerge.Feedback
+               LintsMeasured = $vsAbsentMerge.LintsMeasured; CaveatText = $vsAbsentMerge.CaveatText }
+$vs = Format-VisualCritiqueSummary -Result $vsAbsent
+Assert-True (-not ($vs -match 'visual criteria look satisfied')) 'VS2 [kill] THE OBSERVABLE: with the layout lint absent the report does NOT say the criteria look satisfied'
+Assert-Contains $vs 'PARTIAL examination'       'VS2 [kill] it calls the examination partial'
+Assert-Contains $vs 'has NOT been checked clean' 'VS2 [kill] and refuses the clean bill in words'
+Assert-Contains $vs 'DID NOT RUN'                'VS2 and says the lint did not run'
+Assert-Contains $vs 'python'                     'VS2 [kill] naming the cause, so the operator can fix the box'
+
+# VS3: the caveat survives the OTHER branches too -- a needs-work report is still a partial one.
+$vsNeeds = @{ CaptureTier = '1'; Ok = $true; NeedsWork = $true; Feedback = 'Buttons too small.'
+              LintsMeasured = $false; CaveatText = 'DESIGN LINT: the XAML layout lint DID NOT RUN - gone.' }
+$vs = Format-VisualCritiqueSummary -Result $vsNeeds -FixCount 2
+Assert-Contains $vs 'Buttons too small' 'VS3 the VLM feedback is still carried'
+Assert-Contains $vs 'DID NOT RUN'       'VS3 [kill] and the caveat rides the needs-work branch too'
+Assert-Contains $vs '2 auto-fix'        'VS3 the fix count is preserved'
+
+# VS4: and the structural floor + the fail-soft branch.
+$vsStruct = @{ CaptureTier = 'structural'; Ok = $false; NeedsWork = $false; Feedback = 'Structural notes: x'
+               LintsMeasured = $false; CaveatText = 'DESIGN LINT: the rendered-pixel lint had NOTHING TO EXAMINE - no screenshot.' }
+$vs = Format-VisualCritiqueSummary -Result $vsStruct
+Assert-Contains $vs 'structural floor' 'VS4 the structural-floor wording is preserved'
+Assert-Contains $vs 'NOTHING TO EXAMINE' 'VS4 [kill] and the caveat rides it'
+$vsFail = @{ CaptureTier = '1'; Ok = $false; NeedsWork = $false; Feedback = 'Capture failed: boom'
+             LintsMeasured = $false; CaveatText = 'DESIGN LINT: the XAML layout lint DID NOT RUN - gone.' }
+$vs = Format-VisualCritiqueSummary -Result $vsFail
+Assert-Contains $vs 'unavailable / failed' 'VS5 the fail-soft wording is preserved'
+Assert-Contains $vs 'DID NOT RUN'          'VS5 [kill] and the caveat rides it'
+
+# VS6: a null result keeps its prior no-op wording (nothing to caveat, nothing to invent).
+Assert-Contains (Format-VisualCritiqueSummary -Result $null) 'returned no result' 'VS6 a null result is unchanged'
+# VS7: fix notes are carried (the pre-#1198 behavior this extraction must not have dropped).
+Assert-Contains (Format-VisualCritiqueSummary -Result $vsClean -FixNotes @('FIX #1: applied')) 'FIX #1: applied' `
+    'VS7 [kill] the fix notes still reach the report'
+# VS8 [kill]: a measured PARTIAL lint (files skipped) also withholds the clean bill.
+$vsPartial = @{ CaptureTier = '1'; Ok = $true; NeedsWork = $false; Feedback = 'ok'
+                LintsMeasured = $true; CaveatText = 'DESIGN LINT: the XAML layout lint SKIPPED 1 file(s) it could not read or parse (X.xaml).' }
+$vs = Format-VisualCritiqueSummary -Result $vsPartial
+Assert-True (-not ($vs -match 'visual criteria look satisfied')) 'VS8 [kill] a lint that skipped files it could not parse also withholds the clean bill'
+Assert-Contains $vs 'SKIPPED 1 file' 'VS8 and discloses what was skipped'
+
+# =============================================================================
+Section 'PE* -- #1198: the REAL Invoke-CritiquePass carries the absence to its caller'
+# Reachability, not behavior-in-a-mock: the real entry point, on a box where the interpreter is absent.
+$peWork = Join-Path $scratch 'pe'
+$pe = Invoke-CritiquePass -AppDir $fakeAppDir -Goal 'g' -VisualCriteriaJson '[]' `
+    -BlarAiRepo (Join-Path $scratch 'no-such-blarai-root') -Iteration 0 -MaxIter 3 -WorkDir $peWork
+Assert-False ([bool]$pe.LintsMeasured) 'PE1 [kill] the REAL pass reports LintsMeasured=$false when the tools are absent'
+Assert-Contains $pe.CaveatText 'UNEXAMINED' 'PE1 [kill] and carries the caveat text to its caller'
+Assert-False $pe.ShouldIterate 'PE1 while still never forcing a FIX lap on an absent measurement'
+Assert-True (-not ((Format-VisualCritiqueSummary -Result $pe) -match 'visual criteria look satisfied')) `
+    'PE2 [kill] end to end: the report rendered from a REAL degraded pass never reads as a clean bill'
+
+# =============================================================================
 Section 'LW* -- source wiring: the real loop runs the layout gate + threads its findings'
 $clp = Get-Content "$ScriptDir\critique-loop.ps1" -Raw
 # LW1: Invoke-CritiquePass actually runs the deterministic layout gate.
@@ -1119,10 +1430,82 @@ Assert-True ([regex]::IsMatch($clp, '-PixelHard \$pixelResult\.Hard -PixelMessag
 # LW7: the gate invokes the BlarAI pixel_lint python module.
 Assert-True ([regex]::IsMatch($clp, 'shared\.fleet\.pixel_lint')) `
     'LW7 the loop invokes the shared.fleet.pixel_lint module'
+# LW8 (#1198): BOTH merge sites thread the layout lint's MEASURED-ness. A site that drops it silently
+# restores the defect for that branch, and nothing else in this suite would notice.
+Assert-Eq 2 ([regex]::Matches($clp, '-LayoutMeasured \$layoutResult\.Measured').Count) `
+    'LW8 [kill] both merge sites thread the layout lint measured flag (dropping it at either one restores the defect)'
+# LW9: and the pixel lint's, on the branch where it ran.
+Assert-True ([regex]::IsMatch($clp, '-PixelMeasured \$pixelResult\.Measured')) `
+    'LW9 [kill] the pixel gate measured flag is threaded into Merge-DesignSignals'
+# LW10: the caveat text reaches the RESULT, or it never reaches the operator.
+Assert-Eq 2 ([regex]::Matches($clp, 'CaveatText\s*=\s*\$merged\.CaveatText').Count) `
+    'LW10 [kill] both pass-result branches surface the caveat text (built-but-wired-into-nothing check)'
+Assert-Eq 2 ([regex]::Matches($clp, 'LintsMeasured\s*=\s*\$merged\.LintsMeasured').Count) `
+    'LW10b [kill] and both surface LintsMeasured, which is what the report gates its clean bill on'
+# LW11: the files the lint could not parse are threaded too (a scanned file is not an examined one).
+Assert-Eq 2 ([regex]::Matches($clp, '-LayoutUnparsed \$layoutResult\.Unparsed').Count) `
+    'LW11 [kill] both merge sites thread the unparsed-file list'
+
+# LW12 (#1198): the LIVE caller renders it. new-agent-task.ps1 is where the operator's report is built;
+# a caveat that stops at the result object is a control wired into nothing.
+$natSrc = Get-Content "$ScriptDir\new-agent-task.ps1" -Raw
+Assert-True ([regex]::IsMatch($natSrc, '\$critiqueSummary = Format-VisualCritiqueSummary -Result \$loop\.FinalResult')) `
+    'LW12 [kill] the live [6/6] hook builds its summary through Format-VisualCritiqueSummary (the tested wording)'
+Assert-True ([regex]::IsMatch($natSrc, '-FixNotes @\(\$script:fixNotes\) -FixCount \$script:fixCount')) `
+    'LW12b the auto-FIX notes and count still reach the report'
+Assert-True (-not ([regex]::IsMatch($natSrc, '\$critiqueSummary = "VLM critique: visual criteria look satisfied'))) `
+    'LW13 [kill] the untested inline clean-bill string is GONE from new-agent-task.ps1 (it could bypass the caveat)'
+Assert-True ([regex]::IsMatch($natSrc, '(?m)^VISUAL CRITIQUE|VISUAL CRITIQUE \(post-merge design signal')) `
+    'LW14 the summary is written into the TASK REPORT the operator reads'
 
 # =============================================================================
 # Cleanup
 Remove-Item $scratch -Recurse -Force -ErrorAction SilentlyContinue
+
+# =============================================================================
+Section 'UA* -- Resolve-UnservedAssetFindings: make a 404 ACTIONABLE (#1133)'
+# THE INCIDENT (2026-07-27, run 20260727-215338-bd): the capture caught a 404 on
+# header/header.styles.css, set hard=true, and surfaced it to the fix loop TWICE --
+# and the loop committed five more lines of CSS INTO that unreachable file. The
+# signal was never missing; the WORDING invited "improve the resource" instead of
+# "the resource is not served". These lock the enrichment that says so.
+
+$uaApp = Join-Path $env:TEMP ("ua-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Path (Join-Path $uaApp 'public') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $uaApp 'header') -Force | Out-Null
+Set-Content -Path (Join-Path $uaApp 'header\header.styles.css') -Value '/* outside public */' -Encoding UTF8
+$ua404 = 'Uncaught exception: Failed to load resource: the server responded with a status of 404 (Not Found) (http://127.0.0.1:3814/header/header.styles.css)'
+$ua500 = 'Uncaught exception: Failed to load resource: the server responded with a status of 500 (Server Error) (http://127.0.0.1:3814/nope/missing.js)'
+
+# UA1 [kill]: the incident's exact shape -- file exists, but outside the served root.
+$ua1 = @(Resolve-UnservedAssetFindings -Messages @($ua404) -AppDir $uaApp)
+Assert-Contains $ua1[0] 'NOT under the served directory' 'UA1 names the real cause (not served), not "failed to load"'
+Assert-Contains $ua1[0] 'CANNOT CHANGE THE PAGE'         'UA1 [kill] forbids the exact mistake the loop made: editing the unreachable file'
+Assert-Contains $ua1[0] 'returned 404'                   'UA1 reports the real status code'
+
+# UA2: a path that exists nowhere gets a DIFFERENT, also-true diagnosis.
+$ua2 = @(Resolve-UnservedAssetFindings -Messages @($ua500) -AppDir $uaApp)
+Assert-Contains $ua2[0] 'nothing exists at that path' 'UA2 distinguishes absent-entirely from present-but-unserved'
+Assert-Contains $ua2[0] 'returned 500'                'UA2 does not hardcode 404'
+
+# UA3 [kill]: with no readable worktree we CANNOT tell the two apart, so we must not
+# claim either. Verbatim passthrough -- an invented diagnosis is worse than none.
+$ua3 = @(Resolve-UnservedAssetFindings -Messages @($ua404) -AppDir '')
+Assert-Eq $ua404 $ua3[0] 'UA3 [kill] no worktree -> verbatim; never asserts a fact it did not check'
+$ua4 = @(Resolve-UnservedAssetFindings -Messages @($ua404) -AppDir 'C:\does\not\exist')
+Assert-Eq $ua404 $ua4[0] 'UA4 unreadable worktree -> verbatim passthrough'
+
+# UA5: non-asset findings and browser noise are untouched (no signal is lost or reworded).
+$ua5 = @(Resolve-UnservedAssetFindings -Messages @('Rendered text contains "undefined"') -AppDir $uaApp)
+Assert-Eq 'Rendered text contains "undefined"' $ua5[0] 'UA5 a non-asset finding passes through verbatim'
+$uaFav = 'Uncaught exception: Failed to load resource: the server responded with a status of 404 (Not Found) (http://127.0.0.1:3814/favicon.ico)'
+$ua6 = @(Resolve-UnservedAssetFindings -Messages @($uaFav) -AppDir $uaApp)
+Assert-Eq $uaFav $ua6[0] 'UA6 a missing favicon is browser noise, not a coder defect'
+
+# UA7: empty input is empty output (the loop calls this unconditionally).
+Assert-Eq 0 (@(Resolve-UnservedAssetFindings -Messages @() -AppDir $uaApp)).Count 'UA7 empty in -> empty out'
+
+Remove-Item $uaApp -Recurse -Force -ErrorAction SilentlyContinue
 
 # =============================================================================
 Section 'Result'

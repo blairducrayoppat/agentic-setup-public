@@ -30,6 +30,13 @@
         EndBoundary left at 2026-07-22T00:00:00 - the campaign LOOKED extended
         and was not; the battery would have silently stopped after the 07-21
         night (no error, no log, no report).
+    T8  the task's ACTION targets the pinned bootstrap (#1181a). T1-T7 all
+        described HOW the task runs and none described WHAT it runs, so
+        re-registering it with the pre-pin `-File ...\agentic-setup\scripts\
+        run-battery-night.ps1` would restore the entire #1181 defect - nights
+        measuring whatever branch a shared checkout was parked on - while every
+        check above still reported "conform". The 2026-07-09 incident is proof
+        this task does get re-registered by scripts nobody re-reads.
 
   T4's required minimum is DERIVED, never hard-coded: it calls the runner's own
   helper (tools.dispatch_harness.battery_execution_limit) which computes
@@ -81,6 +88,20 @@
   T7 self-test: inject a synthetic trigger EndBoundary (a datetime string, or
   'none' for a trigger without one). Must be given together with -EndDateOverride.
   '' (default): read the live pair.
+
+.PARAMETER PinnedBootstrap
+  T8's REQUIRED action target: the bootstrap inside the pinned agentic-setup
+  worktree. Defaults to the real path.
+
+.PARAMETER LegacyDriver
+  T8's tolerated PRE-REPOINT action target. Accepted only while the pinned
+  bootstrap does not yet exist on disk - see T8's own comment for why that is the
+  ratchet rather than a flag someone has to remember to flip.
+
+.PARAMETER ActionOverride
+  T8 self-test: drive the classifier with a synthetic action string instead of the
+  live task's, so both the PASS and the FAIL paths are provable without touching
+  the production task. '' (default): read the live action.
 #>
 [CmdletBinding()]
 param(
@@ -91,9 +112,21 @@ param(
     [int]$ExpectedTriggerHour = 23,
     [int]$ExpectedRestartCount = 0,
     [string]$ExpectedMultipleInstances = 'IgnoreNew',
-    [string]$CampaignConfig = "$PSScriptRoot\..\state\battery-campaign.json",
+    # STATE, not code (#1181a). Under the pinned driver $PSScriptRoot is the MEASURED
+    # worktree, whose state\ is empty — T7's lock 1 would be unreadable and this verifier
+    # would report DRIFT on every night, for a campaign that had not drifted at all. It
+    # fails closed, which is right, but a conformance check that cries wolf nightly is one
+    # its reader learns to ignore (#1180, same lesson, same file family). The env var is
+    # exported by battery-bootstrap.ps1; unset means "beside this script", the historical
+    # behaviour for a standalone run in the primary checkout.
+    [string]$CampaignConfig = $(if ($env:BLARAI_BATTERY_AGENTIC_STATE_ROOT) {
+            Join-Path $env:BLARAI_BATTERY_AGENTIC_STATE_ROOT 'state\battery-campaign.json'
+        } else { "$PSScriptRoot\..\state\battery-campaign.json" }),
     [string]$EndDateOverride = '',
-    [string]$EndBoundaryOverride = ''
+    [string]$EndBoundaryOverride = '',
+    [string]$PinnedBootstrap = 'C:\Users\mrbla\agentic-battery-measured\scripts\battery-bootstrap.ps1',
+    [string]$LegacyDriver = 'C:\Users\mrbla\agentic-setup\scripts\run-battery-night.ps1',
+    [string]$ActionOverride = ''
 )
 $ErrorActionPreference = 'Stop'
 # Branch on $LASTEXITCODE / a parsed integer, never on a thrown native error:
@@ -337,6 +370,61 @@ else {
                 }
             }
         }
+    }
+}
+
+Section 'T8  the task ACTION targets the pinned bootstrap (#1181a)'
+# WHY A RATCHET RATHER THAN A FLAG. This check has to be correct on both sides of a
+# re-point that has not happened yet, and the two obvious answers are both wrong: fail now
+# and the nightly's own conformance call prints DRIFT on the operator's morning report
+# every night until someone re-points the task (the #1180 lesson, third instance); accept
+# both forms forever and the check never closes the regression it exists to close, because
+# reverting the action would still read as "conform".
+#
+# So the tolerance is keyed to an OBSERVABLE, not to a date or a switch: the pre-pin driver
+# is accepted only while the pinned bootstrap is not on disk. It cannot be the task's target
+# before it exists, and the moment it does exist -- which the re-point requires, since the
+# bootstrap creates its own tree on first run -- the legacy form becomes drift and fails.
+# Nobody has to remember to tighten anything.
+function Get-T8Class([string]$ActionText, [string]$Pinned, [string]$Legacy) {
+    # Substring, not equality: the action is an Execute plus an argument line
+    # (-NoProfile ... -File <path>), and the path is what identifies it.
+    if ($ActionText -and $Pinned -and $ActionText.ToLowerInvariant().Contains($Pinned.ToLowerInvariant())) { return 'pinned' }
+    if ($ActionText -and $Legacy -and $ActionText.ToLowerInvariant().Contains($Legacy.ToLowerInvariant())) { return 'legacy' }
+    return 'unrecognised'
+}
+
+if ($ActionOverride -ne '') {
+    $t8Action = $ActionOverride
+    Write-Host "  self-test override: action = '$t8Action'"
+}
+else {
+    $t8Action = (@($task.Actions | ForEach-Object {
+        (("{0} {1}" -f [string]$_.Execute, [string]$_.Arguments)).Trim()
+    }) -join ' ;; ').Trim()
+}
+# Always REPORT the current target, pass or fail. Half of what made #1181 survivable for so
+# long is that nothing ever printed what the task actually runs.
+Write-Host "  action: $t8Action"
+$t8PinnedPresent = Test-Path -LiteralPath $PinnedBootstrap
+$t8Class = Get-T8Class $t8Action $PinnedBootstrap $LegacyDriver
+switch ($t8Class) {
+    'pinned' {
+        Check "T8 the action targets the pinned bootstrap ($PinnedBootstrap)" $true
+    }
+    'legacy' {
+        if ($t8PinnedPresent) {
+            Write-Host ("  DRIFT: the pinned bootstrap EXISTS at {0}, but the task still runs the unpinned driver {1} - nights would measure whatever branch that shared checkout is parked on, which is the #1181 defect exactly." -f $PinnedBootstrap, $LegacyDriver) -ForegroundColor Red
+            Check "T8 the action targets the pinned bootstrap (found the pre-pin driver $LegacyDriver)" $false
+        }
+        else {
+            Write-Host ("  PRE-REPOINT: the task runs {0} and the pinned bootstrap is not on disk yet ({1}), so it cannot be the target. This check TIGHTENS automatically the moment that path exists." -f $LegacyDriver, $PinnedBootstrap) -ForegroundColor Yellow
+            Check "T8 the action targets a known battery entry point (pre-repoint form; tightens once $PinnedBootstrap exists)" $true
+        }
+    }
+    default {
+        Write-Host ("  UNRECOGNISED: the action matches neither the pinned bootstrap ({0}) nor the pre-pin driver ({1}). Something re-registered this task with a target nobody here knows about." -f $PinnedBootstrap, $LegacyDriver) -ForegroundColor Red
+        Check "T8 the action targets a known battery entry point" $false
     }
 }
 

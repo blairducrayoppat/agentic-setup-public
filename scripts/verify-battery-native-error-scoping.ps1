@@ -15,6 +15,10 @@
 # freeze.ps1 / verify-battery-unregister-scoping.ps1 — AST walk of the LIVE source +
 # the LIVE extracted block driven both ways, never a re-implementation):
 #   S1  the task-settings wiring try/catch exists.
+#   S1b negative control: a SECOND block adopting the house phrase "check errored" does
+#       not break the selector (the #1051 regression lock — see Select-WiringTry).
+#   S1c control: the RETIRED phrase-based selector DOES over-match that planted block,
+#       so S1b is not vacuous (the toggle-test, same shape as C1 below).
 #   S2  it scope-sets $PSNativeCommandUseErrorActionPreference = $false.
 #   S3  it restores the saved value in a FINALLY (so an unrelated throw still restores).
 #   S4  the drift branch reads a CAPTURED exit ($verifyExit), taken inside the scope.
@@ -37,11 +41,56 @@ function Check([string]$name, [bool]$ok) {
 $launcher = Join-Path $PSScriptRoot 'run-battery-night.ps1'
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($launcher, [ref]$null, [ref]$null)
 
+# ---- the wiring-block selector, shared by S1 and its controls --------------------
+# #1051: this used to select on the log phrase 'check errored'. That phrase is HOUSE
+# PHRASING for any non-fatal preflight, so when the budget-coherence block adopted it for
+# the same good reason, the count went to 2, S1 failed, and the suite bailed before its
+# behaviour section ever ran — 0 passed / 7 failed, for eight days, unread. A verifier
+# must not key on a string it does not own.
+#
+# Anchor instead on $verifyTaskSettings, an identifier this block DOES own; a future block
+# reusing the phrase cannot collide with it. Then keep only OUTERMOST matches: the inner
+# save/restore try wraps the same `& pwsh` call and therefore mentions the same variable,
+# so a naive FindAll returns 2 here too — for a completely different reason.
+function Select-WiringTry {
+    param([Parameter(Mandatory)]$Ast)
+    $m = @($Ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.TryStatementAst] -and
+                $n.Extent.Text -match '\$verifyTaskSettings' }, $true))
+    @($m | Where-Object { $me = $_
+        -not ($m | Where-Object {
+            $_ -ne $me -and
+            $_.Extent.StartOffset -le $me.Extent.StartOffset -and
+            $_.Extent.EndOffset   -ge $me.Extent.EndOffset }) })
+}
+
 # ---- S1: the wiring try/catch (the OUTER try owns the generic catch) -------------
-$outerTry = @($ast.FindAll({ param($n)
+$outerTry = @(Select-WiringTry -Ast $ast)
+Check "S1 the task-settings wiring try/catch exists (got $($outerTry.Count))" ($outerTry.Count -eq 1)
+
+# ---- S1b/S1c: the #1051 regression lock ------------------------------------------
+# The failure this replaces was SILENT — a verifier reporting "cannot drive behavior" and
+# nobody reading it. So the guard is planted, not assumed: append a second non-fatal block
+# that adopts the house phrase exactly as budget-coherence did, and prove the new selector
+# is unmoved. S1c then proves the plant is real by showing the RETIRED selector over-matches
+# it — without that, S1b passes even if the plant were inert.
+$plantedSrc = (Get-Content -LiteralPath $launcher -Raw) + @'
+
+# --- planted by verify-battery-native-error-scoping.ps1 S1b; NOT part of the launcher ---
+try {
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $someLaterCheck -BlarRepo $BlarRoot
+} catch {
+    Write-Log "some-later-check: check errored ($($_.Exception.Message)) - non-fatal, continuing the night."
+}
+'@
+$plantedAst = [System.Management.Automation.Language.Parser]::ParseInput($plantedSrc, [ref]$null, [ref]$null)
+$plantedSel = @(Select-WiringTry -Ast $plantedAst)
+Check "S1b a later block adopting the house phrase does not move the selector (got $($plantedSel.Count))" ($plantedSel.Count -eq 1)
+
+$retiredSel = @($plantedAst.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.TryStatementAst] -and
             $n.Extent.Text -match 'check errored' }, $true))
-Check "S1 the task-settings wiring try/catch exists (got $($outerTry.Count))" ($outerTry.Count -eq 1)
+Check "S1c control: the retired phrase selector DOES over-match the plant (got $($retiredSel.Count), expected >1)" ($retiredSel.Count -gt 1)
 
 $inTry = { param($node) $outerTry.Count -eq 1 -and
     $node.Extent.StartOffset -ge $outerTry[0].Extent.StartOffset -and
@@ -60,10 +109,17 @@ $restore = @($ast.FindAll({ param($n)
             $n.Left.Extent.Text -eq '$PSNativeCommandUseErrorActionPreference' -and
             $n.Right.Extent.Text -ne '$false' }, $true) | Where-Object { & $inTry $_ })
 Check "S3a a restore assignment exists in the wiring (got $($restore.Count))" ($restore.Count -eq 1)
+# #1051, second instance of the same class: this counted try/finally blocks restoring the
+# preference across the WHOLE launcher and demanded exactly one. budget-coherence adopted
+# the identical save/restore pattern — correctly, for the same reason — and the count went
+# to 2, so a check about the task-settings block started failing because of a sibling that
+# does the right thing. Scope the search to the block under test ($inTry), exactly as S2,
+# S4 and S5 already do. The assertion is unchanged: the restore must live in a FINALLY.
 $innerTry = @($ast.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.TryStatementAst] -and
             $null -ne $n.Finally -and
-            $n.Finally.Extent.Text -match 'PSNativeCommandUseErrorActionPreference' }, $true))
+            $n.Finally.Extent.Text -match 'PSNativeCommandUseErrorActionPreference' }, $true) |
+        Where-Object { & $inTry $_ })
 $restoreInFinally = $innerTry.Count -eq 1 -and $restore.Count -eq 1 -and
     $restore[0].Extent.StartOffset -ge $innerTry[0].Finally.Extent.StartOffset -and
     $restore[0].Extent.EndOffset   -le $innerTry[0].Finally.Extent.EndOffset

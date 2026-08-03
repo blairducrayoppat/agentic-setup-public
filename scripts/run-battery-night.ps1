@@ -26,14 +26,79 @@
 
 [CmdletBinding()]
 param(
-    [string]$CampaignConfig = "$PSScriptRoot\..\state\battery-campaign.json",
+    # Resolved in the body against the STATE root, not $PSScriptRoot (#1181a): when this
+    # script runs from the pinned worktree, $PSScriptRoot is the MEASURED tree, whose
+    # state\ is empty. Defaulting there would silently start a brand-new campaign at pass 0.
+    [string]$CampaignConfig,
     [switch]$Now  # skip the dispatch guard + lean wait-loop (manual daytime invocation)
 )
 
 $ErrorActionPreference = "Stop"
-$AgenticRoot = Resolve-Path "$PSScriptRoot\.."
-$BlarRoot    = "C:\Users\mrbla\blarai"
-$Python      = "$BlarRoot\.venv\Scripts\python.exe"
+
+# ---- the two AGENTIC roots (#1181a) ------------------------------------------
+# Exactly the split applied to the BlarAI side below, applied to this repo, and for the
+# same reason: once the scheduled task points at a PINNED worktree so the driver is a
+# commit that exists on main, "where this script lives" and "where this campaign's
+# history lives" stop being the same directory.
+#
+#   CODE root  -- where this script and its siblings live. Follows $PSScriptRoot, so it
+#                 is the pinned worktree when pinned and the primary checkout when not.
+#                 Governs ao-ownership-lib.ps1, stop-assistant.ps1 and the verifiers:
+#                 those are CODE and must be pinned along with their caller.
+#   STATE root -- the primary checkout, always. Governs the campaign config, the per-night
+#                 directories, the morning report, the fleet-swap cancel file and the
+#                 worktree base. This is accumulated history: a pinned worktree is
+#                 detached to a new commit every night, so state kept there would be a
+#                 fresh empty campaign each time -- the pass counter would never advance
+#                 and the self-unregister guard would compare against the wrong config.
+$AgenticCodeRoot  = Resolve-Path "$PSScriptRoot\.."
+$AgenticStateRoot = $AgenticCodeRoot
+
+$agenticStateOverride = $env:BLARAI_BATTERY_AGENTIC_STATE_ROOT
+if ($agenticStateOverride) {
+    # Set by battery-bootstrap.ps1. Validated and FATAL on a bad value: falling back to the
+    # code root would silently start a new campaign in the pinned tree while reporting a
+    # normal night, which is the confound this whole change exists to remove.
+    $resolvedState = (Resolve-Path -LiteralPath $agenticStateOverride -ErrorAction SilentlyContinue)
+    if (-not $resolvedState) {
+        throw "BLARAI_BATTERY_AGENTIC_STATE_ROOT='$agenticStateOverride' does not exist. It must name the PRIMARY agentic-setup checkout - the one holding this campaign's state\."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $resolvedState.Path '.git') -PathType Container)) {
+        throw "BLARAI_BATTERY_AGENTIC_STATE_ROOT='$agenticStateOverride' is not the primary agentic-setup checkout (its .git is not a directory, so it is a linked worktree). Campaign state must not live in a tree that is re-detached every night."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $resolvedState.Path 'state') -PathType Container)) {
+        throw "BLARAI_BATTERY_AGENTIC_STATE_ROOT='$agenticStateOverride' has no state\ directory, so it cannot be the campaign's home."
+    }
+    $AgenticStateRoot = $resolvedState.Path
+}
+
+# Kept as the historical spelling for the STATE-side reads below; the code-side reads use
+# $PSScriptRoot directly so the two can never be confused again by a later edit.
+$AgenticRoot = $AgenticStateRoot
+# ---- the two BlarAI roots (#1181) -------------------------------------------
+# These were ONE variable, spelled $BlarRoot, and that is the whole bug. A night resolved
+# `-m tools.dispatch_harness.battery` AND read the frozen exam cards out of the primary
+# checkout, so it measured whatever branch another session had left parked there -- and
+# then stamped the result "blarai": <that branch's tip>, which reads like a release
+# identifier. 2026-07-29 banked a night stamped 21b4e9be, an unmerged feature-branch tip,
+# while main was f2e4f27b. Merging a harness fix did not reach the next run either.
+#
+# They are two different questions and only one of them can be pinned:
+#
+#   MEASURED ROOT -- which version of the measuring instrument ran. Pinned to a named
+#   commit on main so a night is attributable and merging actually deploys. Governs the
+#   runner module and the frozen cards.
+#
+#   RUNTIME ROOT -- which installation was exercised. CANNOT be a worktree: models/ is
+#   gitignored (46 GB in one checkout, 3 manifest stubs everywhere else), certs/ holds the
+#   per-boot mTLS chain the launcher mints, and certs/launcher.lock is what the teardown
+#   barrier reads. Governs the AO boot/stop, the admission probe, and the venv.
+#
+# Collapsing them again in either direction breaks a night. Measured-for-everything boots
+# an AO with no weights; runtime-for-everything is the unpinned measurement above.
+$BlarRuntimeRoot = "C:\Users\mrbla\blarai"
+$BlarMeasuredRoot = "C:\Users\mrbla\blarai-battery-measured"
+$Python      = "$BlarRuntimeRoot\.venv\Scripts\python.exe"
 $ProjectsDir = "C:\Users\mrbla\projects"
 $TaskPath    = "\BlarAI\"
 $TaskName    = "BlarAI-M2-Battery-Nightly"
@@ -43,9 +108,21 @@ $TaskName    = "BlarAI-M2-Battery-Nightly"
 # unregistered the REAL nightly task — the 23:00 campaign would simply not have
 # fired, discovered only by the LA's pre-battery checklist question. A side
 # config completing must never touch the shared task.
-$DefaultCampaignConfig = (Resolve-Path "$PSScriptRoot\..\state\battery-campaign.json" -ErrorAction SilentlyContinue).Path
+#
+# STATE root, not $PSScriptRoot (#1181a). Under a pinned driver $PSScriptRoot is the
+# measured worktree, whose state\ is empty: $DefaultCampaignConfig would resolve to
+# $null, $IsDefaultCampaign would be FALSE for the real nightly campaign, and the
+# self-unregister guard would stop firing for the one config it is meant to fire for.
+# That fails safe rather than dangerous — a spent campaign would keep running instead of
+# unregistering — but it is still a guard silently doing nothing, so it is pinned to the
+# same root the campaign itself lives in.
+$DefaultCampaignConfig = (Resolve-Path "$AgenticStateRoot\state\battery-campaign.json" -ErrorAction SilentlyContinue).Path
+if (-not $CampaignConfig) { $CampaignConfig = "$AgenticStateRoot\state\battery-campaign.json" }
 $IsDefaultCampaign = $DefaultCampaignConfig -and ((Resolve-Path $CampaignConfig -ErrorAction SilentlyContinue).Path -eq $DefaultCampaignConfig)
 $Stamp       = Get-Date -Format "yyyyMMdd-HHmmss"
+# Assigned for real once the pin has run; declared here so the postlude can render it under
+# StrictMode no matter which path got there.
+$DriverStamp = ''
 $NightDir    = "$AgenticRoot\state\battery\night-$Stamp"
 New-Item -ItemType Directory -Force $NightDir | Out-Null
 Start-Transcript -Path "$NightDir\launcher.log" -Force | Out-Null
@@ -218,7 +295,24 @@ if (-not $IsElevated) {
 }
 
 # ---- 1. campaign state ------------------------------------------------------
-if (-not (Test-Path $CampaignConfig)) { throw "campaign config missing: $CampaignConfig" }
+# A bare `throw` here left NO morning report, so the one invocation a session is most
+# likely to type by accident -- this driver by hand, without the bootstrap that hands it
+# the state root -- failed with a stack trace and left the operator's morning read showing
+# the previous night. Refuse in words instead, and name the actual cause when it is
+# knowable: a pinned worktree's state\ is empty by construction, so the campaign is not
+# missing, it is being looked for in the tree that never holds it.
+if (-not (Test-Path $CampaignConfig)) {
+    $hint = if (($AgenticStateRoot -eq $AgenticCodeRoot) -and
+                (Test-Path -LiteralPath (Join-Path $AgenticCodeRoot '.git') -PathType Leaf)) {
+        "This driver is running out of a PINNED worktree ($AgenticCodeRoot) with no state root handed to it, so it looked for the campaign in that worktree's empty state\ directory. Launch scripts\battery-bootstrap.ps1 instead - it is the entry point, and it is what tells this script where the campaign actually lives."
+    } else {
+        "There is no file at that path. It is the file that tells the night which jobs to run and holds the pass counters."
+    }
+    Write-Log "CAMPAIGN CONFIG MISSING: $CampaignConfig"
+    Write-SkipReport "The battery did not start because it could not find the campaign file that tells it what to run. $hint Nothing was changed or deleted."
+    Stop-Transcript | Out-Null
+    exit 0
+}
 $camp = Get-Content $CampaignConfig -Raw | ConvertFrom-Json
 
 # ---- 1a. hard end date (LA direction 2026-07-14) -----------------------------
@@ -252,6 +346,247 @@ if ($camp.completed_passes -ge $camp.target_full_passes) {
     Stop-Transcript | Out-Null
     exit 0
 }
+
+# ---- 1b. pin the measured tree (#1181) ---------------------------------------
+# Advance the measured worktree to main and PROVE it is what will execute, before the
+# night touches anything. Placed here deliberately: no AO has been claimed, no sandbox
+# built, no :5001 slot taken, so a refusal here costs nothing but the night.
+#
+# The refusal is the point. Every failure below stands the night down rather than falling
+# back to the primary checkout -- a fallback would silently restore exactly the confound
+# this replaces, while reporting a normal night. #1058 already refuses a dirty SANDBOX
+# rather than measuring confounded; this is the same posture one level up, for the code
+# doing the measuring.
+#
+# NOT destructive, ever. A dirty measured tree is REFUSED and left untouched: nobody should
+# have work there, so if someone does it is either a bug worth seeing or a deliberate
+# experiment, and discarding either is forbidden. `git switch --detach` also refuses on its
+# own if it would overwrite local modifications -- git fails closed here too.
+function Invoke-GitRead {
+    # Native exit codes are the signal, so scope off the host preference that would turn a
+    # non-zero exit into a throw (#903 pattern) and hand the caller both streams.
+    param([Parameter(Mandatory)][string[]]$GitArgs)
+    $prev = $PSNativeCommandUseErrorActionPreference
+    try {
+        $PSNativeCommandUseErrorActionPreference = $false
+        $out = (& git @GitArgs 2>&1 | Out-String).Trim()
+        return [pscustomobject]@{ Ok = ($LASTEXITCODE -eq 0); Out = $out; Code = $LASTEXITCODE }
+    } catch {
+        # `& git` when git is NOT ON PATH raises CommandNotFoundException, and that is
+        # TERMINATING no matter what the preference above says -- that switch neutralises
+        # native EXIT CODES, not "there is no such command". Uncaught it escapes the caller
+        # entirely, so the stand-down report never runs and the operator's morning read
+        # still shows the PREVIOUS night's result: a night that did not happen, reported as
+        # one that did. Turn it into the failed read it actually is.
+        return [pscustomobject]@{ Ok = $false; Out = "git could not be run: $($_.Exception.Message)"; Code = -1 }
+    } finally { $PSNativeCommandUseErrorActionPreference = $prev }
+}
+
+function Sync-MeasuredTree {
+    # Returns @{ Ok; Reason; Sha; Created }. NEVER falls back: a $false Ok is a stand-down,
+    # and the caller must treat it as one. It does not throw for any git-side condition
+    # (Invoke-GitRead absorbs those into a failed read); the call site still wraps it,
+    # because a claim that something cannot throw is not a substitute for the caller being
+    # able to survive it doing so.
+    param(
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$MeasuredRoot
+    )
+    $bad = { param($why) [pscustomobject]@{ Ok = $false; Reason = $why; Sha = $null; Created = $false } }
+
+    # The runtime root must be the PRIMARY checkout. In a linked worktree `.git` is a FILE
+    # holding a `gitdir:` pointer; in the primary checkout it is a DIRECTORY. That one-stat
+    # test is the cheapest honest proof that the weights and the minted certs live here,
+    # and it catches the catastrophic mix-up (runtime pointed at a worktree) structurally.
+    if (-not (Test-Path -LiteralPath $RuntimeRoot -PathType Container)) {
+        return & $bad "the BlarAI runtime checkout is missing at $RuntimeRoot."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $RuntimeRoot '.git') -PathType Container)) {
+        return & $bad "$RuntimeRoot is not the primary BlarAI checkout (its .git is not a directory, so it is a linked worktree). The AO must boot from the primary checkout - it is the only one holding the gitignored model weights."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $RuntimeRoot 'models') -PathType Container)) {
+        return & $bad "$RuntimeRoot has no models\ directory, so the AO has no weights to load."
+    }
+
+    $mainRef = Invoke-GitRead @('-C', $RuntimeRoot, 'rev-parse', 'main')
+    if (-not $mainRef.Ok) { return & $bad "could not read main's commit from $RuntimeRoot : $($mainRef.Out)" }
+    $mainSha = $mainRef.Out
+
+    # Create on absence. `git worktree add --detach` is PURELY ADDITIVE - a new directory
+    # plus an admin entry; it cannot modify or destroy another session's work, and detached
+    # means it claims no branch name anyone else might want. (It must be detached anyway:
+    # git refuses to check out `main` in a second worktree, and another worktree already
+    # holds it.) Refusing outright instead would cost a whole night for a condition the
+    # script can repair safely in one additive command.
+    $created = $false
+    if (-not (Test-Path -LiteralPath $MeasuredRoot -PathType Container)) {
+        Write-Log "measured tree absent - creating $MeasuredRoot detached at main $mainSha."
+        $add = Invoke-GitRead @('-C', $RuntimeRoot, 'worktree', 'add', '--detach', $MeasuredRoot, $mainSha)
+        if (-not $add.Ok) { return & $bad "could not create the measured worktree at $MeasuredRoot : $($add.Out)" }
+        $created = $true
+    }
+
+    # ...and it must BE a linked worktree. The inverse of the runtime check: if this ever
+    # resolved to the primary checkout, pinning would be a no-op wearing a pinned name.
+    if (-not (Test-Path -LiteralPath (Join-Path $MeasuredRoot '.git') -PathType Leaf)) {
+        return & $bad "$MeasuredRoot is not a linked git worktree (its .git is not a gitdir pointer file). Refusing rather than measuring an unpinned tree."
+    }
+    $commonA = Invoke-GitRead @('-C', $RuntimeRoot, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    $commonB = Invoke-GitRead @('-C', $MeasuredRoot, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+    if (-not $commonA.Ok -or -not $commonB.Ok) { return & $bad "could not compare the two checkouts' git directories." }
+    if ($commonA.Out -ne $commonB.Out) {
+        return & $bad "$MeasuredRoot belongs to a different repository than $RuntimeRoot ($($commonB.Out) vs $($commonA.Out))."
+    }
+
+    # Cleanliness BEFORE the advance, so the advance only ever runs on a verified-clean tree.
+    $dirty = Invoke-GitRead @('-C', $MeasuredRoot, 'status', '--porcelain')
+    if (-not $dirty.Ok) { return & $bad "could not read the measured tree's status: $($dirty.Out)" }
+    if ($dirty.Out) {
+        $paths = ($dirty.Out -split "`n" | Select-Object -First 10) -join '; '
+        return & $bad "the measured tree $MeasuredRoot is DIRTY and was left untouched (nothing is ever discarded there). Uncommitted paths: $paths"
+    }
+
+    $headRef = Invoke-GitRead @('-C', $MeasuredRoot, 'rev-parse', 'HEAD')
+    if (-not $headRef.Ok) { return & $bad "could not read the measured tree's HEAD: $($headRef.Out)" }
+    if ($headRef.Out -ne $mainSha) {
+        Write-Log "advancing the measured tree $($headRef.Out.Substring(0,8)) -> main $($mainSha.Substring(0,8))."
+        $sw = Invoke-GitRead @('-C', $MeasuredRoot, 'switch', '--detach', $mainSha)
+        if (-not $sw.Ok) { return & $bad "could not advance the measured tree to main $mainSha : $($sw.Out)" }
+    }
+
+    # Re-verify AFTER the advance rather than trusting it: the advance is the step most
+    # likely to half-succeed, and a half-advanced tree is the confound wearing a clean name.
+    $headRef = Invoke-GitRead @('-C', $MeasuredRoot, 'rev-parse', 'HEAD')
+    if (-not $headRef.Ok -or $headRef.Out -ne $mainSha) {
+        return & $bad "the measured tree is at $($headRef.Out) after the advance, not main $mainSha."
+    }
+    $dirty = Invoke-GitRead @('-C', $MeasuredRoot, 'status', '--porcelain')
+    if (-not $dirty.Ok -or $dirty.Out) {
+        return & $bad "the measured tree is dirty immediately after advancing to main - refusing rather than measuring it."
+    }
+    # Belt: the commit must actually BE on main. `switch --detach <sha>` cannot land anywhere
+    # else, but the whole ticket is about a version stamp nobody could find on main, so the
+    # claim gets checked rather than assumed.
+    $anc = Invoke-GitRead @('-C', $MeasuredRoot, 'merge-base', '--is-ancestor', $mainSha, 'main')
+    if (-not $anc.Ok) { return & $bad "the pinned commit $mainSha is not contained in main." }
+
+    return [pscustomobject]@{ Ok = $true; Reason = $null; Sha = $mainSha; Created = $created }
+}
+
+# The outer belt. Every failure the pin can NAME comes back as a $false Ok; this catch is
+# for the ones it cannot -- a git binary that has moved, a permission error mid-stat, a
+# filesystem that vanishes. Without it those escape to the top of the script, past
+# Write-SkipReport, and leave state\battery\MORNING-REPORT.md holding LAST night's result:
+# the operator reads a night that never ran as though it had, which is precisely the hole
+# the skip report exists to close.
+try {
+    $MeasuredPin = Sync-MeasuredTree -RuntimeRoot $BlarRuntimeRoot -MeasuredRoot $BlarMeasuredRoot
+} catch {
+    Write-Log "MEASURED-TREE PIN ERRORED: $($_.Exception.Message)"
+    Write-SkipReport "The battery could not check which version of itself it was about to run - the check itself failed with an unexpected error ($($_.Exception.Message)). It stood down rather than measure something it could not identify. Nothing was changed or deleted; the next scheduled night runs normally once that is resolved."
+    Stop-Transcript | Out-Null
+    exit 0
+}
+if (-not $MeasuredPin.Ok) {
+    Write-Log "MEASURED-TREE PIN FAILED: $($MeasuredPin.Reason)"
+    Write-SkipReport "The battery could not prove which version of itself it was about to run, so it stood down instead of producing a number nobody could trace. $($MeasuredPin.Reason) Nothing was changed or deleted. Once that is resolved the next scheduled night runs normally."
+    Stop-Transcript | Out-Null
+    exit 0
+}
+Write-Log "measured tree PINNED: $BlarMeasuredRoot @ main $($MeasuredPin.Sha)$(if ($MeasuredPin.Created) { ' (created tonight)' })."
+
+# The runner, the probe and the AO boot all inherit this. It is what keeps the AO booting
+# from the installation while the harness runs from the measured tree; without it the
+# harness resolves certs/ and the per-job AO reboot against a worktree that has neither.
+$env:BLARAI_BATTERY_RUNTIME_ROOT = $BlarRuntimeRoot
+
+# REACHABILITY, not configuration. Import the measured tree's own runner under the env var
+# just set and make it report the root it would boot an AO in. This is the one check that
+# cannot be satisfied by a stale tree: if main does not yet carry the runtime-root split,
+# the import prints the MEASURED root and the night stands down instead of STALLING every
+# card on a certs/ directory that does not exist. Drives the real module, not a grep.
+#
+# BOTH modules, because proving one says nothing about the other: battery.py does not import
+# probe.py, and the admission probe now runs from the measured tree as well. An import error
+# in main's probe.py or config.py exits 1 down in the admission band, where exit 1 already
+# means LOAD_FAILED -- so the night would rejoin the 30-minute retry loop and eventually tell
+# the operator "the box never had enough free memory for the 30B coder model". A wrong cause,
+# on the surface he actually reads, from a fault that has nothing to do with memory. Caught
+# here it stands the night down once, with the real reason on the transcript.
+#
+# The answers arrive on NAMED lines, not as "the whole captured stream". Both streams are
+# folded together for the transcript, so any deprecation notice, any import-time warning,
+# any stderr line at all used to be part of the value being compared -- one of them and the
+# night stands down for a pin that is working. Marker lines, last one wins, everything else
+# is log.
+$probeMarker = 'AO_BOOT_ROOT='
+$probeMarker2 = 'PROBE_BOOT_ROOT='
+$probeSrc = 'from tools.dispatch_harness import battery, probe; print("AO_BOOT_ROOT=" + str(battery._BLARAI_REPO_ROOT)); print("PROBE_BOOT_ROOT=" + str(probe._BLARAI_REPO_ROOT))'
+$probeExit = -1
+$probeRaw = ''
+try {
+    Push-Location $BlarMeasuredRoot
+    try {
+        $prevNativePref = $PSNativeCommandUseErrorActionPreference
+        try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $probeRaw = (& $Python -c $probeSrc 2>&1 | Out-String).Trim()
+            $probeExit = $LASTEXITCODE
+        } finally { $PSNativeCommandUseErrorActionPreference = $prevNativePref }
+    } finally { Pop-Location }
+} catch {
+    # `& $Python` with the venv python moved or rebuilt raises CommandNotFoundException --
+    # terminating, and the likeliest way this block ever fails. Same shape and same stakes
+    # as the git case above: uncaught, no morning report is written and the operator reads
+    # last night's result as tonight's.
+    Write-Log "MEASURED-TREE PIN ERRORED: could not run the reachability probe: $($_.Exception.Message)"
+    Write-SkipReport "The battery stood down because it could not run the check that proves it knows where the assistant is installed ($($_.Exception.Message)). Its Python interpreter at $Python is the likely cause. Nothing was changed or deleted; the next scheduled night runs normally once that is resolved."
+    Stop-Transcript | Out-Null
+    exit 0
+}
+function Get-MarkedValue([string]$Raw, [string]$Marker) {
+    # Last marked line wins; absent marker = '' (never $null, so the comparison below is a
+    # mismatch rather than a member access on nothing).
+    $hits = @($Raw -split "`r?`n" | Where-Object { $_.Trim().StartsWith($Marker) } |
+        ForEach-Object { $_.Trim().Substring($Marker.Length).Trim() })
+    if ($hits.Count -gt 0) { return $hits[-1] }
+    return ''
+}
+$reportedRoot = Get-MarkedValue $probeRaw $probeMarker
+$reportedProbeRoot = Get-MarkedValue $probeRaw $probeMarker2
+$expectedRoot = (Resolve-Path -LiteralPath $BlarRuntimeRoot).Path.TrimEnd('\')
+# Windows paths differ in case between the two spellings in use here ("C:\Users\mrbla\blarai"
+# as configured, "C:\Users\mrbla\BlarAI" as python canonicalises it), so the comparison is
+# case-insensitive BY STATEMENT rather than by PowerShell's default -- an editor tightening
+# `-ne` to `-cne` would otherwise stand down every night, and the code would look stricter.
+$rootsMatch = [string]::Equals($reportedRoot.TrimEnd('\'), $expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)
+$probeRootMatch = [string]::Equals($reportedProbeRoot.TrimEnd('\'), $expectedRoot, [System.StringComparison]::OrdinalIgnoreCase)
+if ($probeExit -ne 0 -or -not $rootsMatch -or -not $probeRootMatch) {
+    Write-Log "MEASURED-TREE PIN FAILED: the measured runner reports its AO-boot root as '$reportedRoot' and the admission probe's as '$reportedProbeRoot' (exit $probeExit), expected '$expectedRoot' for both. Full output: $probeRaw"
+    Write-SkipReport "The battery stood down because the version of itself on main cannot yet be told where the assistant is installed, or could not be loaded at all. It reported '$reportedRoot' (runner) and '$reportedProbeRoot' (memory-admission check) instead of '$expectedRoot'. Running anyway would have failed every job for a missing security-certificate folder, or blamed a memory shortage that is not there. Nothing was changed or deleted; the next scheduled night runs normally once the matching BlarAI change is on main."
+    Stop-Transcript | Out-Null
+    exit 0
+}
+Write-Log "measured runner reachability: AO-boot root resolves to $reportedRoot (the installation) for the runner and $reportedProbeRoot for the admission probe; harness runs from $BlarMeasuredRoot (the measurement)."
+
+# ---- the DRIVER's own commit (#1181) -----------------------------------------
+# #1181's predicate is that a night records the state of BOTH trees. The scorecards stamp
+# the BlarAI tree; nothing stamped this one -- yet the driver owns the job set, the
+# admission gate, the budgets and the banking, so "which driver ran?" is half of what makes
+# a night reproducible. It was recoverable only from a gitignored bootstrap log nothing
+# points at. Computed here, rendered into the morning report the operator actually reads.
+# $PSScriptRoot is the CODE root, so this is the pinned tree whenever the pin is in force.
+$driverSha = Invoke-GitRead @('-C', $PSScriptRoot, 'rev-parse', '--short', 'HEAD')
+$driverAnc = Invoke-GitRead @('-C', $PSScriptRoot, 'merge-base', '--is-ancestor', 'HEAD', 'main')
+$DriverStamp = if (-not $driverSha.Ok) {
+    "NOT RECORDED (could not read the driver's commit: $($driverSha.Out))"
+} else {
+    # Containment, not the branch name -- the pinned tree is detached by design, and the
+    # only question worth asking of it is whether its commit is on main.
+    $onMain = if ($driverAnc.Code -eq 0) { 'yes' } elseif ($driverAnc.Code -eq 1) { 'no' } else { 'unknown' }
+    "{0} [on main: {1}] from {2}" -f $driverSha.Out, $onMain, $PSScriptRoot
+}
+Write-Log "driver stamp: $DriverStamp"
 
 # ---- 2. dispatch guard --------------------------------------------------------
 # Presence checks (LASTINPUTINFO idle + BlarAI app window) removed 2026-07-09 by
@@ -313,7 +648,7 @@ if (-not $Now) {
         # detection here means ao-ownership-lib.ps1 never grows a second process detector.
         $aoHeld = [bool](Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue)
         $reclaim = Invoke-AoPreflightReclaim -SentinelPath $AoOwnerSentinel -CurrentNight $Stamp `
-            -AoPresent $aoHeld -BlarAiRepo $BlarRoot -StopAssistantPath $StopAssistantPath -Log ${function:Write-Log}
+            -AoPresent $aoHeld -BlarAiRepo $BlarRuntimeRoot -StopAssistantPath $StopAssistantPath -Log ${function:Write-Log}
         if ($reclaim) {
             $script:ReclaimReason = [string]$reclaim.Reason
             if ($reclaim.Reclaimed) { $script:StaleClaimReclaimed = [string]$reclaim.ClaimedNight }
@@ -361,7 +696,13 @@ try {
         $prevNativeErrPref = $PSNativeCommandUseErrorActionPreference
         try {
             $PSNativeCommandUseErrorActionPreference = $false
-            & pwsh -NoProfile -ExecutionPolicy Bypass -File $verifyTaskSettings -BlarRepo $BlarRoot *>&1 |
+            # -CampaignConfig is the DEFAULT campaign deliberately, never $CampaignConfig:
+            # T7 checks the two-lock calendar cutoff between the SHARED nightly task and the
+            # campaign that governs it. Handing it a side config during a targeted run would
+            # compare the task's EndBoundary against a campaign that does not own it and
+            # report drift that is not there (#1181a; the §3 side-config discipline).
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $verifyTaskSettings `
+                    -BlarRepo $BlarRuntimeRoot -CampaignConfig $DefaultCampaignConfig *>&1 |
                 ForEach-Object { Write-Log "task-settings: $_" }
             $verifyExit = $LASTEXITCODE
         } finally {
@@ -395,7 +736,7 @@ try {
         $prevNativeErrPref = $PSNativeCommandUseErrorActionPreference
         try {
             $PSNativeCommandUseErrorActionPreference = $false
-            & pwsh -NoProfile -ExecutionPolicy Bypass -File $verifyBudget -BlarRepo $BlarRoot *>&1 |
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $verifyBudget -BlarRepo $BlarRuntimeRoot *>&1 |
                 ForEach-Object { Write-Log "budget-coherence: $_" }
             $budgetExit = $LASTEXITCODE
         } finally {
@@ -543,7 +884,7 @@ function Ensure-AoHeadless {
         $script:AoBootSource = 'preflight-boot'
         Write-AoBootProvenance "AO DOWN at the $Context check - this launcher is booting it (boot_launcher_detached, production, detached). Boot output follows."
         $bootPy = 'import sys; from pathlib import Path; from tools.dispatch_harness.battery import boot_launcher_detached; boot_launcher_detached(Path(sys.argv[1]), Path(sys.argv[2]))'
-        Push-Location $BlarRoot
+        Push-Location $BlarRuntimeRoot
         try {
             # Route the boot command's own output through Write-Log rather than letting it
             # fall to the success stream. Ensure-AoHeadless is called FROM INSIDE
@@ -551,7 +892,7 @@ function Ensure-AoHeadless {
             # would land its stdout in that function's return value -- the same
             # array-instead-of-bool shape that killed the admission gate. Nothing is lost:
             # the boot's real log is the file passed as its second argument.
-            & $Python -c $bootPy $BlarRoot "$NightDir\ao-boot.log" 2>&1 |
+            & $Python -c $bootPy $BlarRuntimeRoot "$NightDir\ao-boot.log" 2>&1 |
                 ForEach-Object { Write-Log "ao-boot: $_" }
         } finally { Pop-Location }
         $deadline = (Get-Date).AddSeconds(240)   # a cold 14B load can exceed 2 min
@@ -595,7 +936,15 @@ function Test-NightAdmission {
         return $false
     }
     Write-Log ("lean preflight: projected {0:N1} GiB short of {1} but available {2:N1} GiB >= probe floor {3} — PROBING a real 30B load (#784; ends the dead band #777 exposed)." -f $h.Projected, $LEAN_GATE_GIB, $h.Avail, $PROBE_FLOOR_GIB)
-    Push-Location $BlarRoot   # `-m tools.dispatch_harness.probe` resolves from the repo root
+    # MEASURED root, like the runner below it (#1181). `-m` resolves the module from the
+    # cwd, so this is what decides whether the admission gate is pinned code -- and the
+    # admission gate decides whether the night happens at all, which makes it part of the
+    # instrument, not part of the installation. Run from the runtime root it was the one
+    # piece of the night still executing whatever branch that checkout was parked on.
+    # The probe still ACTS on the installation: BLARAI_BATTERY_RUNTIME_ROOT is exported
+    # above, and probe._BLARAI_REPO_ROOT resolves through it, so the AO it stops and
+    # restores is the installed one and the config it reads is the installation's.
+    Push-Location $BlarMeasuredRoot
     try {
         # 2>&1 folds the probe's stderr log line into the captured output (kept for the
         # transcript); the branch is on the EXIT CODE, which is the reliable signal.
@@ -632,7 +981,7 @@ if (-not $Now) {
             # way it starved this one. Same guard and same non-fatal posture as Leg A.
             if ($AoOwnedByThisNight) {
                 try {
-                    $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRoot `
+                    $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRuntimeRoot `
                         -StopAssistantPath $StopAssistantPath -Context "skipped night $Stamp (never admitted)" -Log ${function:Write-Log}
                 } catch {
                     Write-Log "ao-ownership: skip-path teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
@@ -660,7 +1009,7 @@ Ensure-AoHeadless
 Write-AdmissionRecord 'admitted'
 
 # Fresh sandbox repos: archive last night's (rename — zero deletion), re-init.
-$cards = Get-ChildItem "$BlarRoot\evals\battery\B*.json"
+$cards = Get-ChildItem "$BlarMeasuredRoot\evals\battery\B*.json"
 $repoArchive = "$NightDir\repos-archived"
 foreach ($j in $jobs) {
     $card = $cards | Where-Object { $_.BaseName -eq $j } | Select-Object -First 1
@@ -700,9 +1049,20 @@ foreach ($j in $jobs) {
 # ---- 4. run the battery ------------------------------------------------------
 Write-Log "launching the battery runner..."
 $jobArg = $jobs -join ","
-Push-Location $BlarRoot   # `-m tools.dispatch_harness.battery` resolves from the repo root
+# `-m tools.dispatch_harness.battery` resolves from the CWD, so this Push-Location is what
+# pins the measurement: the runner, the graders and the frozen cards all come from the
+# measured tree. The interpreter is deliberately the RUNTIME venv -- battery.py imports
+# nothing from the editable-installed `app` package, so the venv does not pin any code, and
+# the measured worktree has no .venv of its own.
+#
+# --config names the RUNTIME tree's default.toml on purpose. It carries the port and the
+# fleet roots, and the AO reads its OWN copy from the tree it booted in; letting the harness
+# read the measured tree's copy instead would let the two disagree about which port to talk
+# on. Config is the installation's, not the measurement's.
+Push-Location $BlarMeasuredRoot
 try {
     & $Python -m tools.dispatch_harness.battery --jobs $jobArg --out "$NightDir\scorecards" `
+        --config "$BlarRuntimeRoot\services\assistant_orchestrator\config\default.toml" `
         *> "$NightDir\battery-runner.log"
     $runnerExit = $LASTEXITCODE
 } finally { Pop-Location }
@@ -727,7 +1087,14 @@ if (Get-Process -Name ovms -ErrorAction SilentlyContinue) {
 # stays a completed night even if its report could not be written.
 $__postludeError = $null
 try {
-$scorecards = Get-ChildItem "$NightDir\scorecards" -Filter "*.json" -ErrorAction SilentlyContinue
+# battery.py writes the AGGREGATE battery-summary.json into this same directory, so a bare
+# *.json sweep picks it up as though it were a per-job scorecard (#1180). It has no job_id,
+# and under the StrictMode Latest that ao-ownership-lib.ps1 puts in scope that read is a
+# TERMINATING error -- which landed in the catch below and printed "unreadable scorecard"
+# on EVERY night's report. Nothing was ever unreadable. Exclude it by name; the shape check
+# in the loop is the backstop, not the primary defence.
+$scorecards = Get-ChildItem "$NightDir\scorecards" -Filter "*.json" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne 'battery-summary.json' }
 $lines = @("# M2 battery — night $Stamp", "",
            "jobs requested: $($jobs -join ', ')  |  runner exit: $runnerExit", "")
 $verdicts = @{}
@@ -736,26 +1103,92 @@ $verdicts = @{}
 # it in the denominator quietly depresses the coder rate. mode rides evidence.mode
 # ("plan-graph"|"flat"), stamped by the driver's scorecard; absent = mode-unknown.
 $green = 0; $planEligible = 0; $flatQueue = 0; $modeUnknown = 0
+# #1181: read the tree stamp battery.py writes and say plainly what was measured. Null
+# until a scorecard supplies it -- scorecards written before the stamp existed cannot tell
+# us, and "cannot tell" must not render as "clean".
+$measuredTree = $null; $measuredClean = $false
 foreach ($sc in $scorecards) {
-    try {
-        $d = Get-Content $sc.FullName -Raw | ConvertFrom-Json
-        if ($d.job_id) {
-            $verdicts[$d.job_id] = $d.verdict
-            if ($d.verdict -eq "GREEN") { $green++ }
-            switch ($d.evidence.mode) {
-                "plan-graph" { $planEligible++ }
-                "flat"       { $flatQueue++ }
-                default      { $modeUnknown++ }
-            }
-            $ga = $d.evidence.guest_agreement
-            $gaNote = if ($ga) { "; guest: $ga" } else { "" }
-            $lines += ("* **{0}**: {1} ({2}; {3:n0}s; attribution: {4}{5})" -f
-                $d.job_id, $d.verdict, $d.notes, $d.wall_clock_s, $d.attribution, $gaNote)
-            if ($ga -eq "DIVERGENCE") {
-                $lines = @("## !! GUEST-ORACLE DIVERGENCE on $($d.job_id) — host and clean-room disagree !!", "") + $lines
+  # PER-SCORECARD CONTAINMENT. This outer try is load-bearing and must wrap the WHOLE body,
+  # not just the parse. Under StrictMode Latest every member read below is a potential
+  # TERMINATING error, and an escape from this loop lands in the postlude catch (:885) --
+  # which means NO MORNING-REPORT.md and NO campaign banking for the night. One malformed
+  # scorecard must cost its own line, never the whole night's evidence. A first cut of #1180
+  # narrowed this guard to the parse alone; review caught that it turned a partial failure
+  # total, on the unattended 23:00 path, in the #1019 shape.
+  try {
+    $d = $null
+    try { $d = Get-Content $sc.FullName -Raw | ConvertFrom-Json }
+    catch {
+        # A file that is genuinely not parseable. This is the loud case and it must stay
+        # distinguishable from "this is not a scorecard" -- #1180 collapsed the two, so the
+        # only line that can announce lost evidence became the line nobody reads.
+        $lines += "* !! UNREADABLE scorecard (not valid JSON): $($sc.Name) — evidence for this job is LOST"
+        continue
+    }
+    # An empty or whitespace-only file parses to $null and does NOT throw, so the catch
+    # above never fires -- the truncated/interrupted-write shape. Without this the next
+    # member read terminates and takes the postlude with it.
+    if ($null -eq $d) {
+        $lines += "* !! UNREADABLE scorecard (empty or null): $($sc.Name) — evidence for this job is LOST"
+        continue
+    }
+    # StrictMode Latest is in scope, so a missing member THROWS rather than yielding $null.
+    # Test membership before reading, and report an unexpected shape as its own thing.
+    if ($d.PSObject.Properties.Name -notcontains 'job_id') {
+        $lines += "* skipped, not a per-job scorecard (no job_id): $($sc.Name)"
+        continue
+    }
+    $verdicts[$d.job_id] = $d.verdict
+    if ($d.verdict -eq "GREEN") { $green++ }
+    # Every scorecard in a night SHOULD carry the same stamp -- but nothing enforces that,
+    # and a checkout switched mid-run is exactly the confound this stamp exists to expose.
+    # So detect disagreement rather than assert the invariant and keep the first value.
+    if ($d.PSObject.Properties.Name -contains 'versions') {
+        $v = $d.versions
+        if ($v.PSObject.Properties.Name -contains 'blarai_branch') {
+            # CONTAINMENT is the test; the branch name is provenance beside it. The name
+            # was only ever standing in for "is this code merged", and it breaks on the
+            # tree that matters most: a pinned measurement worktree is DETACHED by
+            # construction (git refuses to check out main twice), so a name test brands
+            # every correctly-pinned night as unmerged and prints a red banner on the
+            # operator's morning read the night the pin first works, and every night after.
+            # An alarm that fires on every normal night is an alarm already switched off.
+            # Absent field = an older scorecard that cannot answer: unknown, never a pass.
+            $thisOnMain = if ($v.PSObject.Properties.Name -contains 'blarai_on_main') { [string]$v.blarai_on_main } else { 'unknown' }
+            $thisTree = "{0} @ {1} [{2}; on main: {3}]" -f $v.blarai_branch, $v.blarai, $v.blarai_tree, $thisOnMain
+            if ($null -eq $measuredTree) {
+                $measuredTree = $thisTree
+                $measuredClean = ($thisOnMain -eq 'yes' -and $v.blarai_tree -eq 'clean')
+            } elseif ($measuredTree -ne $thisTree -and $measuredTree -notmatch '^DISAGREEMENT') {
+                $measuredTree = "DISAGREEMENT between jobs — '$measuredTree' vs '$thisTree' (a checkout moved mid-night; NO job in this night is condition-matched)"
+                $measuredClean = $false
             }
         }
-    } catch { $lines += "* unreadable scorecard: $($sc.Name)" }
+    }
+    switch ($d.evidence.mode) {
+        "plan-graph" { $planEligible++ }
+        "flat"       { $flatQueue++ }
+        default      { $modeUnknown++ }
+    }
+    $ga = $d.evidence.guest_agreement
+    $gaNote = if ($ga) { "; guest: $ga" } else { "" }
+    # attribution is "" on every job until #740's window lands. Rendering the LABEL with
+    # nothing after it taught the reader to skip a field that will one day carry meaning,
+    # so omit the label entirely while it is empty rather than printing a bare heading.
+    $attrNote = if ($d.PSObject.Properties.Name -contains 'attribution' -and $d.attribution) {
+        "; attribution: $($d.attribution)"
+    } else { "" }
+    $lines += ("* **{0}**: {1} ({2}; {3:n0}s{4}{5})" -f
+        $d.job_id, $d.verdict, $d.notes, $d.wall_clock_s, $attrNote, $gaNote)
+    if ($ga -eq "DIVERGENCE") {
+        $lines = @("## !! GUEST-ORACLE DIVERGENCE on $($d.job_id) — host and clean-room disagree !!", "") + $lines
+    }
+  } catch {
+    # Any OTHER unexpected shape (a scorecard missing verdict/notes/evidence, a versions
+    # block missing a key). Contained to this card: it costs one honest line and the rest
+    # of the night still reports. Deliberately worded as lost evidence, not as noise.
+    $lines += "* !! UNREADABLE scorecard (unexpected shape: $($_.Exception.Message)): $($sc.Name) — evidence for this job is LOST"
+  }
 }
 # The honest denominator: GREEN over plan-graph-eligible, with the raw rate + the
 # structurally-non-GREEN flat count both shown (nothing hidden; no verdict altered).
@@ -763,6 +1196,28 @@ $relLine = ("reliability (#789 — honest denominator): GREEN {0}/{1} plan-graph
     $green, $planEligible, $verdicts.Count, $flatQueue)
 if ($modeUnknown -gt 0) { $relLine += ("; mode-unknown={0}" -f $modeUnknown) }
 $lines += ""; $lines += $relLine
+# #1181: name the conditions this night actually measured. A run against an unmerged branch
+# or a tree carrying uncommitted work is not condition-matched to the night before it, which
+# is the baseline the one-change-per-run attribution rule assumes. Silence here let a night
+# be stamped with a feature-branch tip that reads like a release.
+if ($measuredTree) {
+    $lines += "measured tree (#1181): BlarAI $measuredTree"
+    if (-not $measuredClean) {
+        $lines = @("## !! MEASURED AN UNMERGED OR DIRTY TREE — not condition-matched to main: $measuredTree !!", "") + $lines
+    }
+} else {
+    $lines += "measured tree (#1181): NOT RECORDED — the branch and cleanliness of the tree this night ran from are unknown (scorecards predate the stamp)."
+}
+# The OTHER tree. #1181 asks for the state of both, and only one of them is in the
+# scorecards: this driver owns the job set, the admission gate, the budgets and the
+# banking, so a night is not reproducible from the BlarAI commit alone. Deliberately not a
+# banner -- a driver off main is worth seeing in the report, and the stand-downs upstream
+# are what actually stop it, so this line informs rather than alarms.
+if ($DriverStamp) {
+    $lines += "driver tree (#1181): agentic-setup $DriverStamp"
+} else {
+    $lines += "driver tree (#1181): NOT RECORDED — the commit of the launcher that ran this night is unknown."
+}
 $falseDone = $verdicts.Values | Where-Object { $_ -eq "FALSE-DONE" }
 if ($falseDone) { $lines = @("## !! FALSE-DONE DETECTED — RED ALERT !!", "") + $lines }
 if ($TaskSettingsDrift) { $lines = @("## !! BATTERY TASK-SETTINGS DRIFT (#833) — $TaskSettingsDrift", "") + $lines }
@@ -851,7 +1306,7 @@ if ($camp.completed_passes -ge $camp.target_full_passes) {
 # night's Leg B retries the reclaim.
 if ($AoOwnedByThisNight) {
     try {
-        $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRoot `
+        $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRuntimeRoot `
             -StopAssistantPath $StopAssistantPath -Context "end-of-night (night $Stamp)" -Log ${function:Write-Log}
     } catch {
         Write-Log "ao-ownership: end-of-night teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."

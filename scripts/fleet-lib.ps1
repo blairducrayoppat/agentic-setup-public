@@ -1,4 +1,4 @@
-﻿# fleet-lib.ps1 - shared helpers for the agent fleet (verify gate, secret-scan,
+# fleet-lib.ps1 - shared helpers for the agent fleet (verify gate, secret-scan,
 # circuit breakers, session supervisor). Dot-source it:
 #     . "$PSScriptRoot\fleet-lib.ps1"
 # Pure function definitions only - NO side effects on load (safe to dot-source).
@@ -382,6 +382,10 @@ function Invoke-AgentRun {
     # runs can import root-level modules (same as the verify gate). Without this the
     # agent fights a phantom ModuleNotFoundError and burns the whole timeout.
     $prevPP = $env:PYTHONPATH; $env:PYTHONPATH = $WorkDir
+    # #1206 ARM (or actively DISARM) the coder's local docset lookup for THIS spawn. Start-Process
+    # -NoNewWindow hands the child this process's environment block, so the manifest's decision
+    # reaches opencode -- and the tool it shells out to -- by construction. Restored below.
+    $researchEnv = Set-CoderResearchEnv -DriverPath 'stdin' -WorkDir $WorkDir -LogPath $LogPath
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($useExe) {
         $parts = @('run', '--dir', $WorkDir, '-m', $Model)
@@ -475,6 +479,7 @@ function Invoke-AgentRun {
         }
     } catch {}
     if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+    Restore-CoderResearchEnv -State $researchEnv   # #1206: own the arming vars for the spawn only
     # Fold stderr into the transcript log, then drop the temp err file.
     if (Test-Path $errPath) {
         Get-Content $errPath -ErrorAction SilentlyContinue | Add-Content $LogPath -ErrorAction SilentlyContinue
@@ -496,6 +501,12 @@ function Invoke-AgentRun {
     try {
         Add-Content -Path $LogPath -Value ("[opencode-pin] run used opencode $($pinVerdict.LiveVersion) (pin $($pinVerdict.PinVersion); validated)") -ErrorAction SilentlyContinue
     } catch { }
+    # #1206 per-run arming PROVENANCE into the same transcript the battery/morning report reads, so
+    # the local-docset posture of a run is legible without cross-referencing the ledger. (Written
+    # after the run because Start-Process TRUNCATES $LogPath when it redirects stdout into it.)
+    try {
+        Add-Content -Path $LogPath -Value ("[research-docs] armed=$($researchEnv.Armed) -- $($researchEnv.Reason)") -ErrorAction SilentlyContinue
+    } catch { }
     # A step-cap means the agent DID the work then looped; treat it as completed (exit 0), not a
     # failure, so the gate runs + the auto-merge can fire (#670 run-3).
     $exit = if ($timedOut) { $null } elseif ($capped) { 0 } else { $p.ExitCode }
@@ -512,7 +523,7 @@ function Get-FleetDriverConfig {
     param([string]$ScriptRoot = $PSScriptRoot, [switch]$Fresh)
     if (-not $Fresh -and $script:_FleetDriverCfg) { return $script:_FleetDriverCfg }
     $default = [pscustomobject]@{
-        driver = 'stdin'; containment = 'off'
+        driver = 'stdin'; containment = 'off'; research_docs = $false
         acp = [pscustomobject]@{ python = ''; blarai_root = 'C:/Users/mrbla/blarai'; idle_sec = 600; max_steps = 45; spin_steps = 10 }
     }
     try {
@@ -524,6 +535,10 @@ function Get-FleetDriverConfig {
         $raw = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         $driver = if ($raw.driver -in @('stdin','acp')) { $raw.driver } else { 'stdin' }
         $cont   = if ($raw.containment -in @('off','restricted_account')) { $raw.containment } else { 'off' }
+        # #1206 research_docs -- DENY-BY-DEFAULT and strictly typed: ONLY a literal JSON boolean
+        # true arms the coder's local docset lookup. A string "true", a 1, a typo or a missing key
+        # all mean OFF. An ambiguous manifest must never arm a build-time capability by accident.
+        $research = ($raw.research_docs -is [bool]) -and [bool]$raw.research_docs
         $acp = [pscustomobject]@{
             python      = [string]$raw.acp.python
             blarai_root = if ($raw.acp.blarai_root) { [string]$raw.acp.blarai_root } else { 'C:/Users/mrbla/blarai' }
@@ -531,13 +546,159 @@ function Get-FleetDriverConfig {
             max_steps   = if ($raw.acp.max_steps)   { [int]$raw.acp.max_steps }   else { 45 }
             spin_steps  = if ($raw.acp.spin_steps)  { [int]$raw.acp.spin_steps }  else { 10 }
         }
-        $cfg = [pscustomobject]@{ driver = $driver; containment = $cont; acp = $acp }
+        $cfg = [pscustomobject]@{ driver = $driver; containment = $cont; research_docs = $research; acp = $acp }
         $script:_FleetDriverCfg = $cfg
         return $cfg
     } catch {
         # A manifest we cannot read must never enable a non-default posture.
         $script:_FleetDriverCfg = $default
         return $default
+    }
+}
+
+function Get-ResearchArmingVerdict {
+    # #1206 PURE decision half (mirrors Get-OpencodePinVerdict): does THIS coder spawn get the
+    # local docset lookup, and WHY? Injectable + never throws, so the whole truth table is
+    # unit-testable with scripted inputs -- no config file, no opencode, no model.
+    #
+    # The manifest is the ONLY authority, and this verdict is ADVISORY: the tool itself re-reads the
+    # same manifest at the point of use (tools/search_docs.py resolve_arming), so a coder process
+    # that never met this function still resolves the same answer. This exists to decide what goes
+    # in the arming ledger and whether to pin BLARAI_REPO -- not to grant the capability. The two
+    # implementations are held in agreement by verify-research-arming.ps1 section J.
+    #
+    # $AmbientValue is whatever BLARAI_RESEARCH_DOCS already held in the spawning process. It can
+    # never arm anything. A TRUTHY leftover is stale arming-era noise and gets cleared; an explicit
+    # FALSY value is an operator emergency stop and is propagated to the child untouched.
+    # Returns @{ Armed=[bool]; Reason=[string]; AmbientCleared=[bool]; ForcedOff=[bool] }.
+    param(
+        [pscustomobject]$Config,
+        [string]$AmbientValue = ''
+    )
+    $trimmed = ([string]$AmbientValue).Trim()
+    $forcedOff = $trimmed -and ($trimmed.ToLowerInvariant() -in @('0','false','no','off'))
+    $staleTruthy = $trimmed -and (-not $forcedOff)
+    if ($forcedOff) {
+        return @{ Armed = $false; AmbientCleared = $false; ForcedOff = $true
+                  Reason = "FORCED OFF by an operator emergency stop (BLARAI_RESEARCH_DOCS='$trimmed'); propagated to the child" }
+    }
+    if ($null -eq $Config) {
+        return @{ Armed = $false; AmbientCleared = $staleTruthy; ForcedOff = $false
+                  Reason = 'no fleet-driver manifest -- research docs stay DORMANT (fail-safe)' }
+    }
+    if (($Config.research_docs -is [bool]) -and $Config.research_docs) {
+        $reason = 'armed by configs/fleet-driver.json research_docs=true'
+        if ($staleTruthy) { $reason += " -- cleared a stale BLARAI_RESEARCH_DOCS='$trimmed' (the manifest, not the environment, arms this)" }
+        return @{ Armed = $true; AmbientCleared = $staleTruthy; ForcedOff = $false; Reason = $reason }
+    }
+    $seen = if ($null -eq $Config.research_docs) { '<absent>' } else { "'$($Config.research_docs)'" }
+    $reason = "DORMANT: configs/fleet-driver.json research_docs=$seen (only the JSON boolean true arms it)"
+    if ($staleTruthy) {
+        $reason += " -- CLEARED a stale BLARAI_RESEARCH_DOCS='$trimmed' from the child environment"
+    }
+    return @{ Armed = $false; Reason = $reason; AmbientCleared = $staleTruthy; ForcedOff = $false }
+}
+
+function Write-ResearchArmingRecord {
+    # #1206 durable arming evidence. One append-only JSONL record per coder spawn, on BOTH driver
+    # paths, so "was the local docset lookup armed for THIS run" is answerable after the fact
+    # instead of inferred. It is the companion to state/research-usage.jsonl (which the CLI itself
+    # writes, one record per lookup the coder actually MADE): together they separate the three
+    # states that otherwise look identical in a transcript -- not armed / armed but never called /
+    # armed and called. Override the path with $env:BLARAI_RESEARCH_ARMING_LOG (verify + tests).
+    #
+    # Fail-SOFT but never silent: this is EVIDENCE, not the control. The control is the env
+    # mutation in Set-CoderResearchEnv, which is unconditional and cannot degrade. A ledger write
+    # that fails says so loudly on the console rather than aborting a coder run mid-build.
+    param(
+        [bool]$Armed, [string]$Reason, [string]$DriverPath,
+        [string]$WorkDir = '', [string]$LogPath = '', [string]$Interpreter = '',
+        [string]$ScriptRoot = $PSScriptRoot
+    )
+    try {
+        $path = if ($env:BLARAI_RESEARCH_ARMING_LOG) { $env:BLARAI_RESEARCH_ARMING_LOG }
+                else { Join-Path (Split-Path $ScriptRoot -Parent) 'state\research-arming.jsonl' }
+        $dir = Split-Path $path -Parent
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $now = [DateTime]::UtcNow
+        $rec = [pscustomobject]@{
+            ts          = [Math]::Round(($now - [DateTime]'1970-01-01').TotalSeconds, 6)  # correlates with research-usage.jsonl
+            iso         = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            driver_path = $DriverPath      # 'stdin' | 'acp'
+            armed       = $Armed
+            reason      = $Reason
+            workdir     = $WorkDir
+            log         = $LogPath
+            interpreter = $Interpreter
+        }
+        Add-Content -Path $path -Value ($rec | ConvertTo-Json -Compress -Depth 4) -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        Write-Host "  [research-docs] WARNING: could not append the arming record ($($_.Exception.Message)) -- the run continues, the evidence does not" -ForegroundColor Yellow
+    }
+}
+
+function Set-CoderResearchEnv {
+    # #1206 the pre-spawn seam. It does NOT grant the capability -- tools/search_docs.py resolves the
+    # same committed manifest for itself on every call, so a coder process that never passed through
+    # here still gets the right answer (a reboot, a crash relaunch, a hand-started session). What
+    # this does is the part the child CANNOT do for itself:
+    #   1. BANK the arming decision per spawn (state/research-arming.jsonl), so "was it armed for
+    #      that run" is answerable months later instead of reconstructed.
+    #   2. PIN BLARAI_REPO / BLARAI_RESEARCH_PYTHON from the manifest when armed, so an armed run
+    #      resolves the same substrate + interpreter every time instead of whatever is on PATH.
+    #   3. CLEAR a stale truthy BLARAI_RESEARCH_DOCS. Under the old contract that value armed things;
+    #      it no longer can, and leaving it would misdescribe the run to anyone reading the child's
+    #      environment. An explicit FALSY value is the operator's emergency stop and is PRESERVED --
+    #      a deliberate kill must reach the coder's tools, not be tidied away by the launcher.
+    # Returns a state token for Restore-CoderResearchEnv.
+    param(
+        [Parameter(Mandatory)][ValidateSet('stdin','acp')][string]$DriverPath,
+        [string]$WorkDir = '', [string]$LogPath = '',
+        [string]$ScriptRoot = $PSScriptRoot
+    )
+    $state = @{
+        PrevDocs   = $env:BLARAI_RESEARCH_DOCS
+        PrevRepo   = $env:BLARAI_REPO
+        PrevPython = $env:BLARAI_RESEARCH_PYTHON
+        Armed      = $false; Reason = ''; Interpreter = ''; ForcedOff = $false
+    }
+    $cfg = $null
+    try { $cfg = Get-FleetDriverConfig -ScriptRoot $ScriptRoot } catch { $cfg = $null }
+    $verdict = Get-ResearchArmingVerdict -Config $cfg -AmbientValue ([string]$state.PrevDocs)
+    if ($verdict.AmbientCleared) { Remove-Item Env:\BLARAI_RESEARCH_DOCS -ErrorAction SilentlyContinue }
+    if ($verdict.Armed) {
+        if ($cfg.acp.blarai_root) { $env:BLARAI_REPO = [string]$cfg.acp.blarai_root }
+        if ($cfg.acp.python -and (Test-Path $cfg.acp.python)) {
+            $env:BLARAI_RESEARCH_PYTHON = [string]$cfg.acp.python
+            $state.Interpreter = [string]$cfg.acp.python
+        }
+    }
+    $state.Armed = [bool]$verdict.Armed
+    $state.Reason = [string]$verdict.Reason
+    $state.ForcedOff = [bool]$verdict.ForcedOff
+    Write-ResearchArmingRecord -Armed $state.Armed -Reason $state.Reason -DriverPath $DriverPath `
+        -WorkDir $WorkDir -LogPath $LogPath -Interpreter $state.Interpreter -ScriptRoot $ScriptRoot
+    if ($state.Armed) {
+        Write-Host "  [research-docs] ARMED for this run -- $($state.Reason)" -ForegroundColor DarkCyan
+    } elseif ($verdict.AmbientCleared -or $verdict.ForcedOff) {
+        Write-Host "  [research-docs] $($state.Reason)" -ForegroundColor Yellow
+    }
+    return $state
+}
+
+function Restore-CoderResearchEnv {
+    # #1206 put the spawning process back exactly as it was. The variables are process-global and
+    # this same console runs the gate, the review and sibling legs; owning them only for the spawn
+    # keeps the arming decision per-run instead of leaking sideways.
+    param($State)
+    if ($null -eq $State) { return }
+    foreach ($pair in @(
+        @{ Name = 'BLARAI_RESEARCH_DOCS';   Value = $State.PrevDocs },
+        @{ Name = 'BLARAI_REPO';            Value = $State.PrevRepo },
+        @{ Name = 'BLARAI_RESEARCH_PYTHON'; Value = $State.PrevPython }
+    )) {
+        if ($null -eq $pair.Value) { Remove-Item "Env:\$($pair.Name)" -ErrorAction SilentlyContinue }
+        else { Set-Item "Env:\$($pair.Name)" -Value $pair.Value -ErrorAction SilentlyContinue }
     }
 }
 
@@ -591,6 +752,11 @@ function Invoke-AcpCoderRun {
     # The client must import blarai's `shared`/`tools` packages -> run WITH the blarai root on PYTHONPATH
     # and cwd there, matching how the fleet already invokes blarai python (run-battery-night.ps1).
     $prevPP = $env:PYTHONPATH; $env:PYTHONPATH = $blarRoot
+    # #1206 ARM (or actively DISARM) the coder's local docset lookup for THIS spawn -- the ACP path
+    # needs it as much as the stdin one: this interpreter spawns opencode-acp, which spawns the tool.
+    # The env travels down that whole chain by inheritance, so the decision has to be made HERE, at
+    # the process boundary, not in whatever shell launched the orchestrator. Restored on every exit.
+    $researchEnv = Set-CoderResearchEnv -DriverPath 'acp' -WorkDir $WorkDir -LogPath $LogPath
     try {
         # A generous outer ceiling: the client enforces its OWN idle/step/overall bounds and tree-kills;
         # this WaitForExit is only a backstop against a wedged interpreter that never writes the envelope.
@@ -601,13 +767,16 @@ function Invoke-AcpCoderRun {
             try { & taskkill.exe /PID $p.Id /T /F *> $null } catch {}
             try { $null = $p.WaitForExit(5000) } catch {}
             if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+            Restore-CoderResearchEnv -State $researchEnv
             return @{ Ok = $false; Reason = "ACP client exceeded the outer ceiling (${outerSec}s) and was killed; falling back to stdin" }
         }
     } catch {
         if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+        Restore-CoderResearchEnv -State $researchEnv
         return @{ Ok = $false; Reason = "ACP client failed to launch: $($_.Exception.Message); falling back to stdin" }
     }
     if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
+    Restore-CoderResearchEnv -State $researchEnv
     if (-not (Test-Path $resultJson)) {
         return @{ Ok = $false; Reason = 'ACP client wrote no result envelope; falling back to stdin' }
     }
@@ -851,11 +1020,395 @@ function Test-ShouldRunReview {
     # otherwise -- changes present, no gate FAILURE, but the gates are NOT both green (e.g. a build-only
     # ecosystem with test=none, where the review verdict genuinely decides the merge). Pure + ASCII;
     # unit-tested without a model.
-    param([bool]$HasChanges, [string]$VerifyResult = 'none', [string]$TestResult = 'none')
+    # #1195 -- the skip's premise, named. "test=pass" was read as "an exam passed". On a flat-queue run
+    # there is no sealed oracle, so it means the tests the CODER WROTE FOR ITS OWN CODE: the candidate set
+    # the exam, sat it, marked it, and the harness reported the mark as evidence (2026-07-29 merged a unit
+    # converter whose ounce factor is wrong by 2.5x; its own test named 0.0353 in a comment and then
+    # asserted 0.01 <= result <= 0.1, a band widened around a known-wrong answer). $CoderTestHard is the
+    # count of PROVEN defects in that exam -- shared/fleet/coder_test_qa.py's HARD set only: a property
+    # test that provably never executed, and a test that provably cannot fail. A proven defect WITHDRAWS
+    # the green-gate skip so the reviewer actually looks at the exam. It does NOT block the merge (that
+    # stays Test-ShouldMerge's call -- a scanner that could park an unattended night would be a second
+    # merge authority). SOFT/heuristic findings deliberately never reach here: forcing the slow,
+    # over-flagging, sometimes-hanging 30B on prose-matching would re-import the very stall this skip
+    # exists to prevent. Default 0 => byte-identical pre-#1195 behaviour.
+    param([bool]$HasChanges, [string]$VerifyResult = 'none', [string]$TestResult = 'none', [int]$CoderTestHard = 0)
     if (-not $HasChanges) { return $false }
     if (($VerifyResult -eq 'fail') -or ($TestResult -eq 'fail')) { return $false }
     $gatesGreen = ($VerifyResult -eq 'pass') -and ($TestResult -eq 'pass')
+    if ($gatesGreen -and ($CoderTestHard -gt 0)) { return $true }
     return (-not $gatesGreen)
+}
+
+#: #1195 -- the statuses Invoke-CoderTestQa can return. Kept as a named set because the whole point of
+#: this layer is that "the scan found nothing" and "the scan did not happen" are DIFFERENT FACTS, and a
+#: caller that collapses them re-creates the defect one layer up.
+$script:CoderTestQaStatuses = @('clean', 'findings', 'no-tests', 'disabled', 'unavailable', 'not-applicable')
+
+function Get-JsonField {
+    # #1201: read one field off a ConvertFrom-Json object WITHOUT assuming it is there. A bare
+    # `$obj.name` read of an absent property returns $null on a default host but THROWS under the
+    # `Set-StrictMode -Version Latest` that ao-ownership-lib.ps1 puts in scope -- and "the field is
+    # absent" is precisely the condition the cross-repo version-skew guard has to be able to observe.
+    # An exception there would turn a detected skew into a crashed dispatch.
+    param($Object, [Parameter(Mandatory)][string]$Name, $Default = '')
+    if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if (-not $prop) { return $Default }
+    return $prop.Value
+}
+
+function New-CoderTestQaResult {
+    # The empty/degraded result shape. Every field present at every exit, so no caller ever reads a
+    # missing property as a zero. Measured=$false means NO VERDICT WAS OBTAINED -- never "nothing found".
+    param([string]$Status = 'unavailable', [string]$Detail = '')
+    return @{
+        Status = $Status; Measured = $false; Hard = 0; Findings = @(); Counts = @{};
+        FilesScanned = 0; Unparsed = @(); Detail = $Detail; Json = ''
+        # #1201: WHOSE exam the counts above describe. 'changed-since' = only the files this task
+        # changed; 'full-tree' = every test file in the delivered tree, which on a repo with history
+        # is a true statement about the TREE and a false attribution to the TASK; '' = no scan ran.
+        # A finding charged to the wrong task costs a review-agent run plus up to two build/test/verify
+        # FIX laps on an exam the coder never wrote, so the scope rides the result rather than being
+        # inferred at each surface.
+        ScopeMode = ''; ScopeChangedFiles = 0
+        # #1195 residual: the [2/5] pytest gate runs `pytest -x -q` with NO --hypothesis-show-statistics
+        # and never persists its output, so there is no statistics artifact to hand the scanner's --stats.
+        # The `unexecuted_property` class is therefore UNMEASURABLE from this seam today. Recorded as a
+        # field, not a comment, so the report can DISCLOSE it instead of printing a counts map whose
+        # `unexecuted_property: 0` would read as a measured zero.
+        PropertyExecutionMeasured = $false
+    }
+}
+
+function Invoke-CoderTestQa {
+    # #1195: run BlarAI's shared/fleet/coder_test_qa.py over the SELECTED candidate's own test files and
+    # return a status-bearing result. Never throws, never blocks, never adjudicates.
+    #
+    # The scanner exits 0 ALWAYS and deliberately -- from its own main() docstring: "a scanner that can
+    # hard-fail a dispatch on its own exit code would be a second merge authority. One arbiter, in the
+    # harness." So the verdict is the single JSON object on stdout and this function branches on THAT.
+    # $LASTEXITCODE is never consulted; reading it would silently invert the module's design.
+    #
+    # FAIL-SOFT IS NOT FAIL-SILENT. Every degraded path returns Status='unavailable' + Measured=$false and
+    # a Detail naming the cause. An unmeasured scan must never render as a clean one: a control that
+    # degrades into looking like a pass is this project's most-repeated defect, and it is the exact defect
+    # coder_test_qa exists to catch one layer down. Callers gate on .Measured, never on .Findings.Count.
+    #
+    # #1201 ATTRIBUTION. -Since names the commit this task started from, and the scan is then limited
+    # to the files changed after it. Without it the scan reads the WHOLE delivered tree, so on any repo
+    # with history every green-gated task loses its review-skip forever on tests the coder never wrote
+    # (419 files / hard=48 on a clean BlarAI checkout), and inside the battery -- whose scaffold is fresh
+    # per NIGHT, not per TASK -- task N is charged for the vacuous tests of tasks 1..N-1. Three seams can
+    # break the attribution and each is FAIL-CLOSED to 'unavailable' below, never quietly downgraded to a
+    # whole-tree read: a scanner too old to understand --since, a baseline the scanner could not resolve,
+    # and a scanner that answered with a scope other than the one asked for.
+    #
+    # PS 5.1 + 7 safe (no ??/ternary). Only reads; never mutates the scanned tree.
+    param(
+        [Parameter(Mandatory)][string]$Repo,        # the candidate worktree -- the tree that would merge
+        [Parameter(Mandatory)][string]$BlarAiRepo,  # BlarAI root; the module runs as `python -m` from here
+        [string]$Since = '',                        # the task's baseline commit; '' asks for no scoping at all
+        [string]$StatsPath = '',                    # a pytest --hypothesis-show-statistics capture, when one exists
+        [switch]$RequireProperty                    # the task mandated a property-based test
+    )
+    if (-not $Repo -or -not (Test-Path $Repo)) {
+        return (New-CoderTestQaResult -Detail "the candidate worktree is not on disk ($Repo)")
+    }
+    $pythonExe = Join-Path $BlarAiRepo '.venv\Scripts\python.exe'
+    if (-not (Test-Path $pythonExe)) {
+        return (New-CoderTestQaResult -Detail "no BlarAI python interpreter at $pythonExe")
+    }
+    $argsList = @('-m', 'shared.fleet.coder_test_qa', $Repo)
+    if ($Since) { $argsList += @('--since', $Since) }
+    if ($StatsPath) { $argsList += @('--stats', $StatsPath) }
+    if ($RequireProperty) { $argsList += '--require-property' }
+    $lines = @()
+    try {
+        $prevLoc = (Get-Location).Path
+        try {
+            Set-Location $BlarAiRepo
+            $lines = @(& $pythonExe @argsList 2>&1)
+        } finally { Set-Location $prevLoc }
+    } catch {
+        return (New-CoderTestQaResult -Detail "the scanner could not be invoked: $($_.Exception.Message)")
+    }
+    $jsonLine = ''
+    foreach ($ln in $lines) { if ("$ln" -match '^\s*\{') { $jsonLine = "$ln" } }
+    if (-not $jsonLine) {
+        # The module is absent (it lands with #1170), un-importable, or it crashed. Carry python's own
+        # last words: a scan that could not run is a fact the operator has to be able to act on.
+        $tail = ((@($lines | Where-Object { "$_".Trim() }) | Select-Object -Last 3) -join ' | ')
+        if ($tail.Length -gt 300) { $tail = $tail.Substring(0, 300) + '...' }
+        return (New-CoderTestQaResult -Detail "the scanner emitted no JSON (module missing, import error or crash): $tail")
+    }
+    try { $obj = $jsonLine | ConvertFrom-Json } catch {
+        return (New-CoderTestQaResult -Detail "the scanner's output was not parseable JSON: $jsonLine")
+    }
+    $out = New-CoderTestQaResult
+    $out.Json = $jsonLine
+    if (-not [bool]$obj.enabled) {
+        # The kill-switch (BLARAI_CODER_TEST_QA) is off. A switched-off control is an ABSENT measurement,
+        # so Measured stays $false -- it is not a clean exam, it is an unexamined one.
+        $out.Status = 'disabled'
+        $out.Detail = 'BLARAI_CODER_TEST_QA is switched off, so the coder''s own tests were not examined'
+        return $out
+    }
+    # #1201: read the scope the scanner actually applied, defensively -- a scanner that predates this
+    # seam emits no `scope` key at all, and under the StrictMode some callers put in scope a bare
+    # property read on an absent key THROWS. Absence is the fact being tested for, so it must not be
+    # an exception.
+    $scopeProp = $obj.PSObject.Properties['scope']
+    $scope = $null
+    if ($scopeProp) { $scope = $scopeProp.Value }
+    if ($scope) {
+        $out.ScopeMode = "$(Get-JsonField -Object $scope -Name 'mode')"
+        $out.ScopeChangedFiles = [int](Get-JsonField -Object $scope -Name 'changed_files' -Default 0)
+    }
+    if ($Since) {
+        # A verdict this task can be CHARGED for, or no verdict. Widening to the whole tree here would
+        # re-create the exact mis-attribution the -Since argument exists to end, and it would do so
+        # invisibly, which is worse than the defect it replaced.
+        $why = ''
+        if (-not $scope) {
+            $why = "this BlarAI checkout's coder_test_qa predates the --since scoping (#1201): it " +
+                   "reported no scope, so its verdict covers the WHOLE delivered tree and cannot be " +
+                   "attributed to this task"
+        } elseif (-not [bool](Get-JsonField -Object $scope -Name 'resolved' -Default $false)) {
+            $why = "the files THIS task changed could not be identified, so nothing was examined: " +
+                   "$(Get-JsonField -Object $scope -Name 'reason')"
+        } elseif ($out.ScopeMode -ne 'changed-since') {
+            $why = "a task baseline was passed but the scan came back scoped '$($out.ScopeMode)', " +
+                   "which is not attributable to this task"
+        }
+        if ($why) {
+            $bad = New-CoderTestQaResult -Detail $why
+            $bad.ScopeMode = $out.ScopeMode
+            $bad.Json = $jsonLine
+            return $bad
+        }
+    }
+    $out.FilesScanned = [int]$obj.files_scanned
+    $out.Unparsed = @($obj.unparsed | ForEach-Object { "$_" })
+    $out.Hard = [int]$obj.hard
+    $out.Findings = @($obj.findings | ForEach-Object {
+        @{ Class = "$($_.class)"; Message = "$($_.message)"; Subject = "$($_.subject)" }
+    })
+    $counts = @{}
+    if ($obj.counts) { foreach ($p in $obj.counts.PSObject.Properties) { $counts[$p.Name] = [int]$p.Value } }
+    $out.Counts = $counts
+    $out.PropertyExecutionMeasured = [bool]$StatsPath
+    $out.Measured = $true
+    if ($out.Findings.Count -gt 0) {
+        $out.Status = 'findings'
+    } elseif ($out.FilesScanned -eq 0) {
+        # Zero files is NOT a clean exam -- there is no exam. A dotnet/node candidate lands here, and so
+        # does a python candidate that shipped no tests at all; both would read as "clean" if this branch
+        # were folded into the one below, which is the same collapse this function exists to refuse.
+        # #1201: say WHICH zero this is. Under a scoped scan the sentence "no python test files under the
+        # candidate" would be false whenever the tree has tests the task simply did not touch -- and the
+        # fact worth reporting there is the stronger one: this task wrote no exam at all.
+        $out.Status = 'no-tests'
+        if ($out.ScopeMode -ne 'changed-since') {
+            $out.Detail = 'no python test files under the candidate -- there was no exam to examine'
+        } elseif ([int]$out.ScopeChangedFiles -gt 0) {
+            $out.Detail = "this task changed $($out.ScopeChangedFiles) file(s) and NONE of them was a python test -- it wrote no exam for its own work"
+        } else {
+            # A DIFFERENT fact, and the caller only reaches here having already decided there ARE
+            # changes -- but it decides that from a COMMIT COUNT against the baseline, while the scope
+            # is a CONTENT diff against the same baseline. A coder that added something and then took
+            # it back out again satisfies the first and empties the second. Saying "changed 0 file(s)
+            # and none was a test" would be technically true and would hide the only thing worth
+            # knowing here. Not treated as a fault: it is a legitimate outcome, just an odd one.
+            $out.Detail = "this task's commits produce NO net content change against its baseline, so there was nothing to examine (its work was added and then reverted, or it committed only mode/metadata changes)"
+        }
+    } else {
+        $out.Status = 'clean'
+    }
+    return $out
+}
+
+function ConvertTo-FleetAscii {
+    # #1195: fold a string to ASCII for the task REPORT. coder_test_qa.py writes real prose and uses
+    # em-dashes and curly quotes; Set-Content picks its encoding from the HOST (PS 5.1 = ANSI, PS 7 =
+    # UTF-8), so the same finding renders clean on one and as mojibake on the other. The operator must
+    # not have to decode the one line telling them their exam is broken. Substitutions, not deletions:
+    # a folded message still names the same subject, the same value and the same fix.
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    $out = $Text
+    $out = $out -replace ([char]0x2014), '--'   # em dash
+    $out = $out -replace ([char]0x2013), '-'    # en dash
+    $out = $out -replace ([char]0x2018), "'"    # left single quote
+    $out = $out -replace ([char]0x2019), "'"    # right single quote
+    $out = $out -replace ([char]0x201C), '"'    # left double quote
+    $out = $out -replace ([char]0x201D), '"'    # right double quote
+    $out = $out -replace ([char]0x2026), '...'  # ellipsis
+    $out = $out -replace ([char]0x00A0), ' '    # non-breaking space
+    # Anything still outside printable ASCII becomes '?' rather than a host-dependent byte.
+    return ($out -replace '[^\x09\x0A\x0D\x20-\x7E]', '?')
+}
+
+function Format-CoderTestQaBlock {
+    # #1195: the operator-facing block for the task report + console. PURE -> unit-tested without python
+    # or a model (verify-coder-test-qa.ps1). The first line is unindented and starts 'CODER TEST QA:' so
+    # it cannot collide with the ^TESTS:/^VERIFY:/^RESULT: anchors run-fleet.ps1, watch.py and
+    # acceptance.parse_task_report scrape; every continuation line is indented and prefixed '- ' so a
+    # finding's own text can never impersonate one of those keys either.
+    param($Result, [bool]$SkipWithdrawn = $false, [int]$MaxFindings = 12)
+    if ($null -eq $Result) {
+        return "CODER TEST QA: NOT MEASURED - no result object was produced. The coder's own tests were NOT examined; this is an ABSENT measurement, not a clean one."
+    }
+    $status = "$($Result.Status)"
+    $detail = "$($Result.Detail)" -replace '\s*[\r\n]+\s*', ' '
+    if (-not [bool]$Result.Measured) {
+        $lead = 'CODER TEST QA: NOT MEASURED'
+        if ($status -eq 'disabled') { $lead = 'CODER TEST QA: NOT MEASURED (kill-switch off)' }
+        elseif ($status -eq 'not-applicable') { $lead = 'CODER TEST QA: NOT MEASURED (nothing to examine)' }
+        # $detail can carry python's own last words, so it gets the same fold as a finding message.
+        $line = "$lead - $detail."
+        return (ConvertTo-FleetAscii -Text ($line + " The coder's own tests were NOT examined; this is an ABSENT measurement, not a clean one."))
+    }
+    $files = [int]$Result.FilesScanned
+    $hard = [int]$Result.Hard
+    # #1201: name WHOSE exam this is, on the line the operator reads. A count with no scope is the
+    # thing that made "the coder's OWN exam carries 48 PROVEN defect(s)" a false sentence about a task
+    # that had written none of them.
+    $scopeMode = "$($Result.ScopeMode)"
+    $subject = ' of the coder''s tests'
+    if ($scopeMode -eq 'changed-since') {
+        $subject = " of the $([int]$Result.ScopeChangedFiles) file(s) THIS task changed"
+    } elseif ($scopeMode -eq 'full-tree') {
+        $subject = ' of the WHOLE delivered tree (no task baseline, so findings are NOT attributed to this task alone)'
+    }
+    $lines = New-Object System.Collections.ArrayList
+    if ($status -eq 'no-tests') {
+        # True whether the TESTS line above reads pass or none: either way nothing coder-authored was
+        # examined here, because on this candidate there was no exam to examine.
+        [void]$lines.Add("CODER TEST QA: NO EXAM - $detail. The TESTS line above rests on no coder-authored test at all.")
+    } elseif ($status -eq 'clean') {
+        [void]$lines.Add("CODER TEST QA: clean - $files test file(s) examined$subject, no findings.")
+    } else {
+        $n = @($Result.Findings).Count
+        $tail = 'the merge gate is UNCHANGED (advisory by design).'
+        if ($SkipWithdrawn) {
+            $tail = "the green-gate review SKIP was WITHDRAWN so the reviewer looks at this exam; the merge gate is UNCHANGED (advisory by design)."
+        }
+        [void]$lines.Add("CODER TEST QA: $n finding(s) over $files test file(s)$subject, $hard PROVEN - $tail")
+        $shown = 0
+        foreach ($f in @($Result.Findings)) {
+            if ($shown -ge $MaxFindings) { break }
+            $subj = "$($f.Subject)"
+            $where = ''
+            if ($subj) { $where = " $subj" }
+            [void]$lines.Add(("  - [$($f.Class)]$where : $($f.Message)" -replace '\s*[\r\n]+\s*', ' '))
+            $shown++
+        }
+        if ($n -gt $shown) { [void]$lines.Add("  - (+$($n - $shown) more finding(s) in the sidecar JSON)") }
+    }
+    if (@($Result.Unparsed).Count -gt 0) {
+        [void]$lines.Add("  - NOT EXAMINED: $(@($Result.Unparsed).Count) test file(s) would not parse, so they were skipped by the scan.")
+    }
+    if (-not [bool]$Result.PropertyExecutionMeasured) {
+        # Disclosed, not silently absent: the counts map would otherwise carry unexecuted_property: 0,
+        # which reads as a measured zero. See the field's comment in New-CoderTestQaResult.
+        [void]$lines.Add('  - NOT MEASURED: the test gate captures no Hypothesis run statistics, so `unexecuted_property` (a property test that never generated an example) could not be checked (#1195).')
+    }
+    return (ConvertTo-FleetAscii -Text ($lines -join "`n"))
+}
+
+function ConvertTo-CoderTestQaSidecarJson {
+    # #1195: the machine-readable companion to Format-CoderTestQaBlock, written beside the task report so
+    # a scorecard can consume the verdict without regexing prose. PURE -> unit-tested. `measured` is a
+    # FIRST-CLASS field for the same reason it exists in the result: a consumer must be able to tell an
+    # unexamined run from a clean one without inferring it from an empty findings list.
+    param($Result)
+    $r = $Result
+    if ($null -eq $r) { $r = (New-CoderTestQaResult -Detail 'no result object was produced') }
+    $payload = [ordered]@{
+        status = "$($r.Status)"
+        measured = [bool]$r.Measured
+        hard = [int]$r.Hard
+        files_scanned = [int]$r.FilesScanned
+        detail = "$($r.Detail)"
+        property_execution_measured = [bool]$r.PropertyExecutionMeasured
+        # #1201: a scorecard reading `hard` must be able to see WHOSE exam that number graded without
+        # regexing the prose block, so the attribution is a first-class field here too.
+        scope_mode = "$($r.ScopeMode)"
+        scope_changed_files = [int]$r.ScopeChangedFiles
+        unparsed = @(@($r.Unparsed) | ForEach-Object { "$_" })
+        counts = $r.Counts
+        findings = @(@($r.Findings) | ForEach-Object {
+            [ordered]@{ class = "$($_.Class)"; message = "$($_.Message)"; subject = "$($_.Subject)" }
+        })
+        scanner_json = "$($r.Json)"
+    }
+    return (ConvertTo-Json $payload -Depth 6)
+}
+
+function Write-CoderTestQaSidecar {
+    # #1195: persist the sidecar as UTF-8 WITHOUT a BOM, deterministically. Set-Content would pick its
+    # encoding from the host (PS 5.1 ANSI / UTF-8-with-BOM, PS 7 UTF-8), and a BOM makes Python's
+    # json.load raise unless the reader remembered utf-8-sig -- an evidence file a consumer cannot open
+    # is the same class of failure as an unmeasured scan. Best-effort: a write failure must never take
+    # down a dispatch, but it is reported rather than swallowed.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Json)
+    try {
+        [System.IO.File]::WriteAllText($Path, $Json, (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    } catch {
+        Write-Host "  CODER TEST QA: could not write the sidecar $Path ($($_.Exception.Message)); the report block above still carries the verdict." -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Format-VisualCritiqueSummary {
+    # #1198: the operator-facing VISUAL CRITIQUE block for the task report + console. PURE -> unit-tested
+    # without a VLM, a capture, python or a model (verify-critique-loop.ps1). It is a FUNCTION rather than
+    # an inline string in new-agent-task.ps1 for one reason: the line that has to survive here is the
+    # DISCLOSURE, and an inline string cannot be tested, so nothing could prove it survives.
+    #
+    # An UNMEASURED design lint does NOT change the loop's verdict (that decision lives in
+    # Merge-DesignSignals). It changes what this block SAYS: the clean-bill lead is WITHHELD whenever a
+    # lint produced no verdict, because "visual criteria look satisfied" over an unexamined axis is the
+    # exact sentence #1198 exists to stop being printed.
+    #
+    # $Result is an Invoke-CritiquePass result (or $null). ASCII-folded like the coder-QA block: the
+    # report is written with Set-Content, whose encoding follows the HOST (PS 5.1 ANSI / PS 7 UTF-8), so
+    # unfolded prose renders as mojibake on one of them and the operator must not have to decode the one
+    # line telling them their measurement is missing.
+    param($Result, [string[]]$FixNotes = @(), [int]$FixCount = 0)
+    $fixTail = ''
+    if (@($FixNotes).Count -gt 0) { $fixTail = "`n" + ((@($FixNotes)) -join "`n") }
+    if ($null -eq $Result) {
+        return (ConvertTo-FleetAscii -Text "VLM critique ran but returned no result (treated as no-op).$fixTail")
+    }
+    $caveatTail = ''
+    if ("$($Result.CaveatText)") { $caveatTail = "`n" + "$($Result.CaveatText)" }
+    $line = ''
+    if ("$($Result.CaptureTier)" -eq 'structural') {
+        $line = "No pixel capture available (structural floor); visual critique skipped. $($Result.Feedback)$fixTail$caveatTail"
+    } elseif (-not [bool]$Result.Ok) {
+        $line = "VLM critique unavailable / failed (non-blocking): $($Result.Feedback)$fixTail$caveatTail"
+    } elseif ([bool]$Result.NeedsWork) {
+        $line = "VLM still suggests visual improvements after $FixCount auto-fix pass(es) (signal only -- your eyeball is the verdict):`n$($Result.Feedback)$fixTail$caveatTail"
+    } else {
+        # The ONLY branch that reads as a clean bill, so the only one that must refuse to print one when a
+        # deterministic lint produced no verdict at all.
+        $after = ''
+        if ($FixCount) { $after = " after $FixCount auto-fix pass(es)" }
+        # ANY caveat withholds the clean bill, not only a wholly absent lint -- a lint that skipped files
+        # it could not parse examined less than the report would otherwise claim. Both conditions are kept
+        # so a future caller that clears LintsMeasured without a caveat still cannot print the clean lead.
+        if ((-not [bool]$Result.LintsMeasured) -or $caveatTail) {
+            $line = ("VLM critique: the VLM saw no remaining issues$after, but this is a PARTIAL examination -- " +
+                     "a deterministic design check did not examine everything it was pointed at (see below), " +
+                     "so this deliverable has NOT been checked clean. $($Result.Feedback)$fixTail$caveatTail")
+        } else {
+            $line = "VLM critique: visual criteria look satisfied$after. $($Result.Feedback)$fixTail$caveatTail"
+        }
+    }
+    return (ConvertTo-FleetAscii -Text $line)
 }
 
 function Resolve-CriticRange {
