@@ -1815,12 +1815,180 @@ function Add-AssetHint {
     } else {
         $howTo = 'For each, reference the LOCAL file by its relative path (for a desktop app, point an Image/BitmapImage at the packaged asset). Do NOT redraw it and do NOT use any http(s):// URL.'
     }
+    # PROVENANCE-NEUTRAL BY DESIGN (2026-08-06). This block used to tell the coder "BlarAI
+    # already GENERATED the image asset(s) ... ON THIS BOX" -- but the scan above globs the
+    # assets folder, which holds BOTH machine-generated images AND files the OPERATOR
+    # supplied himself (the #1165 M5 intake pipeline, live since 2026-07-29). So an
+    # operator's own photograph was described to the coder as machine output: a false
+    # provenance claim, the #1172 class pointing the other way.
+    #
+    # The coder does not need to know WHO made them, and telling it wrongly is worse than
+    # not telling it at all. What it needs is: they exist, use them, do not redraw, do not
+    # fetch. That is all this says now.
     $note = @"
-BlarAI already GENERATED the image asset(s) this app needs, ON THIS BOX, and committed them into your working tree. USE the local file(s) -- do NOT draw a placeholder <svg> for them, and NEVER reference an external URL:
+The image asset(s) this app needs are ALREADY IN YOUR WORKING TREE and committed. USE the local file(s) -- do NOT draw a placeholder <svg> for them, and NEVER reference an external URL:
 $bullets
 $howTo These files already exist in your tree (open one to confirm). A local relative path is NOT a network request -- it is the offline-correct way to show a real picture.
 "@
-    return "$Prompt`n`n--- GENERATED IMAGE ASSETS (use the local files; do not redraw or fetch) ---`n$note"
+    return "$Prompt`n`n--- IMAGE ASSETS IN YOUR TREE (use the local files; do not redraw or fetch) ---`n$note"
+}
+
+function Format-SmokeResultQualifier {
+    # THE RESULT LINE MUST NOT OUTRANK THE INSTRUMENT. A web delivery whose DECLARED behaviour
+    # contract was exercised and FAILED still signed off as "MERGED into your project - just open
+    # the app and try it." -- the system's own browser check had reported that the declared result
+    # region did not change when the declared primary control was used, three automatic fix passes
+    # had then failed, and the last line of the report told the operator it was fine. Observed live
+    # 2026-08-06 (fleet run 20260806-171303-bd, job create-habit-tracking).
+    #
+    # This adds a QUALIFIER and nothing else: no control flow moves, nothing blocks, nothing parks.
+    # The merge already happened and stays; the sentence describing it stops overstating.
+    #
+    # PURE -> unit-tested without a browser, a capture or a coder (verify-smoke-contract.ps1). It is
+    # a FUNCTION rather than an inline string in new-agent-task.ps1's here-string for the same
+    # reason as Format-VisualCritiqueSummary: an inline string cannot be tested, so nothing could
+    # prove the disclosure survives -- nor that it stays SILENT where it must.
+    #
+    # SILENCE IS THE DEFAULT AND IT IS LOAD-BEARING. Only a DECLARED contract speaks here, and only
+    # in the two states the DELIVERY is answerable for. In particular the HEURISTIC no-delta -- the
+    # capture guessing at "the first visible enabled control" because nothing was declared -- must
+    # stay a soft note forever: a page with no button to press would otherwise carry a permanent
+    # failure notice on a verdict nobody ever asked for. That is the #1140 shape ("a project with no
+    # XAML is not an unexamined layout"), and the OFF cases in the suite exist to hold this line.
+    #
+    # TWO DIFFERENT SENTENCES, BECAUSE THEY ARE TWO DIFFERENT FACTS, and an operator must be able to
+    # tell them apart from the RESULT line alone:
+    #   * EXERCISED AND FAILED ($Measured, not $Passed) -- the control was pressed and the marked
+    #     region did not change. The feature is there and does not work.
+    #   * DECLARED AND NEVER EXERCISABLE ($Status is one of the two *-hook-missing) -- the coder was
+    #     TOLD by Add-SmokeContractHint to place both markers and did not, so the check had nothing
+    #     to press. Nothing was checked, so this branch must not say the check FAILED; it says the
+    #     part is not on the page. That is the delivery's failure to build what it was asked for --
+    #     the same overstatement as the failure case, which is why it qualifies the same line.
+    #
+    # $Status IS REQUIRED TO SPLIT THEM AND THE BOOLEANS CANNOT. A hook-missing capture and a capture
+    # that CRASHED after reading a valid spec ('unavailable') are both Declared + not-Measured; only
+    # the status separates them. The crash is the HARNESS's fault -- behavior.ran is false, no
+    # finding was raised -- and blaming the delivery for it is the exact confusion
+    # Format-SmokeContractCaveat was split apart to stop making. So the unexercised branch is an
+    # ALLOWLIST of the two delivery-fault statuses, never a blocklist of the harness ones: a status
+    # this side does not recognise (the JS half renames a constant, a legacy producer) resolves to
+    # SILENCE here and stays the caveat channel's to disclose, because asserting a cause on evidence
+    # this side cannot parse is how a wrong diagnosis reaches a non-technical reader as a fact.
+    #
+    # $Passed is positive-polarity: $false is "not affirmed", which covers both a real failure and a
+    # capture that never stated the verdict. The failure wording therefore claims only what both
+    # share -- the check did not come back clean -- and never narrates a mechanism it cannot see.
+    # ASCII-folded like the other report blocks (Set-Content follows the HOST encoding, so unfolded
+    # prose is mojibake on one of PS 5.1 / PS 7, and this is the one line that must be readable).
+    param([bool]$Declared = $false, [bool]$Measured = $false, [bool]$Passed = $false,
+          [string]$Status = '')
+    if (-not $Declared) { return '' }
+    if ($Measured) {
+        if ($Passed) { return '' }
+        return (ConvertTo-FleetAscii -Text (
+            " (But the automatic browser check did NOT pass: it used the main control this task was " +
+            "meant to make work and could not confirm the page responded, so the new part may not " +
+            "actually work yet - please try that step first.)"))
+    }
+    if ($Status -eq 'action-hook-missing' -or $Status -eq 'result-hook-missing') {
+        return (ConvertTo-FleetAscii -Text (
+            " (But the automatic browser check could not run: the part this task was meant to add " +
+            "is not on the page at all, so it looks like it was never built - please check whether " +
+            "what you asked for is actually there.)"))
+    }
+    return ''
+}
+
+function Add-SmokeContractHint {
+    # BEHAVIOR-CONTRACT PROMPT: when BlarAI's PLAN declared what the finished page must be able to
+    # DO, tell the coder the two DOM markers a headless browser will look for. Without this the
+    # capture's declared behavior check has nothing to key on and falls back to guessing at "the
+    # first visible button" -- and a guess that fails is only a soft note, never a finding. That is
+    # what every web build did before the plan-side writer existed.
+    #
+    # TELLING IS THE POINT. A check the coder was never informed of grades it against a contract it
+    # had no way to meet, which manufactures false defects and burns fix cycles. This is the "TOLD"
+    # half of capability 3 in BlarAI's docs/design/CODER_DEFINITION_OF_DONE.md; the capture is the
+    # "GRADED" half. The markers are `data-` attributes -- valid HTML, invisible to the user, the
+    # same shape as the `data-testid` convention -- so they cost the delivery nothing.
+    #
+    # DYNAMIC + gated on ACTUAL FILE PRESENCE in the seeded worktree, exactly like Add-AssetHint and
+    # for the same reason: the file is present iff the PLAN declared a contract, which is a fact
+    # about this dispatch, not about the scaffold. No file -> a NO-OP and the prompt is byte-
+    # identical. The selectors are read FROM THE FILE, never written as a literal here, so the
+    # marker the coder is told to place and the marker the capture hunts for cannot drift apart.
+    # Fail-soft: an unreadable or malformed file is a no-op (the capture reports that same fact on
+    # its own side). ALWAYS preserves the original prompt verbatim (appended, never replaces).
+    param([string]$Prompt, [string]$Worktree)
+    if (-not $Worktree -or -not (Test-Path -LiteralPath $Worktree)) { return $Prompt }
+    $specPath = Join-Path $Worktree 'blarai-smoke.json'
+    if (-not (Test-Path -LiteralPath $specPath)) { return $Prompt }
+    try { $spec = Get-Content -LiteralPath $specPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $Prompt }
+    if (-not $spec) { return $Prompt }
+    $click = [string]$spec.click
+    $delta = [string]$spec.expectDelta
+    if (-not $click -or -not $delta) { return $Prompt }
+    $actionLabel = if ($spec.actionLabel) { [string]$spec.actionLabel } else { 'the main control' }
+    $resultLabel = if ($spec.resultLabel) { [string]$spec.resultLabel } else { 'the part of the page that changes' }
+    # The worked example is DERIVED from this contract's own selectors, never written as a literal.
+    # A fixed example would keep naming one marker no matter what the contract said, which is the
+    # same drift hazard the selectors themselves avoid by being read from the file -- and to a small
+    # model a concrete example that contradicts the requirement above it is worse than none.
+    $howTo = "Add the matching attribute or id to each element so those selectors resolve."
+    if ($click -match '^\[([\w-]+)="([^"]+)"\]$') {
+        $howTo = "For $click write the attribute onto the element itself, e.g. <button $($Matches[1])=`"$($Matches[2])`">...</button>. Do the same for $delta on the result element."
+    } elseif ($click -match '^#([\w-]+)$') {
+        $howTo = "For $click give the element that id, e.g. <button id=`"$($Matches[1])`">...</button>. Do the same for $delta on the result element."
+    }
+    $note = @"
+An automated browser will open your finished page, use its main control, and check that the page actually responds. It finds both by a marker you must put in your HTML:
+  - $actionLabel -> must match the selector $click
+  - $resultLabel -> must match the selector $delta
+$howTo Put the markers on the REAL elements -- the control a person actually presses, and the region whose content actually changes when they press it.
+The check then presses that control and requires the marked region to CHANGE. A page where the marked control is missing, is hidden or disabled, or leaves the marked region unchanged is a FAILURE and comes back to you to fix. Do NOT put a marker on a decorative element to satisfy the check, and do NOT fake the change -- make the feature work.
+Markers cost the page nothing: an id or a data- attribute is valid HTML, invisible to the user, and has no effect on styling or layout.
+"@
+    return "$Prompt`n`n--- WHAT THE AUTOMATED BROWSER CHECK WILL DO (mark these two elements) ---`n$note"
+}
+
+function Save-SmokeContractPin {
+    # A CANDIDATE CANNOT EDIT THE EXAM IT IS ABOUT TO SIT. The contract file is seeded into the
+    # baseline so the coder can be TOLD what the capture will exercise -- which puts it in the tree
+    # the coder writes to, for the whole build. A candidate that writes {"click":"body",
+    # "expectDelta":"body"} makes its own critique report `honoured` while the real contract was
+    # never exercised: not a false GREEN at run level (the post-merge design lap re-grades against
+    # pinned bytes) but a false CLEAN at the hop that spends the coder's FIX BUDGET, which defers
+    # the real finding into the smaller design-lap budget.
+    #
+    # BlarAI's swap driver pins the plan's bytes before its two post-merge captures
+    # (`_pin_smoke_contract`). This is the same control at the PER-TASK critique hop, which runs
+    # against the candidate worktree with its own fix cycle and was not covered by that pin.
+    #
+    # Snapshot the RAW BYTES while they are still the plan's -- before the coder has run. Bytes,
+    # not a re-serialisation: acceptance.py's `smoke_spec_file_bytes` is the ONE authority for this
+    # file's content, and a second writer here could only drift from it. $null when there is no
+    # contract (every non-web dispatch), and the restore is then a no-op.
+    param([string]$Worktree)
+    if (-not $Worktree -or -not (Test-Path -LiteralPath $Worktree)) { return $null }
+    $specPath = Join-Path $Worktree 'blarai-smoke.json'
+    if (-not (Test-Path -LiteralPath $specPath)) { return $null }
+    try { return [System.IO.File]::ReadAllBytes($specPath) } catch { return $null }
+}
+
+function Restore-SmokeContractPin {
+    # Write the pinned bytes back immediately before a capture reads them. On an untampered tree
+    # this is a byte-for-byte no-op that leaves no diff; on a tampered one it is a RESTORE. Called
+    # before EVERY critique pass rather than once at loop entry, because the fix cycle hands the
+    # tree back to the coder between passes -- pinning once would cover only the first capture,
+    # which is the same reason the design lap re-pins.
+    #
+    # Structural, not vigilance: nothing has to NOTICE the tampering for the control to hold.
+    # Fail-soft and returns nothing -- a contract write must never derail the critique that calls
+    # it, exactly as on the BlarAI side.
+    param([string]$Worktree, $PinBytes)
+    if ($null -eq $PinBytes -or -not $Worktree -or -not (Test-Path -LiteralPath $Worktree)) { return }
+    try { [System.IO.File]::WriteAllBytes((Join-Path $Worktree 'blarai-smoke.json'), $PinBytes) } catch { }
 }
 
 function Resolve-BuildProfile {
@@ -3212,6 +3380,42 @@ function Invoke-CandidateBuild {
     # produced nothing" -- an infrastructure fault laundered into the capability measurement. The
     # classification (and the reasoning behind the honest-no-op discrimination) lives in the pure
     # Resolve-CommitCapture; this block's only job is to OBSERVE accurately and hand it the facts.
+    # WINDOWS RESERVED DEVICE NAMES DESTROY THE CAPTURE (#1276). MEASURED 2026-08-06, battery
+    # B4 store-cards: the coder left a file literally named `nul` in the worktree (shell
+    # redirect residue), and `git add -A` died on it:
+    #     error: short read while indexing nul
+    #     error: nul: failed to insert into database
+    #     fatal: adding files failed            (git exit 128)
+    # All THREE candidates hit it identically -- 429s + 368s + 430s of real coder work
+    # discarded -- the job PARKED-HONEST[BUILD], and its five dependent tasks skipped. The
+    # coder was not at fault and nothing in the run measured the model.
+    #
+    # These names (CON/PRN/AUX/NUL/COM1-9/LPT1-9, with or without an extension) are DEVICES,
+    # not files. They can never be a legitimate deliverable, git cannot index them, and one
+    # of them is enough to throw away everything the coder produced. Removing them is the
+    # only outcome that preserves the work; leaving them is a guaranteed total loss.
+    #
+    # Deletion needs the \?\ extended-length prefix: ordinary Remove-Item resolves the name
+    # to the DEVICE and fails. Swept LOUDLY -- a silent sweep would hide a real signal about
+    # what the coder is doing.
+    $__reserved = @()
+    try {
+        Get-ChildItem -LiteralPath $wt -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike '*\.git\*' -and
+                           $_.BaseName -match '^(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$' } |
+            ForEach-Object {
+                $__p = $_.FullName
+                # The \\?\ extended-length prefix is REQUIRED: without it the path resolves to
+                # the DEVICE and the delete fails -- the same reason git cannot index it.
+                try { [System.IO.File]::Delete("\\?\" + $__p); $__reserved += $__p }
+                catch { $__reserved += "$__p (UNREMOVABLE: $($_.Exception.Message))" }
+            }
+    } catch { }
+    if ($__reserved.Count -gt 0) {
+        Write-Host ("  reserved-name sweep: removed $($__reserved.Count) Windows device-name " +
+                    "file(s) before staging -- they cannot be indexed and would fail the whole " +
+                    "capture: " + ($__reserved -join ', '))
+    }
     $addOut = (git -C $wt add -A 2>&1 | Out-String); $addRc = $LASTEXITCODE
     # Read the INDEX, not git's English: the staged set is what tells an honest "nothing to commit"
     # apart from a real commit failure, so a commit is only ATTEMPTED when something is staged.

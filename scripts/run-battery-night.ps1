@@ -30,7 +30,32 @@ param(
     # script runs from the pinned worktree, $PSScriptRoot is the MEASURED tree, whose
     # state\ is empty. Defaulting there would silently start a brand-new campaign at pass 0.
     [string]$CampaignConfig,
-    [switch]$Now  # skip the dispatch guard + lean wait-loop (manual daytime invocation)
+    [switch]$Now,  # skip the dispatch guard + lean wait-loop (manual daytime invocation)
+
+    # #1334 — THE OPERATOR'S ESCAPE FROM A WEDGED GUARD.
+    #
+    # The live-dispatch guard identifies a running dispatch by its driving PROCESS, which
+    # is the only witness that spans a whole run. The cost of that choice: a process that
+    # exists but is DEAD pins the guard forever. This is not hypothetical — swap drivers
+    # are spawned DETACHED | NEW_GROUP | CREATE_BREAKAWAY_FROM_JOB precisely so they
+    # survive a tree-kill, which is exactly what an ExecutionTimeLimit does to a night, so
+    # the system is built to produce orphans. One of them makes every night wait to 04:00,
+    # write a plausible-looking skip report and bank nothing, indefinitely.
+    #
+    # WHY A SWITCH AND NOT A HEURISTIC. An age cap or a CPU-idle test would clear the
+    # wedge automatically and would ALSO re-introduce the false negative this whole ticket
+    # exists to remove: a legitimately quiet driver (measured — a supervising swap driver
+    # burns ~0 CPU for hours while its children work) is indistinguishable from a hung one
+    # by any threshold, and guessing wrong destroys somebody's run. A guess that fails
+    # silently is what was here before. An operator saying "I have looked, it is dead" is
+    # evidence a threshold cannot manufacture.
+    #
+    # It is deliberately LOUD, not convenient: it logs a warning, names every process it
+    # is overriding, and rides the night's admission record so the morning report shows
+    # the night ran under an override rather than cleanly. The scheduled task does not
+    # pass it and must never pass it — automation asserting "I have looked" is the lie
+    # this switch exists to keep honest.
+    [switch]$IgnoreLiveDispatch
 )
 
 $ErrorActionPreference = "Stop"
@@ -126,6 +151,23 @@ $DriverStamp = ''
 $NightDir    = "$AgenticRoot\state\battery\night-$Stamp"
 New-Item -ItemType Directory -Force $NightDir | Out-Null
 Start-Transcript -Path "$NightDir\launcher.log" -Force | Out-Null
+
+# #1334: an overridden night must be identifiable as one FOREVER, not just while someone
+# remembers typing the flag. Announced here, immediately after the transcript opens, so it
+# is the first thing in the night's permanent log — and loudly, because a night that ran
+# with a safety check disabled is not comparable to one that did not, and whoever reads
+# this log later must not have to infer that from an absence.
+if ($IgnoreLiveDispatch) {
+    @(
+        "!! =====================================================================",
+        "!! -IgnoreLiveDispatch IS SET. The live-dispatch guard is DISABLED for",
+        "!! this run. If a coding dispatch is actually running, this night will",
+        "!! reclaim its assistant and archive the folder it is building in --",
+        "!! which is the 2026-08-07 incident this guard exists to prevent.",
+        "!! Use this ONLY after checking that the process is a dead leftover.",
+        "!! ====================================================================="
+    ) | ForEach-Object { Write-Warning $_ }
+}
 
 # AO lifecycle ownership (2026-07-20). The night that boots an AO must also stop it:
 # three paths bring one up (this preflight, the runner's per-job AoReensurer, the swap
@@ -322,7 +364,24 @@ $camp = Get-Content $CampaignConfig -Raw | ConvertFrom-Json
 # end_date = no calendar cutoff (a side/manual config just omits it). Scoped to
 # $IsDefaultCampaign like the pass-count check below (2026-07-09 scoping fix) —
 # a side config's cutoff must never touch the shared nightly task.
-if ($camp.end_date) {
+#
+# THE PRESENCE TEST IS LOAD-BEARING, NOT DEFENSIVE (#1045). Without it the line above
+# states a contract this check cannot honour. This script dot-sources ao-ownership-lib.ps1,
+# which sets `Set-StrictMode -Version Latest`; dot-sourcing runs in the CALLER's scope, so
+# StrictMode is live for the rest of this file, and under it a key the config does not have
+# THROWS ("The property 'end_date' cannot be found on this object") instead of returning
+# null. Measured across pwsh 7.6.4 and powershell 5.1, StrictMode on and off: the edition is
+# irrelevant, StrictMode decides all of it.
+#
+# The default campaign always carries end_date, so the nightly never took this branch and no
+# automated path could see the defect -- it was reachable ONLY from the documented
+# side-config route, which is the daytime targeted-run mechanism. #1045 was closed
+# 2026-07-22 by a commit fixing a DIFFERENT StrictMode instance in this same file (the
+# postlude, 84891b2) while the reported one survived behind the runbook's "2099-12-31"
+# workaround. Regression-locked by verify-side-config-optional-keys.ps1, which also pins
+# this idiom so a future edit cannot quietly revert it. The idiom itself is the one this
+# script already uses correctly for pass_banking_frozen and baseline_jobs.
+if (($camp.PSObject.Properties.Name -contains 'end_date') -and $camp.end_date) {
     $endDate = [datetime]::ParseExact($camp.end_date, "yyyy-MM-dd", $null)
     if ((Get-Date).Date -gt $endDate) {
         Write-Log "Campaign end date ($($camp.end_date)) has passed ($($camp.completed_passes)/$($camp.target_full_passes) passes banked) — unregistering the scheduled task per the hard calendar cutoff."
@@ -588,21 +647,238 @@ $DriverStamp = if (-not $driverSha.Ok) {
 }
 Write-Log "driver stamp: $DriverStamp"
 
+# LIVE-DISPATCH DETECTION (#1334, 2026-08-08). An INTERVAL question needs INTERVAL
+# evidence, and every file-based marker in this system answers a SHORTER question than
+# the one being asked.
+#
+# WHAT DEFEATED THE TWO PRIOR GUARDS
+# ==================================
+# Guard A watched :8000 ("no dispatch in flight"). That is the OVMS port, and the swap
+# driver restores the 14B between jobs, so :8000 is NECESSARILY down between waves.
+# Port-watching cannot be repaired; it samples an instant.
+# Guard B (b7af0a0) counted TASK-START vs TASK-END in fleet-run journals. Between two
+# waves those balance, correctly, while a run still owns its sandbox.
+#
+# AND THE OBVIOUS THIRD TRY IS ALSO WRONG. Journals also carry RUN-START/RUN-END, so
+# "just go run-level" looks like the fix. It is not: those markers are emitted PER WAVE.
+# Measured on the run destroyed 2026-08-07 23:01:15 (20260807-195617-bd): RUN-START=6,
+# RUN-END=6 -- balanced. A run-level journal predicate would have admitted the collision
+# for exactly the same reason the task-level one did. The journal has no marker for the
+# outer interval at ANY level, so no reading of it can answer this.
+#
+# THE SOUND WITNESS IS THE DRIVING PROCESS
+# ========================================
+# A dispatch is live iff the process driving it exists. A process is an interval by
+# construction: it spans the whole run INCLUDING the between-wave gaps that defeat every
+# file marker. Measured against the live operator dispatch 2026-08-08 11:03:
+#   pwsh    -File ...\scripts\run-fleet.ps1 -Queue ...   <- outer driver, whole dispatch
+#   pythonw -m shared.fleet.swap_ops --spec ...          <- swap driver
+#   python  -m tools.dispatch_harness.acp_coder ...      <- the coder leg
+# This also covers OPERATOR-initiated dispatches, which claim no AO by design (:691) and
+# were therefore invisible to every prior check -- the exact hole that let the 23:00
+# nightly reclaim a live run's AO.
+#
+# IDENTITY comes from state/fleet-swap/spec.json (run_id/session_id), and ONLY identity.
+# Never liveness: current.json still named a run that ended the previous night while a
+# different run was live, so a file-keyed guard would name the wrong run confidently.
+#
+# FAIL-CLOSED: if the process table cannot be read, that is not evidence of absence --
+# report LIVE and let the caller stand down.
+#
+# LOCKED BY scripts/verify-battery-live-dispatch-guard.ps1 -- S2/S4 the detector shapes,
+# S3 the self-match trap, S5 the library lock with its toggle, S7 the wiring and the
+# stand-down's four halves, S9 the elevation blind spot. Run it after touching ANY of the
+# three call sites. Two modes: default REFUSES while a dispatch is live (the idle-box cases
+# cannot be evaluated then), -LiveProof proves the detector against a real in-flight run.
+#
+# ORDERING REQUIREMENT, not an accident: `-m tools.dispatch_harness.` matches this script's
+# OWN children -- the admission probe and the runner. The night avoids refusing itself only
+# because the probe is synchronous and the archive loop runs BEFORE the runner launches.
+# S7 asserts that order; do not reorder them without reading it.
+function Get-LiveDispatch {
+    # Returns $null when nothing is driving a dispatch, else a descriptor naming who.
+    # Never throws.
+    #
+    # THE OVERRIDE IS HONOURED HERE, at the single point every caller goes through, rather
+    # than at the four call sites — a lock that must be remembered in four places is a lock
+    # that gets forgotten in one. See the -IgnoreLiveDispatch parameter for why this is a
+    # switch and not a heuristic.
+    #
+    # Read via Get-Variable, not bare: this function is extracted by AST and run in an
+    # isolated scope by verify-battery-live-dispatch-guard.ps1, where the parameter does
+    # not exist and StrictMode would make a bare read a terminating error. Absent = not
+    # overridden, which is the safe default.
+    $overrideGuard = $false
+    try { $overrideGuard = [bool](Get-Variable -Name IgnoreLiveDispatch -Scope Script -ValueOnly -ErrorAction Stop) } catch { }
+
+    $all = @()
+    try {
+        $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    } catch {
+        if ($overrideGuard) {
+            Write-Warning "OVERRIDE: -IgnoreLiveDispatch is set and the process table could not be read ($($_.Exception.Message)). Proceeding on the operator's assertion that no dispatch is live."
+            return $null
+        }
+        return [pscustomobject]@{
+            Why     = 'process-table-unreadable'
+            Detail  = "could not enumerate processes ($($_.Exception.Message)); refusing rather than assuming the box is idle"
+            Pids    = @()
+            RunId   = ''
+        }
+    }
+
+    $procs = @($all | Where-Object {
+        # THE IMAGE AND THE FORM TOGETHER, never the form alone. Matching only the
+        # argument text is not "invocation-form matching" — `-m shared.fleet.swap_ops`
+        # appears verbatim inside any shell whose -Command MENTIONS it, so a diagnostic
+        # one-liner, a grep, or this file's own verifier pinned the guard as though a
+        # dispatch were live. That is the permanent-wedge route: the battery would wait
+        # to 04:00 and stand down every night because somebody once ran a search.
+        #
+        # Caught by S3 the first time the suite was run in DEFAULT mode on an idle box —
+        # the check existed from the start and had never once been evaluated, because a
+        # dispatch was live every time it ran. An unrun check is not a passing check.
+        #
+        # Binding each pattern to the executable that can actually host it makes the match
+        # a real form: a .ps1 is run by a shell, a `-m <module>` by an interpreter.
+        $_.ProcessId -ne $PID -and $_.CommandLine -and (
+            ($_.Name -match '^(pwsh|powershell)\.exe$' -and
+             $_.CommandLine -match '-File\s+\S*run-fleet\.ps1') -or
+            ($_.Name -match '^(python|pythonw)\.exe$' -and (
+                $_.CommandLine -match '-m\s+shared\.fleet\.swap_ops' -or
+                $_.CommandLine -match '-m\s+tools\.dispatch_harness\.'))
+        )
+    })
+    if ($overrideGuard) {
+        # Enumerated FIRST, then overridden, so the log NAMES what is being walked past.
+        # An override that says only "proceeding" is worth much less to whoever reads this
+        # transcript afterwards than one that says which pids the operator declared dead.
+        if ($procs.Count -gt 0) {
+            $names = ($procs | ForEach-Object { "$($_.Name):$($_.ProcessId) (started $($_.CreationDate))" }) -join '; '
+            Write-Warning ("OVERRIDE: -IgnoreLiveDispatch is set. $($procs.Count) driving process(es) " +
+                           "are being IGNORED on the operator's assertion that they are dead: $names")
+        } else {
+            Write-Warning "OVERRIDE: -IgnoreLiveDispatch is set, but no driving process was found anyway - the switch changed nothing."
+        }
+        return $null
+    }
+    if ($procs.Count -gt 0) {
+        # fall through to the descriptor below
+    } else {
+        # NOTHING MATCHED - but "I saw nothing" is only evidence of absence if I could SEE.
+        #
+        # A non-elevated process cannot read an ELEVATED process's CommandLine: WMI returns
+        # it as null. The matcher above requires a non-null CommandLine, so on a
+        # non-elevated run every elevated driver is silently skipped and this function
+        # would confidently report an idle box while a dispatch is mid-build. That is
+        # fail-OPEN in the one direction that destroys somebody's work, and it is reachable
+        # because the elevation check at the top of this script WARNS AND PROCEEDS by
+        # design (#756: an already-up AO can carry a non-elevated run).
+        #
+        # So a negative answer is only returned when the blind spot is empty. Measured on a
+        # healthy elevated box: 21 of 253 processes carry a null CommandLine and NONE of
+        # them is a driver-capable image - those are System/Registry/Memory-Compression,
+        # which have no command line at all rather than a hidden one. A driver-capable
+        # image with an unreadable command line is therefore anomalous, and the honest
+        # answer is "I cannot tell", which fails closed.
+        $blind = @($all | Where-Object {
+            -not $_.CommandLine -and $_.Name -match '^(python|pythonw|pwsh|powershell|node|opencode)\.exe$'
+        })
+        if ($blind.Count -gt 0) {
+            # Elevation computed HERE rather than read from the script-scope $IsElevated:
+            # this function is extracted by AST and run in an isolated scope by
+            # verify-battery-live-dispatch-guard.ps1, where that variable does not exist and
+            # StrictMode would make reading it a terminating error. A guard that throws
+            # inside its own verifier is not a guard.
+            $elev = try {
+                [Security.Principal.WindowsPrincipal]::new(
+                    [Security.Principal.WindowsIdentity]::GetCurrent()
+                ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            } catch { 'unknown' }
+            $names = ($blind | ForEach-Object { "$($_.Name):$($_.ProcessId)" }) -join ', '
+            return [pscustomobject]@{
+                Why    = 'command-lines-unreadable'
+                Detail = ("$($blind.Count) driver-capable process(es) have an unreadable command line " +
+                          "($names) - this shell cannot see whether they are dispatch drivers " +
+                          "(elevated=$elev). Refusing rather than reporting an idle box.")
+                Pids   = @($blind | ForEach-Object { $_.ProcessId })
+                RunId  = ''
+            }
+        }
+        return $null
+    }
+
+    # Identity is best-effort and NEVER gates the refusal: an unnamed live dispatch is
+    # still a live dispatch.
+    $runId = ''
+    try {
+        $specPath = Join-Path $AgenticRoot 'state\fleet-swap\spec.json'
+        if (Test-Path $specPath) {
+            $spec = Get-Content $specPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($spec.PSObject.Properties.Name -contains 'run_id') { $runId = [string]$spec.run_id }
+        }
+    } catch { $runId = '' }
+    $first = $procs | Sort-Object CreationDate | Select-Object -First 1
+    return [pscustomobject]@{
+        Why    = 'driving-process-alive'
+        Detail = ("pid $($first.ProcessId) ($($first.Name)) started $($first.CreationDate), " +
+                  "$($procs.Count) driving process(es) total")
+        Pids   = @($procs | ForEach-Object { $_.ProcessId })
+        RunId  = $runId
+    }
+}
+
 # ---- 2. dispatch guard --------------------------------------------------------
 # Presence checks (LASTINPUTINFO idle + BlarAI app window) removed 2026-07-09 by
 # LA direction: the battery launches at 23:00 regardless of operator presence.
-# Only a dispatch already holding :8000 defers the launch (collision, not presence).
+# A dispatch already in flight defers the launch (collision, not presence).
+$script:DispatchBusyReason = $null
 function Test-DispatchBusy {
+    # PRIMARY: the driving process, an INTERVAL. See the LIVE-DISPATCH DETECTION note
+    # above for why the :8000 check below cannot answer this alone -- it is what logged
+    # "guard clear - no dispatch in flight" at 2026-08-07 23:00:07 while a dispatch that
+    # had been building for three hours was in flight, and the night then reclaimed that
+    # run's AO and archived its sandbox (#1334).
+    $live = Get-LiveDispatch
+    if ($live) {
+        $script:DispatchBusyReason = $live
+        $named = if ($live.RunId) { " (run $($live.RunId))" } else { '' }
+        Write-Log ("guard: a dispatch is LIVE$named - $($live.Detail). Waiting. This night will " +
+                   "not reclaim the assistant or archive any sandbox while it runs.")
+        return $true
+    }
+    # SECONDARY, kept as an INDEPENDENT lock rather than replaced: :8000 held with no
+    # driving process still means something is using the coder model server. It is the
+    # weaker signal (necessarily down between waves), so it is never the only one.
     $coderBusy = Test-NetConnection -ComputerName 127.0.0.1 -Port 8000 -InformationLevel Quiet -WarningAction SilentlyContinue
-    if ($coderBusy) { Write-Log "guard: :8000 busy (a dispatch is running) — waiting."; return $true }
+    if ($coderBusy) {
+        $script:DispatchBusyReason = [pscustomobject]@{
+            Why = 'coder-port-held'; Detail = ':8000 is held but no driving process was found'
+            Pids = @(); RunId = ''
+        }
+        Write-Log "guard: :8000 busy (the coder model server is in use) - waiting."
+        return $true
+    }
+    $script:DispatchBusyReason = $null
     return $false
 }
 if (-not $Now) {
     $cutoff = (Get-Date).Date.AddDays(1).AddHours(4)   # stop retrying at 04:00
     while (Test-DispatchBusy) {
         if ((Get-Date) -gt $cutoff) {
-            Write-Log "Guard never cleared by 04:00 — skipping tonight (not counted as a pass)."
-            Write-SkipReport "A coding dispatch held the coder port (:8000) continuously from 23:00 to 04:00, so the battery never had the box to itself. It waited on 30-minute retries and then stood down rather than clobber a run in flight."
+            # SAY WHICH LOCK HELD. "the coder port" was the only reason this could ever
+            # give, so a stand-down caused by a live operator dispatch would have been
+            # reported as a port collision -- right stand-down, wrong cause, and the
+            # operator reads this text.
+            $why = if ($script:DispatchBusyReason) {
+                switch ($script:DispatchBusyReason.Why) {
+                    'driving-process-alive'      { "A coding dispatch was still running ($($script:DispatchBusyReason.Detail))" }
+                    'process-table-unreadable'   { "The battery could not check whether anything else was running ($($script:DispatchBusyReason.Detail))" }
+                    default                      { "The coder model server was in use ($($script:DispatchBusyReason.Detail))" }
+                }
+            } else { "Something held the box" }
+            Write-Log "Guard never cleared by 04:00 - skipping tonight (not counted as a pass)."
+            Write-SkipReport "$why continuously from 23:00 to 04:00, so the battery never had the box to itself. It waited on 30-minute retries and then stood down rather than clobber a run in flight."
             $script:AdmissionPath = 'dispatch-busy'
             Write-AdmissionRecord 'skipped-dispatch-busy'
             Stop-Transcript | Out-Null; exit 0
@@ -610,12 +886,23 @@ if (-not $Now) {
         Write-Log "guard: retrying in 30 min."
         Start-Sleep -Seconds 1800
     }
-    Write-Log "guard clear — no dispatch in flight."
+    # CLAIM ONLY WHAT WAS CHECKED (#1324's lesson, applied here): name both locks, so a
+    # future reader knows this line rests on a process scan AND a port probe, not on one
+    # port probe wearing the words "no dispatch in flight".
+    Write-Log "guard clear - no driving dispatch process, and :8000 is free."
 }
 
 # ---- job set for the night --------------------------------------------------
 $jobs = @($camp.jobs)
-$excluded = @($camp.excluded | ForEach-Object { "$($_.id) ($($_.reason))" })
+# `excluded` is OPTIONAL and was the second live instance of #1045's defect, found by the
+# sweep that ticket asked for: a side config with nothing to exclude has no reason to carry
+# the key, and the bare access throws under the StrictMode that ao-ownership-lib.ps1
+# leaks into this scope when it is dot-sourced.
+# `jobs`, `completed_passes` and `target_full_passes` are deliberately left bare -- they are
+# REQUIRED, a campaign without them is meaningless, and a missing one should fail loud here
+# rather than be silently defaulted into a night that runs the wrong job set.
+$excludedRaw = if ($camp.PSObject.Properties.Name -contains 'excluded') { $camp.excluded } else { @() }
+$excluded = @($excludedRaw | ForEach-Object { "$($_.id) ($($_.reason))" })
 if ($excluded) { Write-Log ("excluded (config, NOT silent): " + ($excluded -join "; ")) }
 if ((Get-Date).Hour -ge 1 -and (Get-Date).Hour -lt 12 -and $jobs -contains "B6") {
     Write-Log "late start ($(Get-Date -Format HH:mm)) — trimming the B6 stretch job tonight (logged, not silent)."
@@ -638,7 +925,8 @@ if (Test-Path $cancel) { Remove-Item $cancel -Force; Write-Log "cleared stale ca
 # AOs missed everything nothing ever claimed - a hand-run probe restore, an operator
 # session, a night that died before claiming - and the resurrected gate turns that miss
 # into a LOST night, because an unowned resident AO fails the fast path (Projected =
-# Available + 8.0 ~= 14 GiB < 20.5) AND the probe floor (raw Available ~= 6 GiB < 15.0).
+# Available + 8.0 ~= 14 GiB, short of $LEAN_GATE_GIB) AND the probe floor (raw Available
+# ~= 6 GiB < 15.0).
 # See ao-ownership-lib.ps1's Invoke-AoPreflightReclaim for why this is safe.
 # Scoped to the scheduled night: under -Now a human is at the keyboard and owns the
 # box (the standing -Now posture - verify-battery-probe-admission.ps1 S5).
@@ -647,8 +935,14 @@ if (-not $Now) {
         # The launcher observes the slot; the library decides whether to stop. Keeping the
         # detection here means ao-ownership-lib.ps1 never grows a second process detector.
         $aoHeld = [bool](Test-NetConnection -ComputerName 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue)
+        # RE-CHECKED here, not reused from the dispatch guard above: that loop can wait on
+        # 30-minute retries until 04:00, so its answer may be hours old by now, and a
+        # dispatch can start in the gap. A stale liveness reading is the defect this
+        # ticket exists to remove, not a shortcut to take while removing it.
+        $liveNow = Get-LiveDispatch
         $reclaim = Invoke-AoPreflightReclaim -SentinelPath $AoOwnerSentinel -CurrentNight $Stamp `
-            -AoPresent $aoHeld -BlarAiRepo $BlarRuntimeRoot -StopAssistantPath $StopAssistantPath -Log ${function:Write-Log}
+            -AoPresent $aoHeld -LiveDispatch $liveNow -BlarAiRepo $BlarRuntimeRoot `
+            -StopAssistantPath $StopAssistantPath -Log ${function:Write-Log}
         if ($reclaim) {
             $script:ReclaimReason = [string]$reclaim.Reason
             if ($reclaim.Reclaimed) { $script:StaleClaimReclaimed = [string]$reclaim.ClaimedNight }
@@ -756,17 +1050,18 @@ try {
 }
 
 # LEAN + PROBE ADMISSION (#784, reworked 2026-07-10; supersedes the #740 c.1504 arithmetic-
-# only gate). The 30B swap needs ~20 GiB of system RAM free AFTER the 14B unloads (swap_driver
-# gate_gb=20.0, #777 measured 2026-07-09; the 14B returns ~8.7 GiB, projected conservatively at
-# 8.0 here). Two-stage admission:
+# only gate). The 30B swap needs the BlarAI swap gate's worth of system RAM free AFTER the 14B
+# unloads (swap_driver gate_gb, resolved from [fleet_dispatch].swap_min_free_gb — 19.0 by LA
+# directive #1313 since 2026-08-07, and UNMEASURED at that value; the 14B returns ~8.7 GiB,
+# projected conservatively at 8.0 here). Two-stage admission:
 #
-#   FAST PATH (unchanged) — PROJECT post-unload headroom; if it clears $LEAN_GATE_GIB (20.5 =
-#     gate 20.0 + margin) proceed immediately. Short -> lean the known-safe restartable apps
+#   FAST PATH (unchanged) — PROJECT post-unload headroom; if it clears $LEAN_GATE_GIB (the swap
+#     gate + 0.5 margin) proceed immediately. Short -> lean the known-safe restartable apps
 #     (firefox, OneDrive — the LA's standing process authority, codified in settings 2026-07-09;
 #     firefox restores its session, OneDrive re-syncs) and re-project.
 #
 #   PROBE (new, #784) — the arithmetic gate has a DEAD BAND: #777 proved a CLEAN load from
-#     19.85 GiB, yet the projection gate (20.5) would wait all night on it (nights 2026-07-08
+#     19.85 GiB, yet the projection gate (20.5 at the time) would wait all night on it (nights 2026-07-08
 #     attempt 1+2 burned SIX stalls at 20.7/20.6 GiB and ~2.5 h of darkness on exactly this
 #     gap). Predicting a threshold never ends the 20-vs-18-vs-17.5 argument; MEASURING does. So
 #     when the projection is still short after leaning but Available >= $PROBE_FLOOR_GIB (15.0,
@@ -782,7 +1077,9 @@ function Get-ProjectedSwapHeadroomGiB {
     if ($AoUp) { return @{ Avail = $availGiB; Projected = $availGiB + 8.0 } }
     return @{ Avail = $availGiB; Projected = $availGiB }
 }
-$LEAN_GATE_GIB   = 20.5   # fast-path projection gate: swap gate 20.0 (#777, 2026-07-09) + 0.5 margin
+$LEAN_GATE_GIB   = 19.5   # fast-path projection gate: the BlarAI swap gate + 0.5 margin. The gate is
+                          # 19.0 by LA directive (#1313, 2026-08-07) and is NOT measured — read
+                          # [fleet_dispatch].swap_min_free_gb's comment before trusting this number.
 $PROBE_FLOOR_GIB = 15.0   # #784: below this Available, too starved to even probe (sanity, not prediction)
 # Apps the night MAY force-stop to make room. Every entry must restart clean with no
 # operator data at risk: browsers restore their session, OneDrive re-syncs, chat/media
@@ -903,7 +1200,19 @@ function Ensure-AoHeadless {
             }
             Start-Sleep -Seconds 3
         }
-        if (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue) { Write-Log "AO up." }
+        # SAY ONLY WHAT WAS MEASURED (#1324). This is a TCP accept on :5001 and nothing more
+        # -- NOT evidence the model loaded or that the AO can answer anything. Measured
+        # 2026-08-07: on B9 run 1 this logged "AO up." 31 seconds after boot while the GPU
+        # had already failed to initialise ("no opencl gpu device is available"), the model
+        # never loaded, and every request that followed timed out. The line was true about
+        # the socket and false about the assistant, and the failure was then charged to
+        # HARNESS-BUDGET -- right bucket, wrong cause, because the log had asserted a
+        # readiness nobody had checked. A real serve-probe (issue a request the model must
+        # answer) is the actual fix and remains open on #1324; until it exists this line must
+        # not claim more than a port check can support. A 14B does not load in 31 seconds.
+        if (Test-NetConnection 127.0.0.1 -Port 5001 -InformationLevel Quiet -WarningAction SilentlyContinue) {
+            Write-Log "AO port :5001 accepting (TCP check only - NOT proof the model loaded or can serve; #1324)."
+        }
     } else {
         Write-Log "AO already up on :5001 — the runner's per-job AoReensurer verifies its mTLS health before each job and re-boots on cert-drift."
         # The ELSE branch used to record NOTHING. Attribute the AO instead of leaving the
@@ -1017,10 +1326,133 @@ foreach ($j in $jobs) {
     $repoName = (Get-Content $card.FullName -Raw | ConvertFrom-Json).repo
     if (-not $repoName.StartsWith("battery-")) { throw "card $j repo '$repoName' violates the battery- prefix rule" }
     $repoPath = Join-Path $ProjectsDir $repoName
+
+    # ADMISSION: refuse to archive a sandbox a PRIOR DISPATCH STILL OWNS.
+    # 2026-08-07, B9 runs 1 and 3: run 1's runner exited at 17:45 but its swap driver is
+    # DETACHED ("Swap driver spawned; the launcher is exiting now") and kept building in
+    # this repo until 18:39:53. Run 3 archived the directory out from under it at 18:13:47.
+    # Both died: run 3 on the locked `public\` folder, and run 1's candidates on
+    # `fatal: not a git repository: (NULL)` once their worktree's .git pointer was emptied.
+    # MEMORY IS THE WRONG INSTRUMENT for this -- run 3's preflight read a clean 26.2 GiB
+    # while that dispatch was live, because a swap driver mid-build is not a memory hog.
+    # Ownership is on disk: a fleet run with RUN-START and no RUN-END still owns its repo.
+    # LOCK 1 (#1334): the driving process. Checked FIRST and independently of the journal
+    # scan below, because the journal scan cannot answer this:
+    #   * TASK-START/TASK-END balance between waves (the 2026-08-07 23:01:15 collision);
+    #   * RUN-START/RUN-END balance too -- they are emitted PER WAVE, so the run destroyed
+    #     that night reads 6/6, and "just go run-level" would have admitted it identically;
+    #   * a run whose journal.log does not exist yet is skipped entirely by the `continue`
+    #     below -- measured 11 minutes wide on a real operator dispatch (dispatched
+    #     10:45:36, journal first written 10:56:47), covering planning, asset generation
+    #     and oracle seeding.
+    # A process spans all of that by construction.
+    $liveDispatch = Get-LiveDispatch
+    if ($liveDispatch) {
+        $named = if ($liveDispatch.RunId) { " (run $($liveDispatch.RunId))" } else { '' }
+        # A CLEAN STAND-DOWN, NOT A BARE `throw`. This loop is TOP-LEVEL - no enclosing
+        # try - so an uncaught throw here exits the script and jumps over three things the
+        # file already learned it needs:
+        #   * Write-SkipReport, so state\battery\MORNING-REPORT.md keeps LAST night's
+        #     result and the operator's morning read silently shows a stale success (the
+        #     consequence this file names at :496 and every other stand-down avoids);
+        #   * Write-AdmissionRecord, so the night leaves no provenance;
+        #   * the LEG A teardown below, so a scheduled night that already claimed and
+        #     booted an AO leaves the 14B resident - the measured #1045 harm.
+        # LOCK 2's throw below has the same shape and predates this change, but it is
+        # REPO-scoped and rare; LOCK 1 is box-wide, which would have made a rare path the
+        # routine one. Fixed here for LOCK 1; LOCK 2 is left alone deliberately so this
+        # commit changes one thing, and it is ticketed.
+        Write-Log ("archive guard: REFUSING - a dispatch is LIVE${named}: $($liveDispatch.Detail). " +
+                   "Archiving $repoName would pull the directory out from under a running build.")
+        # THE ESCAPE IS IN THE REPORT, not in someone's memory. If the process is actually a
+        # dead orphan (they exist by design — swap drivers break away from the job object so
+        # they survive a tree-kill), this stand-down repeats every night and banks nothing.
+        # The one place a person is guaranteed to be looking when that happens is this
+        # report, so the way out is printed here, with the pids to check first.
+        $pidList = (@($liveDispatch.Pids) -join ', ')
+        Write-SkipReport ("A coding dispatch was still running, so the battery stood down rather than " +
+                          "archive the folder it was building in$named. Nothing was changed, moved or " +
+                          "deleted. Details: $($liveDispatch.Detail). The next scheduled night runs " +
+                          "normally once that dispatch has finished.`n`n" +
+                          "IF THIS KEEPS HAPPENING, the process may be a leftover that never exited. " +
+                          "Check whether process id(s) $pidList are really doing anything (Task Manager, " +
+                          "or ask for a look). If they are dead, either stop them, or run the battery " +
+                          "once telling it to ignore them:`n" +
+                          "    Start-ScheduledTask -TaskPath '\BlarAI\' -TaskName 'BlarAI-M2-Battery-Nightly'   # normal`n" +
+                          "    ...or, to override the check for ONE run, the battery must be started by hand with -IgnoreLiveDispatch.`n" +
+                          "Only override after checking: the check exists because a night once destroyed a " +
+                          "running build by assuming the box was idle.")
+        $script:AdmissionPath = 'live-dispatch'
+        Write-AdmissionRecord 'skipped-live-dispatch'
+        if ($AoOwnedByThisNight) {
+            # The probe/preflight may already have booted an AO under this night's claim.
+            # Releasing it here is the whole point of not throwing.
+            try {
+                $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRuntimeRoot `
+                    -StopAssistantPath $StopAssistantPath -Context "stood down for a live dispatch ($Stamp)" -Log ${function:Write-Log}
+            } catch {
+                Write-Log "ao-ownership: stand-down teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
+            }
+        }
+        Stop-Transcript | Out-Null; exit 0
+    }
+
+    # LOCK 2: the journal scan. KEPT rather than replaced -- it answers a question the
+    # process check does not, namely which REPO a run owns, and it still catches the
+    # original b7af0a0 case where a DETACHED swap driver outlives the runner that spawned
+    # it. Weaker on its own (see above); independent of lock 1, which is the point.
+    $liveOwner = $null
+    $fleetRuns = Join-Path $AgenticRoot 'state\fleet-runs'
+    if (Test-Path $fleetRuns) {
+        foreach ($rd in (Get-ChildItem $fleetRuns -Directory -ErrorAction SilentlyContinue |
+                         Sort-Object Name -Descending | Select-Object -First 12)) {
+            $jl = Join-Path $rd.FullName 'journal.log'
+            if (-not (Test-Path $jl)) { continue }
+            $txt = Get-Content $jl -Raw -ErrorAction SilentlyContinue
+            if (-not $txt) { continue }
+            # Names THIS repo, has started a task, and has not finished it.
+            if ($txt -match [regex]::Escape($repoPath)) {
+                $starts = ([regex]::Matches($txt, 'TASK-START')).Count
+                $ends   = ([regex]::Matches($txt, 'TASK-END')).Count
+                if ($starts -gt $ends) { $liveOwner = $rd.Name; break }
+            }
+        }
+    }
+    if ($liveOwner) {
+        throw ("REFUSING to archive $repoName — fleet run $liveOwner still owns it " +
+               "($repoPath): its journal has more TASK-START than TASK-END, so a prior " +
+               "dispatch is still building there. Archiving now would corrupt both runs. " +
+               "Let it finish, or reap it, then re-run.")
+    }
+
     if (Test-Path $repoPath) {
         New-Item -ItemType Directory -Force $repoArchive | Out-Null
-        Move-Item $repoPath (Join-Path $repoArchive $repoName)
-        Write-Log "archived previous $repoName."
+        # ATOMIC-OR-ABORT. An unguarded Move-Item that throws partway leaves the repo SPLIT
+        # across two locations with an EMPTIED .git -- measured 2026-08-07: .git and
+        # README.md moved, `public\` and `tests\` did not, and the remains were corrupt.
+        # A half-moved sandbox is worse than an unarchived one, so put back what moved.
+        $dest = Join-Path $repoArchive $repoName
+        try {
+            Move-Item $repoPath $dest -ErrorAction Stop
+            Write-Log "archived previous $repoName."
+        } catch {
+            $partial = (Test-Path $dest) -and (Test-Path $repoPath)
+            if ($partial) {
+                try {
+                    Get-ChildItem $dest -Force -ErrorAction Stop |
+                        Move-Item -Destination $repoPath -Force -ErrorAction Stop
+                    Remove-Item $dest -Force -Recurse -ErrorAction SilentlyContinue
+                    Write-Log "archive of $repoName FAILED and was rolled back intact."
+                } catch {
+                    Write-Log ("archive of $repoName failed AND the rollback failed — the " +
+                               "sandbox is split between $repoPath and $dest and must be " +
+                               "repaired by hand before this card runs again.")
+                }
+            }
+            throw ("could not archive $repoName ($($_.Exception.Message)). Something still " +
+                   "holds a file under $repoPath — a live dispatch, an open handle, or a " +
+                   "scanner. The sandbox was left as found rather than half-moved.")
+        }
     }
     # A PARKED run leaves its worktree at state/worktrees/<repo>-<task> (the fleet-owned #714
     # hidden base). Those are NOT under $repoPath, so the archive above does not move them; and
@@ -1165,12 +1597,30 @@ foreach ($sc in $scorecards) {
             }
         }
     }
-    switch ($d.evidence.mode) {
+    # MEMBERSHIP BEFORE READ (:1165's own rule, and the pattern `attribution` already uses
+    # below). Under StrictMode Latest a bare $d.evidence.mode on a scorecard that carries no
+    # `mode` is a TERMINATING error, so it escaped to the catch and rendered the whole card as
+    # "evidence for this job is LOST" -- while the scorecard sat there complete, naming its own
+    # cause. The `default` arm was written for exactly this case (:1133 "absent = mode-unknown")
+    # and was UNREACHABLE by the only path that produces it. Measured 2026-08-07 on B9's first
+    # ever run: a STALLED/HARNESS card with verdict, attribution, failure_class and a notes
+    # field reading "approve did not fire EXECUTE: No response from the Assistant Orchestrator"
+    # was reported to the operator as lost. The true cause was in the file the report said was
+    # unreadable.
+    $modeVal = $null
+    if ($d.PSObject.Properties.Name -contains 'evidence' -and $null -ne $d.evidence -and
+        $d.evidence.PSObject.Properties.Name -contains 'mode') {
+        $modeVal = $d.evidence.mode
+    }
+    switch ($modeVal) {
         "plan-graph" { $planEligible++ }
         "flat"       { $flatQueue++ }
         default      { $modeUnknown++ }
     }
-    $ga = $d.evidence.guest_agreement
+    $ga = if ($d.PSObject.Properties.Name -contains 'evidence' -and $null -ne $d.evidence -and
+              $d.evidence.PSObject.Properties.Name -contains 'guest_agreement') {
+        $d.evidence.guest_agreement
+    } else { $null }
     $gaNote = if ($ga) { "; guest: $ga" } else { "" }
     # attribution is "" on every job until #740's window lands. Rendering the LABEL with
     # nothing after it taught the reader to skip a field that will one day carry meaning,
@@ -1275,9 +1725,52 @@ if ($bankingFrozen) {
     $lines += ""; $lines += "campaign: NOT counted as a full pass (missing scorecards or nonzero exit)."
 }
 $camp | ConvertTo-Json -Depth 6 | Set-Content $CampaignConfig
+
+# ---- #1327: the operator's validation exercise --------------------------------------
+# Capabilities ship LIVE and are validated after, so the report owes him a runnable check
+# rather than an approval request. Rendered by BlarAI (which owns what is live and what the
+# capability's observable is); this launcher only appends what it is handed.
+#
+# FAIL-SOFT, and the asymmetry is deliberate. A failure here must never cost the night's
+# results -- those are measurements and this is an addendum. But it must never fail SILENTLY
+# either, because a missing section and a broken renderer are different facts and the whole
+# feature rests on him being able to tell them apart. So: exit 2 (malformed exercise) and any
+# other fault both append a loud line naming the cause, and the report is still written.
+try {
+    # Script from the MEASURED tree (so the exercise matches the code this night ran) but
+    # interpreter from the RUNTIME installation -- the measured tree is a worktree and its
+    # .venv is gitignored, exactly the split the AO-boot reachability line already reports.
+    $renderer = Join-Path $BlarMeasuredRoot "scripts\render_morning_validation.py"
+    if (-not (Test-Path $renderer)) {
+        $renderer = Join-Path $BlarRuntimeRoot "scripts\render_morning_validation.py"
+    }
+    if (Test-Path $renderer) {
+        $py = Join-Path $BlarRuntimeRoot ".venv\Scripts\python.exe"
+        if (-not (Test-Path $py)) { $py = "python" }
+        $prevEnc = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8   # em-dashes survive the pipe
+        $val = & $py $renderer 2>&1
+        $rc = $LASTEXITCODE
+        [Console]::OutputEncoding = $prevEnc
+        if ($rc -eq 0 -and $val) {
+            $lines += ""; $lines += ($val -join "`n")
+        } elseif ($rc -ne 0) {
+            $lines += ""
+            $lines += "* !! the validation exercise could not be produced (renderer exit $rc): $($val -join ' ')"
+            $lines += "  This is a fault in the checking machinery, not a quiet morning. Nothing was validated."
+        }
+    } else {
+        $lines += ""; $lines += "* !! validation renderer not found at $renderer — no exercise was produced."
+    }
+} catch {
+    $lines += ""
+    $lines += "* !! the validation exercise could not be produced: $($_.Exception.Message)"
+    $lines += "  This is a fault in the checking machinery, not a quiet morning. Nothing was validated."
+}
+
 $report = $lines -join "`n"
-Set-Content "$NightDir\MORNING-REPORT.md" $report
-Set-Content "$AgenticRoot\state\battery\MORNING-REPORT.md" $report
+Set-Content "$NightDir\MORNING-REPORT.md" $report -Encoding UTF8
+Set-Content "$AgenticRoot\state\battery\MORNING-REPORT.md" $report -Encoding UTF8
 Write-Log "morning report written."
 
 if ($camp.completed_passes -ge $camp.target_full_passes) {
@@ -1305,11 +1798,32 @@ if ($camp.completed_passes -ge $camp.target_full_passes) {
 # stays a completed night. A failed stop deliberately KEEPS the sentinel, so the next
 # night's Leg B retries the reclaim.
 if ($AoOwnedByThisNight) {
-    try {
-        $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRuntimeRoot `
-            -StopAssistantPath $StopAssistantPath -Context "end-of-night (night $Stamp)" -Log ${function:Write-Log}
-    } catch {
-        Write-Log "ao-ownership: end-of-night teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
+    # #1334: RE-CHECK LIVENESS HERE TOO. The guard at the top of the night and the preflight
+    # reclaim both protect the START of the night; this teardown fires HOURS later and used
+    # to stop whatever holds :5001 unconditionally. A dispatch that began at 01:00 - after
+    # the guard cleared - would lose its assistant at end-of-night: the 2026-08-07
+    # destruction, moved later in the same night. The guard's own log line asserted the
+    # night "will not reclaim the assistant while it runs", which was true of the preflight
+    # and false of this. An assertion the code does not honour is the defect this whole
+    # ticket is about, so it is honoured here rather than reworded.
+    #
+    # Leaving the AO up is the RIGHT outcome when a dispatch is live - it needs it - and it
+    # is self-healing: the claim is kept, and the next night's Leg B reclaim collects it
+    # once the box is genuinely idle. The #1045 leak this teardown exists to prevent is
+    # bounded by that, not reopened.
+    $liveAtTeardown = Get-LiveDispatch
+    if ($liveAtTeardown) {
+        $tdNamed = if ($liveAtTeardown.RunId) { " (run $($liveAtTeardown.RunId))" } else { '' }
+        Write-Log ("ao-ownership: end-of-night teardown SKIPPED - a dispatch is LIVE$tdNamed " +
+                   "($($liveAtTeardown.Detail)). Leaving the assistant up; the claim is kept and " +
+                   "the next night's preflight reclaim collects it once the box is idle.")
+    } else {
+        try {
+            $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRuntimeRoot `
+                -StopAssistantPath $StopAssistantPath -Context "end-of-night (night $Stamp)" -Log ${function:Write-Log}
+        } catch {
+            Write-Log "ao-ownership: end-of-night teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
+        }
     }
 } else {
     Write-Log "ao-ownership: this run claimed no AO (manual -Now run) - leaving the assistant running."

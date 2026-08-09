@@ -134,7 +134,21 @@ while ($true) {
             }
         }
     }
-    elseif ($c -match '^[Tt]$') { & "$S\run-fleet.ps1" }
+    elseif ($c -match '^[Tt]$') {
+        # SPAWNED AS A CHILD, not `& "$S\run-fleet.ps1"` (#1334). The call operator runs the
+        # script IN-PROCESS, so no process anywhere carries `-File …run-fleet.ps1` — the only
+        # pwsh you can see is this panel. The battery's live-dispatch guard identifies a
+        # running dispatch by its driving process, so a run started from [T] was INVISIBLE:
+        # between waves the swap driver and the coder leg are both down by design, the 23:00
+        # nightly would read an idle box, reclaim the assistant and archive the sandbox out
+        # from under it. That is the 2026-08-07 destruction, reached through this menu item.
+        # -NoNewWindow -Wait keeps the operator's experience identical (same console, same
+        # blocking), and matches how BlarAI's own dispatch.py:439 already invokes it.
+        $rf = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+        $p = Start-Process $rf -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"$S\run-fleet.ps1" `
+                -NoNewWindow -Wait -PassThru
+        $global:LASTEXITCODE = $p.ExitCode   # `&` set this; preserve it for anything downstream
+    }
     elseif ($c -match '^[Hh]$') {
         # Regenerate + open the #840 live-proof grading & integration health dashboard (blarai repo).
         $blarPy = 'C:\Users\mrbla\blarai\.venv\Scripts\python.exe'

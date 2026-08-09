@@ -183,6 +183,91 @@ function Format-DesignLintCaveat {
     return "$line. $axis of this deliverable is UNEXAMINED - an ABSENT measurement, not a clean one."
 }
 
+function Format-SmokeContractCaveat {
+    <#
+    .SYNOPSIS
+      PURE: the operator-facing line for the BEHAVIOR CONTRACT -- what the headless capture was told
+      to exercise, and whether it managed to.
+
+      Same job as Format-DesignLintCaveat, aimed at a different collapse. The capture's behavior
+      smoke is either DECLARED (the plan named the control to use and the region that must change,
+      and the coder was told to mark both) or HEURISTIC (nobody said, so the capture guessed at the
+      first visible button and its failures are only a soft note). Those read identically in a green
+      report, and for every web build before the plan-side writer existed only the second was ever
+      possible -- silently. This states which one happened.
+
+      Returns '' -- silence -- for the fully honest case (a contract was declared AND exercised) and
+      for a surface where the question does not arise. A WEB run with no contract is NOT silence:
+      "nothing was declared" is a real limitation on what the report can claim, and hiding it is how
+      the heuristic passed for a check.
+
+      APPLICABILITY IS LOAD-BEARING. This caveat feeds Get-DesignCritiqueNote, which withholds the
+      clean bill whenever ANY caveat is present -- so a caveat that fires where it cannot apply is
+      not a harmless extra line, it downgrades a correct verdict. A WinUI/desktop capture, the
+      structural floor and the pixel-only fallback have no browser behavior smoke BY CONSTRUCTION;
+      reporting their contract as "unexamined" would be the same mistake as calling a project with
+      no XAML an unexamined layout (the #1140 shape). Only the web capture tier is applicable, and
+      the caller knows which tier fired.
+    #>
+    param(
+        [bool]$Declared = $false,
+        [bool]$Measured = $false,
+        [string]$Status = '',
+        # Default $true keeps the function's standing inert contract intact: a caller supplying
+        # nothing still gets '' via the Status/Declared check below, and an explicit $false is the
+        # positive statement "this surface has no browser behavior smoke".
+        [bool]$Applicable = $true
+    )
+    if (-not $Applicable) { return '' }
+    # Inert default: a caller that supplies nothing at all (every pre-contract caller) gets ''.
+    if (-not $Declared -and -not $Status) { return '' }
+    if ($Declared -and $Measured) { return '' }
+    if (-not $Declared) {
+        if ($Status -eq 'unavailable') {
+            return ("BEHAVIOR CONTRACT: the browser capture did not report on it, so it is UNKNOWN " +
+                    "whether the product's main action was exercised - an ABSENT measurement, not a clean one.")
+        }
+        if ($Status -and $Status -ne 'not-declared') {
+            return ("BEHAVIOR CONTRACT: a contract WAS present but could not be used ($Status), so the " +
+                    "declared check DID NOT RUN and the capture guessed instead. Whether the product's " +
+                    "main action works is UNEXAMINED - an ABSENT measurement, not a clean one.")
+        }
+        return ("BEHAVIOR CONTRACT: none was declared for this product, so the capture GUESSED at the " +
+                "main action (first visible control) and any failure was only a note, never a finding. " +
+                "Whether the intended action works is UNEXAMINED - an ABSENT measurement, not a clean one.")
+    }
+    # DECLARED but not measured. Splitting by status is load-bearing: these states have DIFFERENT
+    # culprits and only one of them has a finding upstream, and a single sentence covering all of
+    # them has to assert both facts about states where neither holds.
+    if ($Status -eq 'action-hook-missing' -or $Status -eq 'result-hook-missing') {
+        # The delivery's fault: the contract named hooks the coder was told to place and did not.
+        # `behaviorHard` is true here, so the capture ALREADY raised it as a hard finding and this
+        # line only records the reach -- pointing at feedback that is genuinely there.
+        return ("BEHAVIOR CONTRACT: declared, but the capture could not exercise it ($Status) - the " +
+                "delivery is missing the markers the coder was told to place, so the declared behavior " +
+                "is UNEXAMINED. The finding itself is in the fix feedback above.")
+    }
+    if ($Status -eq 'unavailable') {
+        # The CAPTURE's fault, not the delivery's: `unavailable` is what capture-web-cdp.mjs emits
+        # when the evaluate block THREW after reading a valid spec. `behavior.ran` is false there,
+        # so `behaviorHard` is false, NO finding was raised and NO note was pushed. Blaming the
+        # delivery for missing markers and pointing at a finding above are both untrue -- and the
+        # second is worse than a wrong diagnosis, because it sends a reader looking for text that
+        # does not exist and reads its absence as "nothing serious".
+        return ("BEHAVIOR CONTRACT: declared, but the browser capture itself failed before it could " +
+                "exercise it ($Status) - a CAPTURE failure, not a defect in the delivery. No finding " +
+                "was raised, and whether the product's main action works is UNEXAMINED - an ABSENT " +
+                "measurement, not a clean one.")
+    }
+    # Any other status, including one this side does not recognise (the JS half renamed a constant,
+    # a legacy producer). The DISCLOSURE still holds -- a contract existed and was not exercised --
+    # so it is made; the CAUSE is not known here, so none is asserted and no upstream finding is
+    # promised. Same distinction swap_ops.smoke_contract_disposition draws: refusing to make a claim
+    # on evidence this side cannot parse is right, refusing to make a disclosure is not.
+    return ("BEHAVIOR CONTRACT: declared, but the capture did not exercise it ($Status), so whether " +
+            "the product's main action works is UNEXAMINED - an ABSENT measurement, not a clean one.")
+}
+
 function _FailResult([string]$Feedback, [string]$CaptureTier = '', $Layout = $null, $Pixel = $null) {
     # #1198: the design-lint fields are present on EVERY exit, so a consumer can never read their absence
     # as a measurement. Whichever lint has already reported by the time a pass fails is threaded in as its
@@ -262,6 +347,19 @@ function Merge-DesignSignals {
         [bool]$PixelMeasured = $true,
         [string]$PixelDetail = '',
         [string]$PixelStatus = '',
+        # The behavior-CONTRACT honesty channel. Same discipline as the lint caveats above: it
+        # changes what the report SAYS, never what the loop DECIDES. Defaults are INERT (declared
+        # =$false + status='' emits no caveat) so every pre-contract caller is byte-identical.
+        [bool]$SmokeDeclared = $false,
+        [bool]$SmokeMeasured = $false,
+        [string]$SmokeStatus = '',
+        # Whether the declared contract PASSED, not merely whether it ran. Default $false is the
+        # inert one: a caller that supplies nothing affirms nothing, on any surface.
+        [bool]$SmokePassed = $false,
+        # Whether this capture surface HAS a browser behavior smoke at all (the web tier does; a
+        # WinUI capture, the structural floor and the pixel-only fallback do not). $true is the
+        # inert default; the caveat is suppressed outright when $false.
+        [bool]$SmokeApplicable = $true,
         [Parameter(Mandatory)][int]$Iteration,
         [Parameter(Mandatory)][int]$MaxIter
     )
@@ -304,6 +402,7 @@ function Merge-DesignSignals {
     $caveats = @(
         (Format-DesignLintCaveat -Lint 'layout' -Measured $LayoutMeasured -Detail $LayoutDetail -Status $LayoutStatus -Unparsed $LayoutUnparsed)
         (Format-DesignLintCaveat -Lint 'pixel' -Measured $PixelMeasured -Detail $PixelDetail -Status $PixelStatus)
+        (Format-SmokeContractCaveat -Declared $SmokeDeclared -Measured $SmokeMeasured -Status $SmokeStatus -Applicable $SmokeApplicable)
     ) | Where-Object { $_ }
 
     # LayoutHard in the return means "any deterministic hard finding" so the Python _design_note
@@ -322,6 +421,17 @@ function Merge-DesignSignals {
         # LintsMeasured names exactly what it covers -- the two deterministic LINTS. The browser-runtime
         # channel reports its own availability through Read-ConsoleSidecar's Captured flag.
         LintsMeasured  = ([bool]$LayoutMeasured -and [bool]$PixelMeasured)
+        # The behavior contract reports separately from LintsMeasured, which names exactly the two
+        # deterministic LINTS. Folding a third thing into that bool would make a true reading mean
+        # three different things and an absence unattributable to any of them.
+        SmokeDeclared  = [bool]$SmokeDeclared
+        SmokeMeasured  = [bool]$SmokeMeasured
+        SmokeStatus    = [string]$SmokeStatus
+        # The pass/fail reading rides the SAME reporting channel and is equally inert here: it
+        # changes what the RESULT line SAYS, never what this function DECIDES. A failed declared
+        # contract already forced its fix laps through ``hard``; by the time anyone reads this the
+        # laps are spent, and re-deciding on it would spend them twice.
+        SmokePassed    = [bool]$SmokePassed
         Caveats        = @($caveats)
         CaveatText     = (@($caveats) -join "`n")
     }
@@ -476,16 +586,59 @@ function Read-ConsoleSidecar {
       degrades to today's pixel-only behavior. Only a captured:true sidecar contributes a signal, and
       its ``hard`` verdict (a console/exception error, an undefined/NaN text leak, or a DECLARED-
       behavior failure -- computed authoritatively by the Node helper) forces another FIX iteration.
-      Returns @{ Captured=[bool]; Hard=[bool]; Messages=[string[]] }.
+      The BEHAVIOR-CONTRACT honesty fields ride alongside. The capture's positive behavior smoke has
+      two quite different clean readings -- "the plan declared what to exercise and it worked" and
+      "nothing was declared, so a heuristic guessed" -- and until the plan-side writer existed only
+      the second could ever occur, invisibly. SmokeDeclared/SmokeMeasured/SmokeStatus keep them
+      apart. They are REPORTING only: the loop's decision still comes from ``hard``, exactly as
+      before, because "no contract was declared" is not something the coder can fix.
+
+      SmokePassed answers the question the other three cannot: those three say whether the declared
+      check RAN; only this one says whether it PASSED. A contract that ran and FAILED (the operator
+      pressed nothing, the marked region never changed) left every one of the three reading exactly
+      as it does for a contract that ran and succeeded -- which is how a run whose declared
+      behaviour failed, and whose three fix passes then failed too, could still sign off as a clean
+      delivery. Positive polarity on purpose: $false means "not affirmed", which is the safe
+      reading on every surface that has no browser behaviour smoke at all.
+      Returns @{ Captured=[bool]; Hard=[bool]; Messages=[string[]]; Notes=[string[]];
+      SmokeDeclared=[bool]; SmokeMeasured=[bool]; SmokeStatus=[string]; SmokePassed=[bool] }.
     #>
     param([Parameter(Mandatory)][string]$SidecarPath)
-    $empty = @{ Captured = $false; Hard = $false; Messages = @() }
+    # A capture that produced no sidecar tells us nothing about the contract either -- 'unavailable'
+    # is the honest reading, never 'not-declared' (which would assert the plan declared nothing).
+    $empty = @{ Captured = $false; Hard = $false; Messages = @(); Notes = @()
+                SmokeDeclared = $false; SmokeMeasured = $false; SmokeStatus = 'unavailable'
+                SmokePassed = $false }
     if (-not (Test-Path $SidecarPath)) { return $empty }
     try { $obj = Get-Content $SidecarPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $empty }
     if (-not $obj -or -not $obj.captured) { return $empty }
     $msgs = @()
     if ($obj.findings) { $msgs = @($obj.findings | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
-    return @{ Captured = $true; Hard = [bool]$obj.hard; Messages = $msgs }
+    $notes = @()
+    if ($obj.notes) { $notes = @($obj.notes | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
+    # A legacy helper writes no `smoke` block. Absent -> declared=$false, measured=$false,
+    # status='unavailable': it can neither claim the contract ran nor claim none existed.
+    $declared = $false; $measured = $false; $status = 'unavailable'; $passed = $false
+    if ($null -ne $obj.smoke) {
+        $declared = [bool]$obj.smoke.declared
+        $measured = [bool]$obj.smoke.measured
+        if ($obj.smoke.status) { $status = [string]$obj.smoke.status }
+        # ``behaviorHard``, NOT ``hard``. The aggregate is ALSO raised by a console error, an
+        # uncaught exception or an undefined/NaN text leak, so reading it here would report a page
+        # that merely threw as a failed contract -- and would leave a failed contract on an
+        # otherwise quiet page indistinguishable from either. ``behaviorHard`` is the capture's one
+        # field that means exactly "a DECLARED must-work feature did not work".
+        #
+        # A PASS IS AFFIRMED, NEVER INFERRED. Both halves are required: the contract must have been
+        # exercised (measured), and the capture must have STATED the verdict. A producer that
+        # writes a `smoke` block but no ``behaviorHard`` leaves the verdict unread, and unread
+        # resolves to $false -- not passed -- because the only consumer of this field composes a
+        # clean bill from it.
+        if ($measured -and $null -ne $obj.behaviorHard) { $passed = -not [bool]$obj.behaviorHard }
+    }
+    return @{ Captured = $true; Hard = [bool]$obj.hard; Messages = $msgs; Notes = $notes
+              SmokeDeclared = $declared; SmokeMeasured = $measured; SmokeStatus = $status
+              SmokePassed = $passed }
 }
 
 # ---------------------------------------------------------------------------
@@ -776,6 +929,9 @@ function Invoke-CritiquePass {
         -PixelHard $pixelResult.Hard -PixelMessages $pixelResult.Messages `
         -PixelMeasured $pixelResult.Measured -PixelDetail $pixelResult.Detail -PixelStatus $pixelResult.Status `
         -RuntimeHard $runtimeResult.Hard -RuntimeMessages $runtimeResult.Messages `
+        -SmokeDeclared $runtimeResult.SmokeDeclared -SmokeMeasured $runtimeResult.SmokeMeasured `
+        -SmokeStatus $runtimeResult.SmokeStatus -SmokePassed $runtimeResult.SmokePassed `
+        -SmokeApplicable ([bool]($captureTier -eq 'web')) `
         -VlmOk $ok -VlmNeedsWork $needsWork -VlmShouldIterate $shouldIterate -VlmFeedback $feedback `
         -Iteration $Iteration -MaxIter $MaxIter
     return @{
@@ -792,6 +948,10 @@ function Invoke-CritiquePass {
         PixelMeasured   = $merged.PixelMeasured
         PixelStatus     = "$($pixelResult.Status)"
         LintsMeasured   = $merged.LintsMeasured
+        SmokeDeclared   = $merged.SmokeDeclared
+        SmokeMeasured   = $merged.SmokeMeasured
+        SmokeStatus     = $merged.SmokeStatus
+        SmokePassed     = $merged.SmokePassed
         Caveats         = $merged.Caveats
         CaveatText      = $merged.CaveatText
         ScreenshotPath  = $pngPath
@@ -835,6 +995,16 @@ function Invoke-CritiqueLoop {
       Signature: { param([string]$Feedback, [string]$AppDir) return [string]$NewAppDir }
       May return $null/$empty to keep the current AppDir unchanged.
 
+    .PARAMETER SmokePinBytes
+      The PLAN's blarai-smoke.json bytes (from Save-SmokeContractPin, taken before the coder ran).
+      Re-materialised into the app dir before EVERY pass, so a candidate cannot edit the exam it is
+      about to sit -- this loop runs against the CANDIDATE worktree, which the coder has had write
+      access to for the whole build, and its fix cycle hands that tree back between passes. Without
+      it a candidate that rewrites the contract to something trivially satisfiable gets a clean
+      per-task critique, spending its fix budget on nothing and deferring the real finding to the
+      smaller post-merge design lap. $null -> no-op (every caller that supplies nothing, and every
+      dispatch with no declared contract, is byte-identical).
+
     .OUTPUTS
       Hashtable:
         FinalResult    [hashtable]  The last Invoke-CritiquePass result.
@@ -849,7 +1019,12 @@ function Invoke-CritiqueLoop {
         [string]$WorkDir = '',
         [scriptblock]$RebuildCallback = $null,
         # #1171: threaded onward to every Invoke-CritiquePass this loop drives.
-        [string]$DeclaredSurface = ''
+        [string]$DeclaredSurface = '',
+        # The PLAN's blarai-smoke.json bytes, snapshotted by Save-SmokeContractPin before the coder
+        # ran. See the .PARAMETER block: re-materialised before EVERY pass, so a candidate cannot
+        # edit the exam it is about to sit. $null (the default) is a no-op, so every caller that
+        # supplies nothing -- and every dispatch with no contract -- is byte-identical.
+        $SmokePinBytes = $null
     )
 
     $currentAppDir = $AppDir
@@ -857,6 +1032,9 @@ function Invoke-CritiqueLoop {
     $lastResult = $null
 
     while ($iteration -lt $MaxIter) {
+        # BEFORE the capture reads it, never after: the coder has had write access to this tree for
+        # the whole build, and the fix cycle below hands it back between passes.
+        Restore-SmokeContractPin -Worktree $currentAppDir -PinBytes $SmokePinBytes
         $result = Invoke-CritiquePass `
             -AppDir $currentAppDir `
             -Goal $Goal `

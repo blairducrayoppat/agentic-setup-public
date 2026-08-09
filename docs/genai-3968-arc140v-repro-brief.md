@@ -52,8 +52,9 @@ Intel repo is an outward-facing action gated on Blair's explicit approval (and u
 - **GPU memory override is REQUIRED** for anything \~18 GB+: Intel Graphics Software → System →
   Shared GPU Memory Override → \~87% **+ reboot** raises the iGPU window from \~18 GB to \~27 GB. Without it, large models
   spill to the slow path and collapse to \~3.5 t/s. Confirm it is enabled before measuring (see `bench/`).
-- **Lean profile** needed for a 35B: BlarAI VM stopped, browser closed, ≥21 GB free before load (`start-llm.ps1`
-  checks this). **Never operate inside `C:\Users\mrbla\BlarAI`.** Respect the OpenCode deny-edit configs.
+- **Lean profile** needed for a 35B: BlarAI VM stopped, browser closed, and enough free RAM to clear the
+  per-model floor `start-llm.ps1` enforces (`$needGB`; ≥19 GB for the 30B as of 2026-08-07 — read the
+  script, not this line). **Never operate inside `C:\Users\mrbla\BlarAI`.** Respect the OpenCode deny-edit configs.
 - **Gotcha:** Bitdefender Advanced Threat Defense blocks pwsh command lines that pattern-match recon
   (Bypass + web request + process listing in one line). If a scripted step dies with `EPERM`, check BD notifications;
   split the command or route through cmd/curl. **No broad AV exclusions.**

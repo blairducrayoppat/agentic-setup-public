@@ -1,7 +1,7 @@
 {
   "driver": "acp",
   "containment": "off",
-  "research_docs": false,
+  "research_docs": true,
   "acp": {
     "python": "C:/Users/mrbla/agentic-setup/.venv314-acp/Scripts/python.exe",
     "blarai_root": "C:/Users/mrbla/blarai",

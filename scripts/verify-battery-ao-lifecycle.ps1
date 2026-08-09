@@ -117,7 +117,17 @@ $reclaimCalls = Get-Calls $ast 'Invoke-AoPreflightReclaim'
 $stopCalls    = Get-Calls $ast 'Stop-OwnedAo'
 $claimCalls   = Get-Calls $ast 'Set-AoOwner'
 Check "A1 LEG B: Invoke-AoPreflightReclaim called exactly once (got $($reclaimCalls.Count))" ($reclaimCalls.Count -eq 1)
-Check "A1 LEG A: Stop-OwnedAo called twice - end-of-night + the skip path (got $($stopCalls.Count))" ($stopCalls.Count -eq 2)
+# #1334 added a THIRD teardown: the live-dispatch stand-down in the archive guard, which
+# must release an AO this night already claimed rather than throw past the end-of-night
+# teardown. The count moves 2 -> 3.
+#
+# THE COUNT IS A PROXY AND THIS IS ITS THIRD FALSE ALARM. The property is "every path that
+# exits after claiming an AO tears it down"; asserting an arity means every legitimate new
+# stand-down reports a defect. A7 below is red for the same reason (#1332), and A9 moved
+# for the same reason in the same change — three count-not-property assertions in one file,
+# tripped by one correct edit. #1332 owns the AST-walk fix; this is the evidence that it is
+# a class rather than a one-off, recorded rather than absorbed.
+Check "A1 LEG A: Stop-OwnedAo called 3x - end-of-night + skip path + live-dispatch stand-down (got $($stopCalls.Count))" ($stopCalls.Count -eq 3)
 Check "A1 the claim (Set-AoOwner) is made exactly once (got $($claimCalls.Count))" ($claimCalls.Count -eq 1)
 
 Section 'A2  every ownership entry point is scoped to the scheduled night (-not $Now)'
@@ -174,8 +184,18 @@ if ($reclaimCalls.Count -eq 1) {
 }
 
 Section 'A5  the teardown is ownership-guarded and runs after the morning report'
-# The END-OF-NIGHT teardown is the last one in the file; the other is the skip path.
-if ($stopCalls.Count -eq 2) {
+# The END-OF-NIGHT teardown is the last one in the file; the others are stand-down paths.
+#
+# `-ge 1`, NOT `-eq 2`. This guard USED to be an equality, and #1334 added a third teardown
+# (the live-dispatch stand-down) — which did not fail this section, it SILENTLY SKIPPED it,
+# taking both checks below with it and still reporting green. A count used as an assertion
+# is a false alarm; a count used as a GATE is silent coverage loss, which is strictly worse
+# and is what happened here. Caught only by diffing the total check count against main.
+# Selecting the LAST call by offset is what actually identifies the end-of-night teardown,
+# and that holds for any number of stand-down paths.
+$a5Ran = $false
+if ($stopCalls.Count -ge 1) {
+    $a5Ran = $true
     $stop = (@($stopCalls) | Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1)
     $guarded = $false
     $p = $stop.Parent
@@ -193,6 +213,9 @@ if ($stopCalls.Count -eq 2) {
     Check "A5 the teardown runs AFTER the morning report is written" `
         (($reportIdx -ge 0) -and ($stop.Extent.StartOffset -gt $reportIdx))
 }
+# THE THIRD ANSWER (lesson 330): "did not run" must not be indistinguishable from "passed".
+# A5's checks live behind a conditional, so the section asserts its own execution.
+Check "A5 the section actually RAN (a skipped section must never read as a pass)" $a5Ran
 
 Section 'A6  Write-Log cannot pollute a return value (the dead-gate lock)'
 $writeLogFn = @($ast.FindAll({ param($n) $n -is $FuncAst -and $n.Name -eq 'Write-Log' }, $true))
@@ -244,7 +267,9 @@ Check "A8 the post-probe call site is context-tagged (an already-up AO is attrib
 
 Section 'A9  admission.json is written on every exit'
 $recCalls = Get-Calls $ast 'Write-AdmissionRecord'
-Check "A9 Write-AdmissionRecord called 3x - admitted + both skip paths (got $($recCalls.Count))" ($recCalls.Count -eq 3)
+# #1334: a fourth exit — the live-dispatch stand-down — and it must leave provenance like
+# every other. Count 3 -> 4. Same count-not-property proxy as A1/A7 above; see A1's note.
+Check "A9 Write-AdmissionRecord called 4x - admitted + both skip paths + live-dispatch stand-down (got $($recCalls.Count))" ($recCalls.Count -eq 4)
 $outcomes = @(@($recCalls) | ForEach-Object { $_.Extent.Text })
 Check "A9 one call records the ADMITTED outcome" ([bool](@($outcomes) -match "'admitted'"))
 Check "A9 one call records the memory skip" ([bool](@($outcomes) -match "'skipped-memory'"))
@@ -253,12 +278,19 @@ Check "A9 one call records the dispatch-busy skip" ([bool](@($outcomes) -match "
 # is written BEFORE the runner launches, not after it returns.
 $runnerCall = @($ast.FindAll({ param($n) $n -is $CommandAst -and
                     $n.Extent.Text -match 'tools\.dispatch_harness\.battery' }, $true))
-if ($runnerCall.Count -ge 1 -and $recCalls.Count -eq 3) {
-    $admittedCall = @(@($recCalls) | Where-Object { $_.Extent.Text -match "'admitted'" })[0]
+# `$recCalls.Count -ge 1`, NOT `-eq 3`. Same defect as A5 above: #1334 added a fourth
+# admission record and this check SILENTLY STOPPED RUNNING rather than failing. What
+# identifies the admitted record is its own outcome string, which the Where-Object below
+# already selects on — the total count was never the thing that mattered.
+$a9Ran = $false
+$admittedCall = @(@($recCalls) | Where-Object { $_.Extent.Text -match "'admitted'" })[0]
+if ($runnerCall.Count -ge 1 -and $admittedCall) {
+    $a9Ran = $true
     $firstRunner = (@($runnerCall) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
     Check "A9 the admitted record is written BEFORE the runner launches (survives a mid-run tree-kill)" `
         ($admittedCall.Extent.StartOffset -lt $firstRunner.Extent.StartOffset)
 }
+Check "A9 the ordering check actually RAN (a skipped check must never read as a pass)" $a9Ran
 
 Section 'A7  a skipped night is never silent'
 $skipCalls = Get-Calls $ast 'Write-SkipReport'
@@ -545,7 +577,7 @@ try {
     Set-LockPid $root8 $dec8.Id
     $sent8 = Join-Path $work 'sentinel8.json'   # deliberately never created - nothing owns this AO
     $r8 = Invoke-AoPreflightReclaim -SentinelPath $sent8 -CurrentNight '20260720-230000' `
-            -AoPresent $true -BlarAiRepo $root8 -StopAssistantPath $stopAsst -Log { param($m) }
+            -AoPresent $true -LiveDispatch $null -BlarAiRepo $root8 -StopAssistantPath $stopAsst -Log { param($m) }
     Check "B8 the reclaim fired on an AO with NO sentinel (got reason '$($r8.Reason)')" ([bool]$r8.Reclaimed)
     Check "B8 the reason names it unowned, not stale-claim" ($r8.Reason -eq 'unowned-ao')
     Check "B8 the UNOWNED decoy is DEAD - the gap is closed" (Wait-Dead $dec8.Id 10)
@@ -560,7 +592,7 @@ try {
     Set-LockPid $root4 $dec4.Id
     $sent4 = Join-Path $work 'sentinel4.json'
     $r4 = Invoke-AoPreflightReclaim -SentinelPath $sent4 -CurrentNight '20260720-230000' `
-            -AoPresent $false -BlarAiRepo $root4 -StopAssistantPath $stopAsst -Log { param($m) }
+            -AoPresent $false -LiveDispatch $null -BlarAiRepo $root4 -StopAssistantPath $stopAsst -Log { param($m) }
     Check "B4 [kill-test] the reclaim reports no-ao" ($r4.Reason -eq 'no-ao')
     Check "B4 [kill-test] the decoy is still ALIVE - the reclaim fires on the OBSERVED slot, not blindly" (Test-Alive $dec4.Id)
 
@@ -575,7 +607,7 @@ try {
     $sent5 = Join-Path $work 'sentinel5.json'
     $null = Set-AoOwner -SentinelPath $sent5 -Night '20260720-230000' -OwnerPid $PID
     $r5 = Invoke-AoPreflightReclaim -SentinelPath $sent5 -CurrentNight '20260720-230000' `
-            -AoPresent $true -BlarAiRepo $root5 -StopAssistantPath $stopAsst -Log { param($m) }
+            -AoPresent $true -LiveDispatch $null -BlarAiRepo $root5 -StopAssistantPath $stopAsst -Log { param($m) }
     Check "B5 the reclaim reports current-night" ($r5.Reason -eq 'current-night')
     Check "B5 the run-in-progress decoy is still ALIVE even though the slot is held" (Test-Alive $dec5.Id)
     Check "B5 the current night's claim is retained" (Test-Path $sent5)
@@ -589,7 +621,7 @@ try {
     $sent6 = Join-Path $work 'sentinel6.json'
     $null = Set-AoOwner -SentinelPath $sent6 -Night '20260719-230001' -OwnerPid $PID
     $r6 = Invoke-AoPreflightReclaim -SentinelPath $sent6 -CurrentNight '20260720-230000' `
-            -AoPresent $true -BlarAiRepo $root6 -StopAssistantPath $stopAsst -Log { param($m) }
+            -AoPresent $true -LiveDispatch $null -BlarAiRepo $root6 -StopAssistantPath $stopAsst -Log { param($m) }
     Check "B6 the reclaim fired (Reclaimed)" ([bool]$r6.Reclaimed)
     Check "B6 the reason names it a stale claim, not unowned" ($r6.Reason -eq 'stale-claim')
     Check "B6 it named the stale night" ($r6.ClaimedNight -eq '20260719-230001')
@@ -602,7 +634,7 @@ try {
     $sent9 = Join-Path $work 'sentinel9.json'
     $null = Set-AoOwner -SentinelPath $sent9 -Night '20260718-230002' -OwnerPid $PID
     $r9 = Invoke-AoPreflightReclaim -SentinelPath $sent9 -CurrentNight '20260720-230000' `
-            -AoPresent $false -BlarAiRepo $root9 -StopAssistantPath $stopAsst -Log { param($m) }
+            -AoPresent $false -LiveDispatch $null -BlarAiRepo $root9 -StopAssistantPath $stopAsst -Log { param($m) }
     Check "B9 the reclaim reports claim-without-ao" ($r9.Reason -eq 'claim-without-ao')
     Check "B9 the orphaned sentinel was tidied (no perpetual retry)" (-not (Test-Path $sent9))
 }

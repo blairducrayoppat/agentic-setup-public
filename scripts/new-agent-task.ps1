@@ -155,7 +155,41 @@ foreach ($__stale in @(git -C $Repo worktree list --porcelain 2>$null | Where-Ob
     if ((Split-Path $__stale -Leaf) -like "$repoName-$Task-c*") { git -C $Repo worktree remove $__stale --force 2>&1 | Out-Null }
 }
 git -C $Repo worktree prune 2>&1 | Out-Null
-git -C $Repo branch -D $branch 2>&1 | Out-Null
+# PRESERVE THE PARKED BRANCH INSTEAD OF DESTROYING IT (#1277).
+#
+# This line was `git -C $Repo branch -D $branch`, and it contradicted the subsystem that
+# creates the thing it deleted. swap_ops.py:3289 states plainly: "Branches are NEVER
+# deleted (the parked branch is the operator's recovery handle)." A parked job's ONLY
+# durable artifact is that branch -- the worktree is removed, the prompt is gone, and
+# nothing else links the commits to what they were trying to build. Then the next run of
+# the same task slug ran `branch -D` on it, at the TOP of the task, before anything else.
+# Two subsystems held opposite policies on the same ref and the destructive one ran first.
+#
+# The idempotency requirement is real and unchanged: a re-run must not collide with a
+# stale branch of the same name. But freeing the NAME does not require destroying the
+# COMMITS. Renaming does both.
+#
+# Only branches carrying work unreachable from HEAD are preserved. A branch whose commits
+# already merged (or that never committed) is deleted exactly as before -- preserving those
+# would bury the real recovery handles under clutter, which is its own way of losing them.
+$__hasWork = $false
+if ((git -C $Repo rev-parse --verify --quiet "$branch" 2>$null)) {
+    $__unmerged = @(git -C $Repo rev-list --count "HEAD..$branch" 2>$null)
+    $__hasWork = ($__unmerged -match '^\d+$') -and ([int]$__unmerged[0] -gt 0)
+}
+if ($__hasWork) {
+    $__parked = "parked/$Task-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    git -C $Repo branch -m $branch $__parked 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  preserved prior parked work: $branch -> $__parked (recovery handle kept; see #1277)"
+    } else {
+        # Fail LOUD rather than falling back to -D: silently deleting after announcing a
+        # preserve is worse than the original defect.
+        throw "Could not preserve the prior parked branch '$branch' (rename to '$__parked' failed). Refusing to delete it. Resolve by hand."
+    }
+} else {
+    git -C $Repo branch -D $branch 2>&1 | Out-Null
+}
 foreach ($__br in @(git -C $Repo branch --list "agent/$Task-c*" 2>$null | ForEach-Object { ($_ -replace '^[\*\+]?\s*', '').Trim() })) {
     if ($__br) { git -C $Repo branch -D $__br 2>&1 | Out-Null }
 }
@@ -291,6 +325,22 @@ if ($scaffold -eq 'web-static') { Write-Host "  Static web page: the coder exten
 $__assetPromptBefore = $Prompt
 $Prompt = Add-AssetHint -Prompt $Prompt -Worktree $wt -Surface $Surface
 if ($Prompt -ne $__assetPromptBefore) { Write-Host "  Generated image assets present: the coder is told to reference the local file(s) offline (no <svg> placeholder, no CDN)." -ForegroundColor DarkCyan }
+# The BEHAVIOR CONTRACT: if BlarAI's plan declared what the finished page must be able to DO, tell
+# the coder the two DOM markers the headless capture will look for -- so it is graded on a contract
+# it was actually given, not on a check it never heard of. Same file-presence gate and the same
+# position as the asset hint (above the resample loop, so it survives a reset-to-base); no contract
+# file -> a no-op and the prompt is byte-identical.
+$__smokePromptBefore = $Prompt
+$Prompt = Add-SmokeContractHint -Prompt $Prompt -Worktree $wt
+if ($Prompt -ne $__smokePromptBefore) { Write-Host "  Behavior contract declared: the coder is told which two elements to mark for the automated browser check." -ForegroundColor DarkCyan }
+# ...and PIN those bytes HERE, while they are still the PLAN's. This is the last point before the
+# coder gets write access to the tree, so it is the only place a snapshot is trustworthy. They are
+# re-materialised before every per-task critique capture below (Invoke-CritiqueLoop -SmokePinBytes):
+# a candidate cannot edit the exam it is about to sit. The swap driver already applies this control
+# before its two post-merge captures; the per-task critique hop -- which runs against the CANDIDATE
+# worktree and spends the coder's fix budget -- was outside it. $null when no contract was declared,
+# which makes every downstream restore a no-op.
+$smokePinBytes = Save-SmokeContractPin -Worktree $wt
 
 # ONE attempt = (optional reset-to-base) -> build (inner no-op retry) -> oracle-restore -> secret-scan ->
 # commit -> [2/5] tests -> [3/5] verify. #700 UNIFIED this into fleet-lib's Invoke-CandidateBuild -- the SINGLE
@@ -734,6 +784,11 @@ $mergedVia = if ($merged) { $mergeDecision.Via } else { '' }
 # (Playground, which needs the 30B swapped out — the measured 32.5 GB breach) is OUT OF SCOPE
 # here and stays a separate OVMS-gated go-live step. This block performs no OVMS stop/swap.
 $critiqueSummary = ''
+# #1303: the RESULT line's qualifier when the DECLARED behaviour contract was exercised and did not
+# come back clean. Initialised empty so every path that never reaches the critique hook -- a
+# non-visual task, the hook switched off, a hook that threw -- composes the RESULT line exactly as
+# it did before, byte for byte. An absent reading affirms nothing and claims nothing.
+$smokeQualifier = ''
 # Capture EVERYTHING the hook needs from the real params/vars NOW, into hook-local copies.
 # This is load-bearing: dot-sourcing critique-loop.ps1 below binds ITS param block in THIS
 # scope, which would overwrite $Goal / $VisualCriteriaJson / $AppDir. We never read those
@@ -842,12 +897,28 @@ if ($_critiqueActive) {
         # callbacks were defined in-scope and one level deep, never crossing this boundary.)
         $loop = Invoke-CritiqueLoop -AppDir $wt -Goal $critiqueGoal `
             -VisualCriteriaJson $_visualTrimmed -BlarAiRepo $_blarAiRepo `
-            -MaxIter 3 -WorkDir $critiqueWork -RebuildCallback $rebuildAutoFix
+            -MaxIter 3 -WorkDir $critiqueWork -RebuildCallback $rebuildAutoFix `
+            -SmokePinBytes $smokePinBytes
         # #1198: the wording lives in Format-VisualCritiqueSummary (fleet-lib.ps1, pure + unit-tested), so
         # the one disclosure that must survive here -- a design lint that produced NO verdict is never
         # composed away into "visual criteria look satisfied" -- is provable rather than merely present.
         $critiqueSummary = Format-VisualCritiqueSummary -Result $loop.FinalResult `
             -FixNotes @($script:fixNotes) -FixCount $script:fixCount
+        # #1303: the same result, read for the ONE question the RESULT line below asserts an answer
+        # to. The STATUS travels with the three booleans because they cannot split the two states
+        # the operator most needs told apart: a delivery that never grew the markers and a capture
+        # that crashed on a valid contract are both declared-and-unmeasured, and only the status
+        # says which. Indexed reads, not property reads: a pass that exited through _FailResult
+        # carries no contract keys at all, and under the StrictMode a caller may have in scope a
+        # bare property read on a missing key THROWS -- which would land in the catch below and lose
+        # the critique summary too. A missing key indexes to $null -> $false/'' -> silence, which is
+        # the honest reading for a pass that reached no verdict.
+        $_fr = $loop.FinalResult
+        if ($_fr) {
+            $smokeQualifier = Format-SmokeResultQualifier `
+                -Declared ([bool]$_fr['SmokeDeclared']) -Measured ([bool]$_fr['SmokeMeasured']) `
+                -Passed ([bool]$_fr['SmokePassed']) -Status ([string]$_fr['SmokeStatus'])
+        }
         Write-Host "  critique: $($critiqueSummary -split "`n" | Select-Object -First 1)" -ForegroundColor DarkGray
     } catch {
         # The merge already happened; a critique error MUST NOT fail the task. Log + continue.
@@ -876,7 +947,7 @@ VERIFY: $verifyResult$(if ($verifyResult -eq 'fail') { ' (build/lint/typecheck F
 SECRETS: $(if ($secretBlocked) { "BLOCKED - $($secret.detail)" } elseif ($secret.status -eq 'skipped') { 'NOT SCANNED - the stage step failed before the scan could run' } elseif ($secret.status -eq 'unavailable') { 'scan skipped (gitleaks not installed)' } else { 'clean' })
 ANOMALIES: $(if ($anomaly.Anomalies.Count) { ($anomaly.Anomalies -join '; ') } else { 'none' })$(if ($concurrencyNote) { "`nNOTE (concurrency): $concurrencyNote" })$(if ($dispatchCancelled) { "`nSTOPPED: a /dispatch stop was observed mid-run; best-of-N parked after the current candidate and did not start fresh candidates or auto-merge (#771)." })
 REVIEW VERDICT: $verdict$(if ($critiqueSummary) { "`nVISUAL CRITIQUE (post-merge design signal — NOT a gate, your eyeball is the verdict):`n  $($critiqueSummary -replace "`n", "`n  ")" })
-RESULT: $(if ($gitFailed) {"ERRORED: the stage/commit step failed ($gitFaultReason), so the coder's work was never captured - see the CAPTURE FAULT line above for git's own message. Any work is left UNCOMMITTED in $wt. This run measures the BOX, not the model: do not read it as a coder no-op."} elseif ($secretBlocked) {"BLOCKED: a potential secret was detected, so nothing was committed or merged. Your changes are left UNCOMMITTED in $wt for review."} elseif ($merged) {"MERGED into your project - just open the app and try it.$(if ($mergedVia -eq 'build-only-gate') { ' (Merged via the build-only gate: the build passed cleanly but the AI code review was inconclusive - please launch and eyeball it.)' })"} elseif (-not $hasChanges -and $noChangeDeclared) {'Nothing to merge - the coder explicitly declared NO CHANGE NEEDED: the task appears already satisfied by the current project (see the NO-CHANGE DECLARED line above; an honest no-change outcome, not a failure to produce).'} elseif (-not $hasChanges -and $captureFaultNote) {'Nothing to merge from the selected candidate - but another candidate FAULTED before its work could be captured (see CAPTURE FAULT above). Nothing was lost from the selected candidate, but do NOT read this run as a clean "the coder produced nothing" result.'} elseif (-not $hasChanges) {'Nothing to merge.'} else {"NOT merged. The work is parked safely on branch '$branch' (workspace: $wt)."})
+RESULT: $(if ($gitFailed) {"ERRORED: the stage/commit step failed ($gitFaultReason), so the coder's work was never captured - see the CAPTURE FAULT line above for git's own message. Any work is left UNCOMMITTED in $wt. This run measures the BOX, not the model: do not read it as a coder no-op."} elseif ($secretBlocked) {"BLOCKED: a potential secret was detected, so nothing was committed or merged. Your changes are left UNCOMMITTED in $wt for review."} elseif ($merged) {"MERGED into your project - just open the app and try it.$(if ($mergedVia -eq 'build-only-gate') { ' (Merged via the build-only gate: the build passed cleanly but the AI code review was inconclusive - please launch and eyeball it.)' })$smokeQualifier"} elseif (-not $hasChanges -and $noChangeDeclared) {'Nothing to merge - the coder explicitly declared NO CHANGE NEEDED: the task appears already satisfied by the current project (see the NO-CHANGE DECLARED line above; an honest no-change outcome, not a failure to produce).'} elseif (-not $hasChanges -and $captureFaultNote) {'Nothing to merge from the selected candidate - but another candidate FAULTED before its work could be captured (see CAPTURE FAULT above). Nothing was lost from the selected candidate, but do NOT read this run as a clean "the coder produced nothing" result.'} elseif (-not $hasChanges) {'Nothing to merge.'} else {"NOT merged. The work is parked safely on branch '$branch' (workspace: $wt)."})
 $(if (-not $merged -and $hasChanges) {@"
 
 WHAT TO DO (no git knowledge needed):
