@@ -1,0 +1,67 @@
+{
+  "schema": "review-clauses/v1",
+  "card_id": "B9",
+  "repo": "battery-b9-pottery-site",
+  "source": "BlarAI evals/battery/B9.json -> goal (card_class: frozen). Copied, never edited.",
+  "note": "WHAT THIS IS. The operator's own goal, cut into the separate things he asked for, so that when he\nreviews the site he is handed HIS OWN WORDS clause by clause instead of an empty impression. He\nsaid it himself after the first review anyone ever ran: \"I am not really sure what I am supposed to\nexpect, to be honest with you.\" That is a defect in the review instrument, not in him -- a reviewer\nwith no reference standard produces impressions, and his eyeball verdict is the only ground truth\nthis project has for whether the automated gates are any good.\n\nWHY IT LIVES HERE AND NOT ON THE CARD. evals/battery/B9.json is a FROZEN measurement card in the\nBlarAI repo. Adding review-side fields to it would change the bytes the coder's prompt is built\nfrom and break run-to-run comparability, so the review side keeps its own sidecar, keyed by card id\nand matched to a build by `repo`.\n\nEVERY STRING BELOW IS VERBATIM. `text` is an exact substring of `goal_verbatim`; each entry in\n`parts` is an exact substring of its own clause. Nothing is paraphrased into requirements-speak,\nbecause he has to recognise the sentences as his. verify-website-review-loop.ps1 proves both\nsubstring properties on every run -- a paraphrase slipped in later fails the check.\n\nWHY SOME CLAUSES HAVE `parts`. One sentence can carry two separately-failable obligations, and the\nsecond half is the one that fails silently. \"it should tell someone politely if they have left\nsomething out INSTEAD OF JUST LOSING WHAT THEY TYPED\" passes its first half on any site that shows\nan error message at all. The clause stays whole and gets ONE mark, exactly as he wrote it; `parts`\nonly makes sure the prompt asks him about both halves before he answers.",
+  "goal_verbatim": "I run a small pottery studio and I want a proper little website for it, not just one page. There should be a home page that introduces the studio, a page listing the pieces I have for sale, a separate page for each individual piece with its own details and photo, and a contact page where someone can send me an enquiry. Every page needs the same heading and menu across the top so it feels like one website and I can get anywhere from anywhere. The list of pieces and each piece's own page have to come from the same saved information, so when I change a piece's price it changes everywhere it appears. The contact page should keep the enquiries somewhere I can look at later, and it should tell someone politely if they have left something out instead of just losing what they typed. I would also like the piece list to let me narrow down to just the mugs or just the bowls.",
+  "clauses": [
+    {
+      "id": "b9-c1",
+      "text": "a home page that introduces the studio",
+      "parts": []
+    },
+    {
+      "id": "b9-c2",
+      "text": "a page listing the pieces I have for sale",
+      "parts": []
+    },
+    {
+      "id": "b9-c3",
+      "text": "a separate page for each individual piece with its own details and photo",
+      "parts": [
+        "a separate page for each individual piece",
+        "its own details and photo"
+      ]
+    },
+    {
+      "id": "b9-c4",
+      "text": "a contact page where someone can send me an enquiry",
+      "parts": []
+    },
+    {
+      "id": "b9-c5",
+      "text": "Every page needs the same heading and menu across the top so it feels like one website and I can get anywhere from anywhere",
+      "parts": [
+        "Every page needs the same heading and menu across the top",
+        "I can get anywhere from anywhere"
+      ]
+    },
+    {
+      "id": "b9-c6",
+      "text": "The list of pieces and each piece's own page have to come from the same saved information, so when I change a piece's price it changes everywhere it appears",
+      "parts": [
+        "The list of pieces and each piece's own page have to come from the same saved information",
+        "when I change a piece's price it changes everywhere it appears"
+      ]
+    },
+    {
+      "id": "b9-c7",
+      "text": "The contact page should keep the enquiries somewhere I can look at later",
+      "parts": []
+    },
+    {
+      "id": "b9-c8",
+      "text": "it should tell someone politely if they have left something out instead of just losing what they typed",
+      "parts": [
+        "it should tell someone politely if they have left something out",
+        "instead of just losing what they typed"
+      ]
+    },
+    {
+      "id": "b9-c9",
+      "text": "I would also like the piece list to let me narrow down to just the mugs or just the bowls",
+      "parts": []
+    }
+  ]
+}

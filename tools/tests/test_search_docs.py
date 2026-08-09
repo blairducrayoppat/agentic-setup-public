@@ -262,13 +262,25 @@ def test_manifest_resolves_from_the_tool_not_the_cwd_or_env(monkeypatch):
     assert resolved.is_file(), f"the committed manifest must exist at {resolved}"
 
 
-def test_the_shipped_manifest_is_dormant(monkeypatch):
-    """The landed-dormant claim, asserted against the file that actually ships. This is
-    the line that fails if a future change arms the capability without a go-live."""
+def test_the_shipped_manifest_matches_the_recorded_go_live(monkeypatch):
+    """The shipped-state lock, asserted against the file that actually ships.
+
+    WAS "is_dormant" until 2026-08-06, when the LA armed the capability in person
+    (#1206, agentic-setup b13344d) after it had sat installed-but-unused since
+    2026-07-24. This test FIRED on that change, which is exactly what it is for: nobody
+    moves this switch silently in either direction.
+
+    The purpose is unchanged and the assertion simply tracks the recorded decision -- it
+    now fails if someone DISARMS without a decision, which is the live risk today.
+    Note what this does NOT assert: that the environment can arm anything. It cannot, and
+    the hostile-parent test below proves that independently of whatever ships here."""
     monkeypatch.delenv("BLARAI_FLEET_DRIVER_CONFIG", raising=False)
     monkeypatch.delenv("BLARAI_RESEARCH_DOCS", raising=False)
     state, reason = search_docs.resolve_arming()
-    assert state == search_docs.DORMANT, f"configs/fleet-driver.json ships armed: {reason}"
+    assert state != search_docs.DORMANT, (
+        f"configs/fleet-driver.json ships DORMANT again: {reason}. If that was deliberate, "
+        "record the decision on #1206 and update this test; if it was not, restore it."
+    )
 
 
 def _run_in_a_clean_process(tool: Path, tmp_path: Path) -> dict:
@@ -297,12 +309,17 @@ def _run_in_a_clean_process(tool: Path, tmp_path: Path) -> dict:
     return json.loads(payload)
 
 
-def test_a_clean_process_still_reads_the_shipped_dormant_state(tmp_path):
-    """THE DURABILITY TEST (dormant half). Nothing set by hand, nothing inherited: the
-    shipped state must still read the same. If arming lived in the environment this would
-    be indistinguishable from a machine where someone simply forgot to export it."""
+def test_a_clean_process_still_reads_the_shipped_armed_state(tmp_path):
+    """THE DURABILITY TEST, against the SHIPPED state (armed since 2026-08-06, #1206).
+
+    Nothing set by hand, nothing inherited: a process that carries no BLARAI_* state at
+    all -- after a reboot, a crash relaunch, or a hand start -- must still read what the
+    manifest says. That is the whole reason arming lives in a committed file rather than
+    an exported variable: otherwise this would be indistinguishable from a machine where
+    someone simply forgot to export it, and only whoever was spawned by the right parent
+    would be armed."""
     result = _run_in_a_clean_process(_TOOLS_DIR / "search_docs.py", tmp_path)
-    assert result["reason"] == search_docs.DORMANT, result
+    assert result["reason"] != search_docs.DORMANT, result
 
 
 def test_a_clean_process_still_reads_an_armed_manifest(tmp_path):
@@ -327,11 +344,20 @@ def test_a_clean_process_still_reads_an_armed_manifest(tmp_path):
 
 def test_a_clean_process_cannot_be_armed_by_a_hostile_parent(tmp_path):
     """The already-running-process failure, from the other side: a parent that exports a
-    truthy BLARAI_RESEARCH_DOCS cannot arm a child whose committed manifest says false."""
+    truthy BLARAI_RESEARCH_DOCS cannot arm a child whose committed manifest says false.
+
+    DECOUPLED FROM THE SHIPPED VALUE on 2026-08-06. This test used to lean on
+    configs/fleet-driver.json happening to ship dormant, so arming the capability (#1206)
+    broke it -- and a SECURITY property that breaks when an unrelated config flips was
+    never really testing the property. It now plants its own explicit `research_docs:
+    false` manifest, so it proves the same thing whatever ships, and it will keep proving
+    it after the next go-live too."""
     import subprocess
 
+    manifest = _write_manifest(tmp_path, False)          # EXPLICITLY dormant, ours
     env = {k: v for k, v in os.environ.items() if not k.startswith("BLARAI_")}
     env["BLARAI_RESEARCH_DOCS"] = "1"          # the old arming variable, set by a parent
+    env["BLARAI_FLEET_DRIVER_CONFIG"] = str(manifest)
     env["BLARAI_REPO"] = str(tmp_path / "no-such-blarai")
     env["BLARAI_RESEARCH_USAGE_LOG"] = str(tmp_path / "hostile-usage.jsonl")
     proc = subprocess.run(

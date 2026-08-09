@@ -174,7 +174,7 @@ function Invoke-AoPreflightReclaim {
     # every AO nothing ever claimed, and the resurrected admission gate turns that miss
     # into a LOST NIGHT rather than a degraded one: with an unowned AO resident,
     # Measure-SwapHeadroom sees the AO up so Projected = Available + 8.0 ~= 14 GiB
-    # (short of the 20.5 gate), while raw Available ~= 6 GiB is BELOW the 15.0 probe
+    # (short of the lean gate), while raw Available ~= 6 GiB is BELOW the 15.0 probe
     # floor -- so admission refuses, retries to 04:00 and skips. Demonstrated live: a
     # hand-run probe restored an AO (its always-restore discipline) and took Available
     # 17.59 -> 6.03 GiB, carrying no sentinel because no night claimed it.
@@ -201,12 +201,39 @@ function Invoke-AoPreflightReclaim {
         [Parameter(Mandatory)][bool]$AoPresent,
         [Parameter(Mandatory)][string]$BlarAiRepo,
         [Parameter(Mandatory)][string]$StopAssistantPath,
+        # #1334. Null when nothing is driving a dispatch; otherwise the caller's
+        # descriptor of what is. MANDATORY with [AllowNull()] rather than optional: the
+        # normal value IS null, but an optional lock is one a future call site can simply
+        # forget, and this one stands between a scheduled night and somebody's live work.
+        # Supplied by the caller for the same reason $AoPresent is -- this library decides
+        # WHETHER to stop, never HOW to look, and never grows a second detector.
+        [Parameter(Mandatory)][AllowNull()][psobject]$LiveDispatch,
         [scriptblock]$Log = { param($m) Write-Host $m }
     )
     $emit = { param($m) try { & $Log "ao-ownership: $m" } catch { } }
 
     $owner = Get-AoOwner -SentinelPath $SentinelPath
     $claimedNight = if ($owner) { [string]$owner.night } else { '' }
+
+    # A LIVE DISPATCH DOMINATES EVERYTHING BELOW, including the "reclaim the SLOT, not the
+    # claim" rule this function is built around. That rule is correct for an ORPHAN: an
+    # unowned resident AO starves the admission gate into skipping the night, so taking it
+    # is the lesser harm. It is catastrophic for an AO a live run is actively USING, and
+    # the two are indistinguishable from the sentinel alone -- an operator dispatch claims
+    # no AO by design, so it lands in the "NOTHING owns it" branch below and reads exactly
+    # like an orphan.
+    #
+    # Measured 2026-08-07 23:00:11: this function stopped pid 28152 under that reasoning
+    # while a dispatch which had already delivered six tasks was mid-flight. The night
+    # that took it then stalled 256 s later, when its own replacement AO was torn down by
+    # the cleanup of the run it had just orphaned. Two runs destroyed, one guard, one gap.
+    if ($LiveDispatch) {
+        $named = if ($LiveDispatch.RunId) { " for run $($LiveDispatch.RunId)" } else { '' }
+        & $emit ("preflight reclaim REFUSED - a dispatch is live$named ($($LiveDispatch.Detail)). " +
+                 "The AO on :5001 may be in use by it. Nothing stopped, nothing archived, " +
+                 "no claim taken.")
+        return [pscustomobject]@{ Reclaimed = $false; Reason = 'live-dispatch'; ClaimedNight = $claimedNight }
+    }
 
     # A claim naming THIS night means a run is already in flight under this stamp
     # (re-entrant invocation): never tear down the run in progress. Checked first so it

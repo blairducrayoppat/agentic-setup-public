@@ -4,7 +4,7 @@
 # can prompt you to save). Nothing is ever closed without your y/n.
 #
 # Usage (or just double-click the .cmd launchers on the Desktop):
-#   .\start-llm.ps1 -Model coder-30b     # deep coding  (needs ~21 GB free)
+#   .\start-llm.ps1 -Model coder-30b     # deep coding  (needs ~19 GB free)
 #   .\start-llm.ps1 -Model qwen3-14b     # everyday     (needs ~13 GB free)
 #   .\start-llm.ps1 -Model vision        # screenshots  (needs ~10 GB free)
 #   -Force skips all prompts (for automation).
@@ -77,7 +77,10 @@ switch ($Model) {
         # ENV var, not a CLI flag, so the inherited OVMS process below picks it up.
         # Added 2026-06-29 (BlarAI OpenVINO 2026.2 upgrade, §5 candidate A4). Measure the TTFT delta.
         $env:MOE_USE_MICRO_GEMM_PREFILL = '0'
-        $needGB = 20   # was 21; #777 measured 2026-07-09 — clean READY from 19.85 GiB, no storm (see blarai PERFORMANCE_LOG)
+        # Lockstep with BlarAI's [fleet_dispatch].swap_min_free_gb — see that key's comment for
+        # the full provenance. 19 is an LA DIRECTIVE (#1313, 2026-08-07), NOT a measurement: it
+        # sits 0.85 GiB BELOW #777's measured-good 19.85 GiB ambient. The prior 20 was measured.
+        $needGB = 19
     }
     'qwen3-14b' {
         $path  = Find-OvDir @('C:\models\qwen3-14b', 'C:\Users\mrbla\BlarAI\models\qwen3-14b')

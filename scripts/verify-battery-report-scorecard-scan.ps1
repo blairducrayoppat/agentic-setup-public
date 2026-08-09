@@ -74,7 +74,8 @@ Check "S3 the parse-failure path is distinguishable from the wrong-shape path" `
 function New-NightFixture {
     param([switch]$Corrupt, [switch]$NonScorecard, [string]$Attribution = "",
           [string]$Branch = "main", [string]$TreeState = "clean", [switch]$NoVersions,
-          [switch]$Empty, [switch]$Partial, [string]$OnMain = "yes", [switch]$NoOnMain)
+          [switch]$Empty, [switch]$Partial, [string]$OnMain = "yes", [switch]$NoOnMain,
+          [switch]$NoMode)
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("nb-1180-{0}" -f [guid]::NewGuid())
     $null = New-Item -ItemType Directory -Force -Path (Join-Path $dir 'scorecards')
     $sd = Join-Path $dir 'scorecards'
@@ -110,6 +111,19 @@ function New-NightFixture {
     # only dies on the first missing member. Both took the whole postlude with them.
     if ($Empty)        { Set-Content -LiteralPath (Join-Path $sd 'B7.scorecard.json') -Value '' -NoNewline }
     if ($Partial)      { Set-Content -LiteralPath (Join-Path $sd 'B8.scorecard.json') -Value '{ "job_id": "B8" }' }
+    # A COMPLETE card whose evidence block carries no `mode`. This is not a damaged file --
+    # it is what the driver writes for a job that stalls before the plan graph exists, and it
+    # answers every question the report asks. Shape taken verbatim from B9's first ever run,
+    # 2026-08-07, which reported as LOST while naming its own cause in `notes`.
+    if ($NoMode) {
+        ([ordered]@{
+            job_id = 'B9'; verdict = 'STALLED'; attribution = 'HARNESS'
+            wall_clock_s = 283.3; notes = 'approve did not fire EXECUTE: No response from the Assistant Orchestrator.'
+            evidence = [ordered]@{ oracle_status = 'unknown'; failure_class = 'HARNESS-BUDGET' }
+            versions = [ordered]@{ battery_runner = 'v1'; blarai = 'abc1234'
+                                   blarai_branch = 'detached'; blarai_tree = 'clean'; blarai_on_main = 'yes' }
+        } | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath (Join-Path $sd 'B9.scorecard.json')
+    }
     $dir
 }
 
@@ -224,7 +238,41 @@ $escaped = $false
 try { $null = Invoke-ScanBlock -NightDirPath $f7 -Src $narrowedSrc } catch { $escaped = $true }
 Check "C2b control: the narrowed guard DOES escape on a partial scorecard" $escaped
 
-foreach ($d in @($f6,$f7)) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }
+
+# ---- B8/C4: a COMPLETE card with no evidence.mode is not lost evidence -------------
+# The launcher's own comment says "absent = mode-unknown" and the switch carries a `default`
+# arm for it -- but under StrictMode the bare $d.evidence.mode THREW before reaching it, so
+# the arm written for this case was unreachable by the only path that produces it. Measured
+# 2026-08-07 on B9's first ever run: a card carrying verdict, attribution, failure_class and
+# a notes field naming the exact cause was reported to the operator as LOST. This is the
+# difference between a loud failure and a loud FALSEHOOD -- the second is worse, because it
+# sends the reader looking for evidence that is sitting in the file the report disowned.
+$f8 = New-NightFixture -NoMode
+$r8 = Invoke-ScanBlock -NightDirPath $f8 -Src $script:liveSrc
+Check "B8a no evidence.mode: the card RENDERS, it is not reported as lost" `
+    ([bool]($r8.Lines -match '^\* \*\*B9\*\*'))
+Check "B8b no evidence.mode: NO unreadable line for that card" `
+    (-not [bool]($r8.Lines -match 'UNREADABLE.*B9\.scorecard\.json'))
+Check "B8c no evidence.mode: the rendered line carries the REAL cause" `
+    ([bool]($r8.Lines -match 'No response from the Assistant Orchestrator'))
+Check "B8d no evidence.mode: the healthy jobs still render" `
+    (@($r8.Lines | Where-Object { $_ -match '^\* \*\*B[24]\*\*' }).Count -eq 2)
+# C4 CONTROL: drive the SAME fixture through the pre-fix bare read. If this does not throw,
+# the fixture is not reproducing the regression and B8 proves nothing.
+$bareModeSrc = @'
+$scorecards = Get-ChildItem "$NightDir\scorecards" -Filter "*.json" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne 'battery-summary.json' }
+foreach ($sc in $scorecards) {
+    $d = Get-Content $sc.FullName -Raw | ConvertFrom-Json
+    if ($d.PSObject.Properties.Name -notcontains 'job_id') { continue }
+    switch ($d.evidence.mode) { "plan-graph" { } "flat" { } default { } }
+}
+'@
+$threw = $false
+try { $null = Invoke-ScanBlock -NightDirPath $f8 -Src $bareModeSrc } catch { $threw = $true }
+Check "C4 control: the pre-fix bare read DOES throw on the same fixture" $threw
+
+foreach ($d in @($f6,$f7,$f8)) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }
 
 # ---- T1-T4: the #1181 measured-tree note -----------------------------------------
 # The night runs from the primary checkouts, so it measures whatever branch they were left

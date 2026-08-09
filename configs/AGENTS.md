@@ -4,7 +4,7 @@
 - Work on one file at a time. Re-read a file before editing it a second time.
 - Never invent paths, APIs, or flags — confirm with read/grep/glob first.
 - Act ONLY through real tool calls — never write a tool call as text in your reply. Do not output a `{"tool_calls": ...}` JSON block, a `<tool_call>` / `name=...>` / `<parameter=...>` snippet, or any hand-written function-call syntax; emit an actual tool call instead. Prose is for explaining, tool calls are for acting — never mix the two.
-- Write and edit files using a path INSIDE the project directory you were given (a relative path like `count.txt` or `src/app.py`). Never write to an absolute path outside the project (e.g. your home folder) — that will be refused.
+- Write and edit files using a path INSIDE the project directory you were given. The file tools (`read`/`write`/`edit`) accept EITHER a bare relative path (`count.txt`, `src/app.py`) OR a FULL drive-qualified path (`C:/Users/.../your-project/src/app.py`). **NEVER a LEADING-SLASH path like `/src/app.py` or `/public/index.html`** — a leading slash means the filesystem ROOT, so it lands outside the project and is REFUSED every single time. **If a file tool is refused, look for a leading slash FIRST** — that is the cause far more often than a real permission problem, and re-sending the same path will fail again. Do not switch to shell `cat`/`cp`/`echo` to work around it: fix the path. Never write to an absolute path outside the project (e.g. your home folder) — that will be refused.
 - Prefer edit over rewriting whole files. BUT if an edit fails to match twice: re-read the file and copy the failing line exactly, quotes included. If it fails a third time, write the whole corrected file in one write tool call instead of retrying edits.
 - After changes: run the project's tests (or at least the changed file) and report the command + result.
 - For web pages: verify your own work — open the page with the browser tool (file:/// path or localhost), check console messages for errors, fix, re-verify. Done = clean console. Browser tool is for LOCAL files and localhost only.
@@ -85,3 +85,27 @@ SECURITY: these domains include DESTRUCTIVE operations (disabling BitLocker, cle
 shares/VMs, rewriting firewall rules, reloading a live proxy). You **write** the script/config; you do
 **not** auto-run destructive operations — generate them clearly flagged "OPERATOR REVIEW REQUIRED" with a
 dry-run form, for the human to run deliberately. Each pack's Security section spells this out.
+
+## Look it up instead of guessing — you have the real documentation, locally
+
+You have a `search_docs` tool. It searches a LOCAL, offline copy of the official documentation
+on this machine. No network, no waiting, no cost. It is available right now.
+
+**What is in it:** `dom`, `html`, `css`, `javascript`, `node`, `python~3.11`, `pytest`.
+(Measured: 13,803 pages / 26,329 symbols, of which 10,475 pages — 76% — are web sources.)
+
+**Use it BEFORE you guess, not after you fail.** Specifically:
+
+- You are about to write an API call and you are not certain of the exact name, argument order,
+  or return shape — `search_docs "Element.replaceChildren"`.
+- A build or test error names something you do not recognise — search the error's symbol.
+- You are choosing between two ways to do something and are unsure which is current.
+- **You are about to write the same fix a second time.** A second attempt at the same failure is
+  the strongest signal you are guessing. Look it up before that attempt, not after a third.
+
+**How:** `search_docs "<symbol, error text, or concrete question>"`. Ask a CONCRETE named gap
+("URLSearchParams.getAll", "node:test mock timers"), not a broad topic ("how do I do routing").
+Exact symbol matches are returned first; add `-k 8` for more lexical hits.
+
+This is faster and more reliable than reasoning from memory about an API you half-recall, and it
+costs a few seconds. A wrong API signature costs a whole candidate.

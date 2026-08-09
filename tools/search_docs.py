@@ -118,6 +118,22 @@ def _log_usage(*, query: str, outcome: str, exact_hits: int, search_hits: int) -
     try:
         log_path = Path(os.environ.get("BLARAI_RESEARCH_USAGE_LOG", "").strip() or _DEFAULT_USAGE_LOG)
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # WHO ASKED (#1206). Until 2026-08-06 every record was a bare
+        # caller="search_docs_cli", so a coder's lookup and a developer's diagnostic
+        # probe were INDISTINGUISHABLE. That is not cosmetic: #1206's acceptance
+        # predicate is "this ledger gains records whose caller is the CLI", and on
+        # 2026-08-06 a hand-run probe from a dev session landed in it mid-battery and
+        # was very nearly read as the coder finally using the tool -- the opposite of
+        # the truth. The ledger has to answer "who asked", or it cannot answer the
+        # only question it exists for.
+        #
+        # cwd is the discriminator that costs nothing: the coder always runs inside
+        # its task worktree (state\worktrees\<job>-<task>), a dev probe never does.
+        cwd = ""
+        try:
+            cwd = str(Path.cwd())
+        except Exception:  # noqa: BLE001 -- a deleted cwd must not break the log
+            cwd = "<unavailable>"
         record = {
             "ts": time.time(),
             "caller": "search_docs_cli",
@@ -125,6 +141,11 @@ def _log_usage(*, query: str, outcome: str, exact_hits: int, search_hits: int) -
             "outcome": outcome,  # "unavailable" | "no_match" | "hit"
             "exact_hits": exact_hits,
             "search_hits": search_hits,
+            "cwd": cwd[:300],
+            # Set by the fleet when it spawns a coder; absent for anything else. Read
+            # from the environment rather than inferred, so "I do not know" stays
+            # distinguishable from "not a coder".
+            "fleet_task": os.environ.get("BLARAI_FLEET_TASK", "") or "",
         }
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")

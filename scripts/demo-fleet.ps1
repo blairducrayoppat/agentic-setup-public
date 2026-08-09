@@ -46,7 +46,16 @@ Remove-Item $q -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Running one task through the fleet (this calls the AI model; about 1-5 min)..." -ForegroundColor Cyan
-& "$PSScriptRoot\run-fleet.ps1" -Queue $q -MaxRunMinutes 8 -MaxReviewMinutes 5
+# SPAWNED AS A CHILD, not `& …run-fleet.ps1` (#1334): the call operator runs it IN-PROCESS,
+# leaving no process with `-File …run-fleet.ps1` for the battery's live-dispatch guard to
+# see. A demo run would then be invisible to the 23:00 nightly, which would reclaim its
+# assistant and archive its sandbox mid-build. -NoNewWindow -Wait keeps the behaviour
+# identical for whoever is watching.
+$rfExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+$rfProc = Start-Process $rfExe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',
+    "$PSScriptRoot\run-fleet.ps1",'-Queue',$q,'-MaxRunMinutes','8','-MaxReviewMinutes','5' `
+    -NoNewWindow -Wait -PassThru
+$global:LASTEXITCODE = $rfProc.ExitCode
 
 Write-Host ""
 Write-Host "Done. If the result above says MERGED, see what the AI built:" -ForegroundColor Cyan

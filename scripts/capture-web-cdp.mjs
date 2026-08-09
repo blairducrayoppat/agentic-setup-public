@@ -30,9 +30,25 @@
 // (capture-app.ps1 re-sweeps by it in its finally). Default: a self-generated temp dir.
 //
 // The behavior smoke reads an OPTIONAL declared spec from <app-dir>/blarai-smoke.json:
-//   { "click": "<css selector for the primary action>", "expectDelta": "<css selector that must change>" }
+//   { "click": "<css selector for the primary action>", "expectDelta": "<css selector that must change>",
+//     "actionLabel": "<plain words>", "resultLabel": "<plain words>" }
 // When absent, a heuristic picks the first visible enabled primary control. The rendered-text
 // `undefined`/`NaN` scan is ALWAYS on and needs no declaration (it is the direct B5 catch).
+//
+// WHO WRITES THE SPEC. BlarAI's PLAN does, never the coder: shared/fleet/acceptance.py derives it
+// (`_smoke_spec_from_plan`), the AO seeds it into the baseline every candidate inherits so the coder
+// is TOLD the two DOM hooks to place, and the swap driver re-writes the plan's bytes immediately
+// before each capture so a candidate cannot edit the exam it is about to sit. Until that writer
+// existed nothing wrote this file at all, so the declared arm below was unreachable and EVERY web
+// build fell through to the heuristic — whose failures are only a soft note.
+//
+// THE SPEC IS UNTRUSTED INPUT HERE. Its selectors reach `document.querySelector`, so they are
+// re-validated against a narrow allowlist (`isValidSmokeSelector`) before use, and a spec that fails
+// validation is REFUSED rather than half-honoured. A declared hook that matches NO element gets its
+// own status — never a silent degrade to the heuristic, which is the same defect one layer up. The
+// sidecar's `smoke` block always states which happened, so "no spec was declared", "a spec was
+// declared and its hooks are missing" and "a spec was declared and exercised" are three
+// distinguishable readings rather than one.
 
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -134,18 +150,48 @@ export function scanRenderedText(innerText) {
  *  axis (or the named region) counts; no delta on a real click is the "cosmetic hide" tell. */
 export function evaluateBehavior(before, after, spec, click) {
   const b = before || {}, a = after || {};
-  if (!click || !click.clicked) {
-    return { ran: true, ok: false, changed: false,
-      reason: click && click.reason ? cleanText(click.reason) : 'no primary action could be found or clicked' };
+  const c = click || {};
+  // ---- DECLARED path: the plan named the hooks and the coder was told to place them ----
+  // Each miss is named separately and carries its own status, because the FIX differs: an
+  // absent hook is "add the attribute to your button", a dead one is "wire the button up".
+  // Falling back to the heuristic here — which is what happened before the declared arm had
+  // a writer — turns "the contract was not met" into "no delta was seen", a softer and
+  // wronger statement.
+  if (spec && spec.click) {
+    const label = cleanText(spec.actionLabel || 'the main control', 80);
+    if (c.explicitPresent === false) {
+      return { ran: true, ok: false, changed: false, status: SMOKE_ACTION_HOOK_MISSING,
+        reason: `${label} is missing its required marker: no element matches ${cleanText(spec.click, 80)}. `
+          + `Add that attribute to the control a person uses to make the page do its main job.` };
+    }
+    if (c.explicitVisible === false) {
+      return { ran: true, ok: false, changed: false, status: SMOKE_ACTION_HOOK_MISSING,
+        reason: `${label} carries its marker (${cleanText(spec.click, 80)}) but is hidden or disabled, `
+          + `so a person cannot use it.` };
+    }
+  }
+  if (!c.clicked) {
+    return { ran: true, ok: false, changed: false, status: SMOKE_ACTION_HOOK_MISSING,
+      reason: c.reason ? cleanText(c.reason) : 'no primary action could be found or clicked' };
   }
   if (spec && spec.expectDelta) {
+    const rLabel = cleanText(spec.resultLabel || 'the result region', 80);
+    // regionHtmlLen is -1 exactly when querySelector matched nothing (see snapshotJs), so an
+    // ABSENT result region is decidable rather than inferred from "it did not change".
+    if ((a.regionHtmlLen ?? -1) < 0 && (b.regionHtmlLen ?? -1) < 0) {
+      return { ran: true, ok: false, changed: false, status: SMOKE_RESULT_HOOK_MISSING,
+        reason: `${rLabel} is missing its required marker: no element matches `
+          + `${cleanText(spec.expectDelta, 80)}. Add that attribute to the part of the page that `
+          + `changes when the main control is used.` };
+    }
     const changed = (a.regionHtmlLen ?? -1) !== (b.regionHtmlLen ?? -2) || (a.regionText ?? '') !== (b.regionText ?? '');
-    return { ran: true, ok: changed, changed,
-      reason: changed ? '' : `the declared result region (${cleanText(spec.expectDelta, 80)}) did not change after the primary action` };
+    return { ran: true, ok: changed, changed, status: SMOKE_HONOURED,
+      reason: changed ? '' : `${rLabel} (${cleanText(spec.expectDelta, 80)}) did not change after `
+        + `${cleanText(spec.actionLabel || 'the main control', 80)} was used` };
   }
   const changed = (a.htmlLen !== b.htmlLen) || (a.elementCount !== b.elementCount)
     || (a.chartMarks !== b.chartMarks) || (a.canvasInk !== b.canvasInk) || (a.textLen !== b.textLen);
-  return { ran: true, ok: changed, changed,
+  return { ran: true, ok: changed, changed, status: SMOKE_NOT_DECLARED,
     reason: changed ? '' : `the primary action (${cleanText(click.selectorUsed || 'auto', 80)}) produced no visible change when clicked` };
 }
 
@@ -324,7 +370,11 @@ function snapshotJs(regionSelector) {
 }
 
 // Click the primary action. Uses spec.click when declared, else a heuristic (first visible, enabled
-// primary control). Returns {clicked, selectorUsed, reason}. Never throws into the page.
+// primary control). Returns {clicked, selectorUsed, reason, explicitPresent, explicitVisible}.
+// The two explicit* flags are what make a DECLARED miss reportable: a declared hook that matched no
+// element (`explicitPresent:false`) is a delivery defect, while a declared hook that matched a hidden
+// or disabled element (`explicitVisible:false`) is a different one — and the heuristic fallback below
+// would have made both look identical to a working click. Never throws into the page.
 function clickJs(clickSelector) {
   const sel = JSON.stringify(clickSelector || '');
   return `(function(){
@@ -332,8 +382,15 @@ function clickJs(clickSelector) {
       function visible(el){ if(!el) return false; var r=el.getBoundingClientRect(); var s=getComputedStyle(el);
         return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none' && !el.disabled; }
       var explicit = ${sel};
-      var el = null, used = '';
-      if (explicit) { el = document.querySelector(explicit); used = explicit; if(el && !visible(el)) el=null; }
+      var el = null, used = '', explicitPresent = null, explicitVisible = null;
+      if (explicit) {
+        var found = null;
+        try { found = document.querySelector(explicit); } catch(e) { found = null; }
+        explicitPresent = !!found;
+        explicitVisible = visible(found);
+        el = explicitVisible ? found : null;
+        used = explicit;
+      }
       if (!el) {
         var order = ['button','[type=submit]','input[type=button]','[role=button]','a[href]'];
         for (var i=0;i<order.length && !el;i++){
@@ -348,17 +405,127 @@ function clickJs(clickSelector) {
   })()`;
 }
 
-function readSmokeSpec(appDir) {
-  if (!appDir) return null;
-  try {
-    const p = path.join(appDir, 'blarai-smoke.json');
-    if (!fs.existsSync(p)) return null;
-    const spec = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (spec && typeof spec === 'object') {
-      return { click: typeof spec.click === 'string' ? spec.click : '', expectDelta: typeof spec.expectDelta === 'string' ? spec.expectDelta : '' };
+/** The declared-spec statuses. Every capture reports exactly one, and they are deliberately
+ *  distinguishable: "the check did not run" must never read like "the check ran and found
+ *  nothing". SMOKE_NOT_DECLARED is the honest no-op (no contract for this product); UNREADABLE
+ *  and INVALID mean a contract WAS present and could not be honoured — a defect in the writer,
+ *  not in the delivery; the two *_HOOK_MISSING are defects in the DELIVERY (the coder was told
+ *  to place the hook and did not); HONOURED is the only one that means the declared behavior
+ *  was actually exercised. */
+export const SMOKE_NOT_DECLARED = 'not-declared';
+export const SMOKE_UNREADABLE = 'unreadable';
+export const SMOKE_INVALID = 'invalid-selector';
+export const SMOKE_ACTION_HOOK_MISSING = 'action-hook-missing';
+export const SMOKE_RESULT_HOOK_MISSING = 'result-hook-missing';
+export const SMOKE_HONOURED = 'honoured';
+/** A contract was read and validated but the smoke has not run yet — and might not (the block is
+ *  wrapped, and a page that wedges the evaluate never reaches a verdict). Reading a file is not
+ *  exercising a contract, so the read step deliberately CANNOT mint 'honoured'. */
+export const SMOKE_DECLARED = 'declared';
+/** The smoke did not reach a verdict at all (an evaluate that threw). Not a pass, not a failure. */
+export const SMOKE_UNAVAILABLE = 'unavailable';
+
+/** Length cap on a declared selector (mirrors acceptance.py's `_SMOKE_SELECTOR_MAX`). */
+const SMOKE_SELECTOR_MAX = 120;
+
+/** One simple selector: [attr="value"] | #id | .class | tag. Mirrors acceptance.py's
+ *  `_CSS_SIMPLE_SELECTOR` — the two must admit the same language or a spec the ruler minted
+ *  would be refused here (or, worse, the reverse). ASCII classes are spelled out rather than
+ *  written `\w` on BOTH sides: JS's `\w` is ASCII and Python's is Unicode-aware, so the
+ *  shorthand made the two sides disagree about every non-ASCII identifier. `y` (sticky) so it
+ *  can be matched AT A POSITION by the scanner below rather than anchored to the whole string. */
+const _CSS_SIMPLE = '(?:\\[[A-Za-z][A-Za-z0-9_-]*="[A-Za-z0-9_ -]{1,40}"\\]|#[A-Za-z][A-Za-z0-9_-]*|\\.[A-Za-z][A-Za-z0-9_-]*|[A-Za-z][A-Za-z0-9]*)';
+const _CSS_SIMPLE_RE = new RegExp(_CSS_SIMPLE, 'y');
+
+/** The whitespace a combinator may be built from. Spelled out for the same cross-repo reason
+ *  as the identifier classes: an explicit set means the same thing on both sides. */
+const _CSS_SPACE = ' \t\n\r\f\v';
+
+/** Linear-time recogniser for the selector allowlist: compounds (one or more simple selectors
+ *  written back to back) separated by a descendant (whitespace) or child (`>`) combinator.
+ *
+ *  The obvious single regex — `(?:…|tag)+(?:(?:\s*>\s*|\s+)(?:…|tag)+)*` — is a nested
+ *  quantifier over an alternation whose last branch matches a bare run of letters, and V8
+ *  backtracks catastrophically on it: measured 66 ms at 20 characters, 1.76 s at 24, 47.2 s at
+ *  28. The `SMOKE_SELECTOR_MAX` cap does not bound that at all. Greedy consumption without
+ *  backtracking is sound here because the four branches have DISJOINT first characters
+ *  (`[`, `#`, `.`, a letter) and a shorter match of any branch can only be followed by another
+ *  match of the same branch. Every iteration advances at least one character. */
+function scanCssSelector(text) {
+  let pos = 0;
+  const end = text.length;
+  for (;;) {
+    let simples = 0;
+    while (pos < end) {
+      _CSS_SIMPLE_RE.lastIndex = pos;
+      const m = _CSS_SIMPLE_RE.exec(text);
+      if (!m) break;
+      pos = _CSS_SIMPLE_RE.lastIndex;
+      simples++;
     }
-  } catch { /* fail-soft: no/garbled spec -> heuristic */ }
-  return null;
+    if (!simples) return false;          // a character the allowlist does not admit
+    if (pos >= end) return true;
+    const combinatorStart = pos;
+    while (pos < end && _CSS_SPACE.includes(text[pos])) pos++;
+    if (pos < end && text[pos] === '>') {
+      pos++;
+      while (pos < end && _CSS_SPACE.includes(text[pos])) pos++;
+    }
+    if (pos === combinatorStart) return false;  // compound ended on an inadmissible character
+    if (pos >= end) return false;               // a trailing combinator names no second compound
+  }
+}
+
+/** True iff `selector` is a CSS selector the smoke contract may carry. DENY-BY-DEFAULT: a
+ *  selector list (comma), a pseudo-class, functional notation, an over-long string or a
+ *  non-string is refused. This is a trust boundary — the value ends up in the page's own
+ *  `document.querySelector` — so it is validated here even though the writer validated it too.
+ *  The length cap is a SIZE bound, not a time bound: the scan is linear, so a rejection costs
+ *  the same as an acceptance and no input can wedge the capture. */
+export function isValidSmokeSelector(selector) {
+  if (typeof selector !== 'string') return false;
+  const s = selector.trim();
+  if (!s || s.length > SMOKE_SELECTOR_MAX) return false;
+  return scanCssSelector(s);
+}
+
+/** One-line, control-stripped label for the findings text. Empty when unusable. */
+function smokeLabel(raw) {
+  return typeof raw === 'string' ? cleanText(raw, 80) : '';
+}
+
+/** Read the DECLARED behavior spec from <app-dir>/blarai-smoke.json.
+ *
+ *  ALWAYS returns `{spec, status}` — never a bare null — because the CALLER must be able to
+ *  tell "no contract was declared" from "a contract was declared and I could not use it".
+ *  Collapsing those two into a null is exactly how the declared arm stayed invisible for as
+ *  long as it did. `spec` is null unless BOTH selectors clear `isValidSmokeSelector`;
+ *  validate-don't-repair, so a half-valid spec is refused whole. */
+export function readSmokeSpec(appDir) {
+  if (!appDir) return { spec: null, status: SMOKE_NOT_DECLARED };
+  const p = path.join(appDir, 'blarai-smoke.json');
+  let raw;
+  try {
+    if (!fs.existsSync(p)) return { spec: null, status: SMOKE_NOT_DECLARED };
+    raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return { spec: null, status: SMOKE_UNREADABLE };   // present but broken: NOT the same as absent
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { spec: null, status: SMOKE_UNREADABLE };
+  const click = typeof raw.click === 'string' ? raw.click.trim() : '';
+  const expectDelta = typeof raw.expectDelta === 'string' ? raw.expectDelta.trim() : '';
+  if (!isValidSmokeSelector(click) || !isValidSmokeSelector(expectDelta)) {
+    return { spec: null, status: SMOKE_INVALID };
+  }
+  return {
+    spec: {
+      click,
+      expectDelta,
+      actionLabel: smokeLabel(raw.actionLabel) || 'the main control',
+      resultLabel: smokeLabel(raw.resultLabel) || 'the result region',
+    },
+    status: SMOKE_DECLARED,   // read, not yet exercised — the verdict comes from evaluateBehavior
+  };
 }
 
 function writeSidecar(sidecarPath, obj) {
@@ -380,7 +547,8 @@ async function run() {
     process.exit(2);
   }
 
-  const spec = readSmokeSpec(appDir);
+  const smokeRead = readSmokeSpec(appDir);
+  const spec = smokeRead.spec;
   const edge = findEdge(typeof args.edge === 'string' ? args.edge : '');
   const port = Number(args['debug-port']) || (await freePort());
   const profile = (typeof args['profile-dir'] === 'string' && args['profile-dir'])
@@ -480,7 +648,9 @@ async function run() {
     await sleep(settleMs); // let deferred module JS run + async console/exception fire
 
     // ---- H9 behavior smoke: snapshot -> click primary action -> snapshot -> evaluate delta ----
-    let behavior = { ran: false, ok: true, changed: false, reason: '' };
+    // Both the initial value and the catch below carry status UNAVAILABLE, never a passing one: a
+    // smoke that did not reach a verdict must not be readable as one that did.
+    let behavior = { ran: false, ok: true, changed: false, status: SMOKE_UNAVAILABLE, reason: '' };
     let textScan = { hasUndefined: false, hasNaN: false, samples: [] };
     try {
       const before = await evalJson(cdp, snapshotJs(spec && spec.expectDelta));
@@ -490,7 +660,8 @@ async function run() {
       textScan = scanRenderedText((after && after.innerText) || (before && before.innerText) || '');
       behavior = evaluateBehavior(before, after, spec, click);
     } catch (e) {
-      behavior = { ran: false, ok: true, changed: false, reason: 'behavior smoke skipped: ' + cleanText(String(e), 120) };
+      behavior = { ran: false, ok: true, changed: false, status: SMOKE_UNAVAILABLE,
+        reason: 'behavior smoke skipped: ' + cleanText(String(e), 120) };
     }
 
     // ---- screenshot via CDP (same session, same render the console came from) ----
@@ -510,6 +681,30 @@ async function run() {
     const notes = (!behaviorHard && behavior.ran && !behavior.ok && behavior.reason)
       ? [cleanText(`Behavior note (heuristic, not enforced): ${behavior.reason}`, 400)] : [];
     const hard = computeHard(consoleEntries, pageErrors, textScan, behaviorHard);
+    // The declared-spec honesty record. `measured` answers the only question a reader of a
+    // green report actually needs — did the DECLARED behavior get exercised, or did the run
+    // simply not have a contract to exercise? Those are different facts and this is the one
+    // place that keeps them apart. `status` is the finer reading (see the SMOKE_* constants);
+    // when the read succeeded, the BEHAVIOR's own status wins, because a contract can be
+    // perfectly readable and still name hooks the delivery never grew.
+    const smoke = {
+      declared: specDeclared,
+      measured: specDeclared && behavior.ran && behavior.status === SMOKE_HONOURED,
+      status: spec ? (behavior.status || SMOKE_UNAVAILABLE) : smokeRead.status,
+      click: spec ? spec.click : '',
+      expectDelta: spec ? spec.expectDelta : '',
+      actionLabel: spec ? spec.actionLabel : '',
+      resultLabel: spec ? spec.resultLabel : '',
+    };
+    // A contract that was PRESENT and could not be read/validated is a writer defect, and the
+    // capture must say so out loud rather than quietly running the heuristic — a silent
+    // degrade here is indistinguishable from a product that simply had no contract.
+    if (!spec && smokeRead.status !== SMOKE_NOT_DECLARED) {
+      notes.push(cleanText(
+        `Behavior contract present but not usable (${smokeRead.status}): blarai-smoke.json could not `
+        + `be read or its selectors failed validation, so the declared check did NOT run and this `
+        + `capture fell back to the heuristic.`, 400));
+    }
     writeSidecar(sidecarPath, {
       captured: true,
       hard,
@@ -521,6 +716,7 @@ async function run() {
       behavior,
       specDeclared,
       behaviorHard,
+      smoke,
       findings,
       notes,
     });
