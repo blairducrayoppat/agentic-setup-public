@@ -36,7 +36,7 @@ $repos = @(
 $fixedSecrets = @()
 $vp = [Environment]::GetEnvironmentVariable('VIKUNJA_PASS', 'User')
 if ($vp -and $vp -ne '${VIKUNJA_PASS}') { $fixedSecrets += $vp }
-$regexes = @(
+$builtinRegexes = @(
     'sk-ant-[A-Za-z0-9_\-]{10,}',
     'ghp_[A-Za-z0-9]{20,}', 'github_pat_[A-Za-z0-9_]{20,}', 'hf_[A-Za-z0-9]{20,}'
 )
@@ -46,7 +46,34 @@ if (-not (Test-Path $privatePatterns)) {
     Write-Host "Refusing to publish anything without the full gate (fail-closed)." -ForegroundColor Red
     exit 2
 }
-$regexes += @(Get-Content $privatePatterns | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+$topicRegexes = @(Get-Content $privatePatterns | Where-Object { $_ -and $_ -notmatch '^\s*#' })
+
+# --- hash-pinned allowlist (Vikunja #1104) ---
+# Clears ONE blob at ONE path in ONE repo from the PRIVATE-TOPIC regexes only -
+# never from $fixedSecrets or $builtinRegexes, which stay unconditional (a
+# real secret shape is never "reviewed clean", only rotated or removed). Any
+# edit to a cleared file changes its blob hash and re-trips the gate; clearance
+# never survives a content change. Two provenances:
+#   - P5-verdict.md / promptfoo_injection_corpus.json: reviewed 2026-07-24,
+#     generic-word matches confirmed not to reference any real private
+#     identifier (Vikunja #1104 comment 2541).
+#   - nist_ai_rmf_playbook.json: reviewed 2026-08-09, same generic-word class
+#     (a standard AI-risk-framework mention of ordinary human-factors terms).
+#   - docs/DECISION_REGISTER.md / docs/archive/journal/2026-07.md: the LA
+#     reviewed the exact flagged references in these two files verbatim and
+#     cleared them for publication (see DEC-12 in docs/DECISION_REGISTER.md,
+#     Vikunja #1104 comment 2959, 2026-08-08). This clears only what was
+#     actually reviewed there - NOT a blanket future clearance, and the
+#     underlying guard pattern stays fully live for anything not yet
+#     reviewed, including the other private topics this same pattern file
+#     guards.
+$allowlist = @(
+    @{ Repo = 'blarai'; Path = 'docs/research/publication-program/novelty-survey/P5-verdict.md'; Blob = 'b2ca0ff0128b9874e4026246e1ad051ca17c8c8a' }
+    @{ Repo = 'blarai'; Path = 'evals/fixtures/injection_corpus/promptfoo_injection_corpus.json'; Blob = 'a2bd5de1ecb44f10c08a699e82d48410fd2da72c' }
+    @{ Repo = 'blarai'; Path = 'docs/governance/nist_ai_rmf_playbook.json'; Blob = '3804556942b25c0034c86465b40ebd894f03f017' }
+    @{ Repo = 'blarai'; Path = 'docs/DECISION_REGISTER.md'; Blob = '30d19319300e76e875b2d5478401334711e9071a' }
+    @{ Repo = 'blarai'; Path = 'docs/archive/journal/2026-07.md'; Blob = '68652e1a6a4c0f09799258b9010af2e17bb506a3' }
+)
 
 $fail = 0
 foreach ($r in $repos) {
@@ -58,8 +85,20 @@ foreach ($r in $repos) {
 
         # --- leak-gate: scan the exact tree being published ---
         $hits = @()
-        foreach ($s in $fixedSecrets) { $h = git grep -l -F $s $tree 2>$null; if ($h) { $hits += "secret-value -> $($h -join ',')" } }
-        foreach ($rx in $regexes)     { $h = git grep -l -E $rx $tree 2>$null; if ($h) { $hits += "$rx -> $(($h | Select-Object -First 3) -join ',')" } }
+        foreach ($s in $fixedSecrets)  { $h = git grep -l -F $s $tree 2>$null; if ($h) { $hits += "secret-value -> $($h -join ',')" } }
+        foreach ($rx in $builtinRegexes) { $h = git grep -l -E $rx $tree 2>$null; if ($h) { $hits += "$rx -> $(($h | Select-Object -First 3) -join ',')" } }
+        foreach ($rx in $topicRegexes) {
+            $matches = git grep -l -E $rx $tree 2>$null
+            if (-not $matches) { continue }
+            $realHits = @()
+            foreach ($m in $matches) {
+                $path = $m.Substring($m.IndexOf(':') + 1)
+                $blob = (git rev-parse "${tree}:${path}").Trim()
+                $cleared = $allowlist | Where-Object { $_.Repo -eq $r.Name -and $_.Path -eq $path -and $_.Blob -eq $blob }
+                if (-not $cleared) { $realHits += $path }
+            }
+            if ($realHits) { $hits += "$rx -> $(($realHits | Select-Object -First 3) -join ',')" }
+        }
         if ($hits) {
             Write-Host "[$($r.Name)] LEAK-GATE FAILED — NOT published:" -ForegroundColor Red
             $hits | ForEach-Object { Write-Host "    $_" -ForegroundColor Red }

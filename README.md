@@ -1,5 +1,9 @@
 # agentic-setup — a fully-local coding-agent stack for one Lunar Lake laptop
 
+**&#9654; The BlarAI vision film (66 seconds):**
+
+https://github.com/user-attachments/assets/9ffd473b-93e5-4763-a9ec-e12ac6afa10c
+
 This repository is the **operations layer** for a self-contained, offline-capable AI
 coding system that runs entirely on a single Intel Lunar Lake laptop — no cloud model,
 no API keys, no data leaving the machine. It serves a 30-billion-parameter coder model
@@ -18,6 +22,29 @@ tuned to the one hard constraint that governs the whole design.
 > a parser nothing here uses would churn history for no benefit. Do not add 5.1 to any
 > verify matrix; if a specific file must be 5.1-parseable for an external tool, add a BOM to
 > that one file. (#785 decision (b), 2026-07-10.)
+
+## Recent advancements (as of August 2026)
+
+- **A real review loop for what the fleet builds.** The operator can now open
+  any website the coding fleet produced directly from the run's own review
+  page — the page also hands him his original request back as a line-by-line
+  checklist, flags every link that leads nowhere before he has to click it
+  himself, and surfaces media/placement findings (repeated images, missing
+  per-item assets) next to the build. The first time this loop was used for
+  real, it surfaced three defects that every automated grading pass had
+  missed — the fastest of them found by a person clicking one link.
+- **Guards now measure over an interval, not a single sample.** Several checks
+  that gate whether a resource is safe to reclaim were found asking what is
+  functionally an interval question — "has anything happened recently?" — but
+  sampling only a single instant, which cannot tell a healthy pause from a
+  stall. Fixed across the run guards that make that call.
+- **The overnight fleet fails loud, never silent** (carried forward from
+  July): a failed git capture is surfaced as an errored task with git's own
+  message, never silently misreported as empty output; a genuine no-op is
+  recognized as success rather than retried against an impossible diff;
+  new-project scaffolding is language-neutral and backed by a hundred-plus
+  locked assertions; a crash in a run's postlude can no longer strand the
+  resident model in the shared ~31 GB pool.
 
 ## The one constraint everything follows from
 
