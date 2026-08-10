@@ -16,21 +16,35 @@
           "tool_call": true,
           "reasoning": false,
           "temperature": true,
-          "limit": { "context": 65536, "output": 16384 }
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
         },
         "qwen3-14b": {
           "name": "Qwen3-14B INT4 — everyday/fleet tier",
           "tool_call": true,
           "reasoning": true,
           "temperature": true,
-          "limit": { "context": 32768, "output": 8192 }
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
         },
         "qwen3-vl-8b": {
           "name": "Qwen3-VL-8B INT4 — vision/screenshots",
           "tool_call": false,
           "attachment": true,
-          "modalities": { "input": ["text", "image"] },
-          "limit": { "context": 16384, "output": 4096 }
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ]
+          },
+          "limit": {
+            "context": 16384,
+            "output": 4096
+          }
         }
       }
     }
@@ -194,6 +208,29 @@
       "kill *": "ask",
       "*kill-port*": "ask",
       "format *": "deny",
+      "npm start*": "deny",
+      "npm run start*": "deny",
+      "npm run dev*": "deny",
+      "npm run serve*": "deny",
+      "npm run watch*": "deny",
+      "yarn start*": "deny",
+      "yarn dev*": "deny",
+      "pnpm start*": "deny",
+      "pnpm dev*": "deny",
+      "node server.js*": "deny",
+      "node src/server.js*": "deny",
+      "node app.js*": "deny",
+      "node src/app.js*": "deny",
+      "node index.js*": "deny",
+      "node src/index.js*": "deny",
+      "npx serve*": "deny",
+      "serve *": "deny",
+      "http-server*": "deny",
+      "python -m http.server*": "deny",
+      "python3 -m http.server*": "deny",
+      "vite*": "deny",
+      "next dev*": "deny",
+      "nodemon*": "deny",
       "curl*": "ask",
       "wget*": "ask",
       "Invoke-WebRequest*": "ask",
@@ -239,7 +276,16 @@
   "mcp": {
     "browser": {
       "type": "local",
-      "command": ["cmd", "/c", "playwright-mcp", "--browser", "msedge", "--headless", "--isolated", "--allow-unrestricted-file-access"],
+      "command": [
+        "cmd",
+        "/c",
+        "playwright-mcp",
+        "--browser",
+        "msedge",
+        "--headless",
+        "--isolated",
+        "--allow-unrestricted-file-access"
+      ],
       "enabled": true
     }
   },
@@ -258,7 +304,13 @@
     "max_bytes": 32768
   },
   "agent": {
-    "build": { "temperature": 0.7, "top_p": 0.8 },
-    "plan": { "temperature": 0.7, "top_p": 0.8 }
+    "build": {
+      "temperature": 0.7,
+      "top_p": 0.8
+    },
+    "plan": {
+      "temperature": 0.7,
+      "top_p": 0.8
+    }
   }
 }

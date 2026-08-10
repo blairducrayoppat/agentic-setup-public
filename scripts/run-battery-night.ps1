@@ -1414,7 +1414,33 @@ foreach ($j in $jobs) {
             if ($txt -match [regex]::Escape($repoPath)) {
                 $starts = ([regex]::Matches($txt, 'TASK-START')).Count
                 $ends   = ([regex]::Matches($txt, 'TASK-END')).Count
-                if ($starts -gt $ends) { $liveOwner = $rd.Name; break }
+                if ($starts -gt $ends) {
+                    # UNBALANCED IS NOT THE SAME AS LIVE (#1360, 2026-08-09).
+                    # A run KILLED mid-task -- budget elapsed, tree-kill, doom stop --
+                    # never writes its final TASK-END, so its journal stays unbalanced
+                    # FOREVER and this lock blocks every later run on that repo until a
+                    # human intervenes. Measured: run 20260809-154357-bd was killed at
+                    # 10,901 s with 4 TASK-START / 3 TASK-END, and the next battery stood
+                    # down 42 s after launch. It would have done so every night after.
+                    #
+                    # The swap driver's OWN account is the independent evidence. Restoring
+                    # the 14B is its LAST act, written to swap-progress.log after the 30B
+                    # is stopped. A run that got that far is over, whatever its journal
+                    # balance says -- and reading the run's own terminal record keeps this
+                    # lock independent of LOCK 1's process check, which is the point of
+                    # having two.
+                    $sp = Join-Path $rd.FullName 'swap-progress.log'
+                    $spTxt = ''
+                    if (Test-Path $sp) { $spTxt = Get-Content $sp -Raw -ErrorAction SilentlyContinue }
+                    if ($spTxt -and ($spTxt -match '14B is back')) {
+                        Write-Log ("archive guard: run $($rd.Name) has an unbalanced journal " +
+                                   "($starts TASK-START / $ends TASK-END) but its swap-back " +
+                                   "COMPLETED, so it is FINISHED, not live -- killed mid-task " +
+                                   "and never wrote its last TASK-END. Not blocking.")
+                        continue
+                    }
+                    $liveOwner = $rd.Name; break
+                }
             }
         }
     }
