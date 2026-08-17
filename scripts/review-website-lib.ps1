@@ -287,6 +287,10 @@ function New-OperatorReviewRecord {
 
     $checklist = [ordered]@{}
     $mdChecklist = @()
+    # Initialised HERE, not inside the `Found` branch, because the escaped-defect counter below
+    # reads it on every path — including the no-checklist path, where the branch never runs.
+    # StrictMode turns that into a throw rather than an empty loop (caught 2026-08-14).
+    $rows = @()
 
     if ($Clauses -and $Clauses.Found) {
         $rows   = @()
@@ -359,12 +363,91 @@ function New-OperatorReviewRecord {
         )
     }
 
+    # ---- ESCAPED DEFECTS (DoD capability 12) ---------------------------------------------------
+    # An escaped defect is a defect the GATES PASSED and a human then found. Capability 12 wants
+    # them counted against the gate that missed them, so a false-negative RATE becomes a published
+    # number rather than an adjective.
+    #
+    # It is derivable from what this record already collects, and that is the whole trick: a clause
+    # HE marked `not-met` on a build the pipeline banded GREEN is, by definition, something the
+    # gates passed and he did not. No new question, no extra keystroke — the marks are already
+    # taken, they were simply never counted.
+    #
+    # THREE HONESTY RULES, all of which are the reason this block is longer than its arithmetic:
+    #
+    #   1. NOT-MEASURED IS NOT ZERO. Without a checklist there are no marks, and without a verdict
+    #      we cannot say the gates passed anything. Either case sets `measured=false` and leaves
+    #      `count` null — never 0. A zero here would read as "the gates missed nothing", which is
+    #      the exact #1342 lie this loop exists to stop, told about the loop itself.
+    #   2. ONLY `not-met` COUNTS. `could-not-tell` is not a defect, and `not-reviewed` is a clause
+    #      he never reached. Folding either into the count would manufacture escapes out of his
+    #      silence.
+    #   3. THIS COUNT IS A FLOOR AND SAYS SO. Measured 2026-08-14: of the defects known to have
+    #      escaped the gates, #1367 (`/` served the scaffold stub past four gates), #1370 and #1375
+    #      all reached the system through CONVERSATION, and not one appears in any review record.
+    #      A counter that reads only this file will under-report for as long as that is true, so it
+    #      states its own scope instead of implying completeness.
+    $escapedClauses = @()
+    $verdictAtReview = $(if ($Claims) { [string]$Claims.Verdict } else { '' })
+    $escapedMeasured = $false
+    $escapedReason   = ''
+    # Clauses he actually REACHED (any answer, including "could not tell"), and the subset he gave
+    # a DEFINITIVE answer on. Both are counted from the marks, never from the checklist's length.
+    $reviewedCount   = 0
+    $decidedCount    = 0
+    foreach ($r in @($rows)) {
+        $m = [string]$r.mark
+        if ($m -eq $script:MarkMet -or $m -eq $script:MarkNotMet) { $decidedCount++; $reviewedCount++ }
+        elseif ($m -eq $script:MarkCouldNotTell) { $reviewedCount++ }
+    }
+    if (-not ($Clauses -and $Clauses.Found)) {
+        $escapedReason = 'No checklist was available for this review, so no clause could be marked and nothing can be counted. This is not a count of zero.'
+    } elseif (-not $verdictAtReview) {
+        $escapedReason = 'The run recorded no verdict, so "the gates passed it" cannot be established. A defect is only ESCAPED relative to a gate that let it through. This is not a count of zero.'
+    } elseif ($reviewedCount -eq 0) {
+        # THE THIRD REFUSAL, added 2026-08-14 after an independent review broke the first version.
+        # A checklist can LOAD and be answered zero times: `review-website.ps1:233` breaks out of the
+        # clause loop on `q` BEFORE the first mark is recorded, and the free-text prompt afterwards
+        # still writes a record. Every clause then defaults to `not-reviewed`, none is `not-met`, and
+        # the old code reported `measured=true, count=0` — rendered as "None found." He had reviewed
+        # NOTHING. That is this file's own stated failure class ("a review abandoned after two
+        # clauses must not read afterwards as nine considered answers") committed one level down,
+        # inside the block written to prevent it.
+        $escapedReason = 'A checklist was loaded but he answered none of it, so there is no ground truth to compare the gates against. This is not a count of zero.'
+    } else {
+        $escapedMeasured = $true
+        foreach ($r in @($rows)) {
+            if ([string]$r.mark -eq $script:MarkNotMet) {
+                $escapedClauses += [ordered]@{ id = $r.id; text = $r.text; words = $r.words }
+            }
+        }
+    }
+    $escaped = [ordered]@{
+        measured          = $escapedMeasured
+        reason            = $escapedReason
+        verdict_at_review = $verdictAtReview
+        count             = $(if ($escapedMeasured) { @($escapedClauses).Count } else { $null })
+        # DENOMINATOR = clauses he DECIDED, not clauses the file contains. Using the full clause
+        # count silently treats every un-reviewed clause as a confirmed non-escape, which puts
+        # unmeasured items on the "everything is fine" side of the ratio — the #1231 family's move,
+        # arriving through a wrong-population choice instead of a self-referential sum. A clause he
+        # never reached carries no ground truth: the gate may have been right about it or wrong, and
+        # nobody knows.
+        denominator       = $(if ($escapedMeasured) { $decidedCount } else { $null })
+        reviewed          = $(if ($escapedMeasured) { $reviewedCount } else { $null })
+        clauses_total     = $(if ($Clauses -and $Clauses.Found) { @($Clauses.Clauses).Count } else { $null })
+        clauses           = @($escapedClauses)
+        scope_note        = 'FLOOR, not a total. Counts only clauses HE marked not-met on this build, out of the clauses he gave a definitive answer on (`denominator`); `reviewed` counts those he reached at all and `clauses_total` the checklist length, so partial coverage is visible rather than flattering. Defects reported in conversation rather than through this tool are not visible here and are known to exist (#1367, #1370, #1375).'
+    }
+
     $record = [ordered]@{
-        # v2 = v1 + `checklist`. Bumped rather than silently widened so a reader can tell a review
-        # taken BEFORE the checklist existed (v1, no marks recorded) from one where the checklist
-        # was offered and came back empty. Those are different facts about the review.
-        schema       = 'operator-website-review/v2'
-        schema_note  = 'v2 adds `checklist`. A v1 record predates the checklist and carries no marks; absence of marks in a v1 record is not evidence about the site.'
+        # v3 = v2 + `escaped_defects`. Bumped rather than silently widened so a reader can tell a
+        # review taken BEFORE the counter existed from one where it ran and found nothing.
+        # v2 = v1 + `checklist`, for the same reason: a review taken BEFORE the checklist existed
+        # (v1, no marks recorded) is a different fact from one where the checklist was offered and
+        # came back empty.
+        schema       = 'operator-website-review/v3'
+        schema_note  = 'v3 adds `escaped_defects` (clauses he marked not-met on a build the gates banded — a FLOOR, see its scope_note). v2 added `checklist`. A v1 record predates both; absence of marks in a v1 record is not evidence about the site.'
         recorded_at  = (Get-Date).ToString('o')
         build_name   = $Build.Name
         build_path   = $Build.Path
@@ -375,6 +458,7 @@ function New-OperatorReviewRecord {
         pages        = @($Pages)
         skipped_tasks = @(if ($Claims) { @($Claims.Skipped) | ForEach-Object { $_.Id } })
         checklist    = $checklist
+        escaped_defects = $escaped
         operator_feedback = @($Feedback)
     }
 
@@ -387,6 +471,28 @@ function New-OperatorReviewRecord {
         "- **Build:** $($Build.Path)",
         ''
     ) + $mdChecklist + @(
+        '## What the gates missed',
+        ''
+    ) + $(
+        if (-not $escaped.measured) {
+            @("**Not measured.** $($escaped.reason)", '')
+        } elseif ($escaped.count -eq 0) {
+            @(("**None found in what he checked.** He gave a definitive answer on " +
+               "$($escaped.denominator) of $($escaped.clauses_total) clause(s) and marked none of " +
+               "them not-met, on a build the system banded ``$($escaped.verdict_at_review)``. " +
+               'The coverage figure is stated because "none found" over three clauses and over ' +
+               'nine are different facts. This counts only what he marked here; anything he ' +
+               'reported in conversation is not visible to this count.'), '')
+        } else {
+            @(("**$($escaped.count) of $($escaped.denominator) clauses he DECIDED were marked NOT MET " +
+               "(he reached $($escaped.reviewed) of $($escaped.clauses_total)), on a build " +
+               "the system banded ``$($escaped.verdict_at_review)``.** Each one is a defect every " +
+               'gate passed and he did not:'), '') +
+            (@($escaped.clauses) | ForEach-Object {
+                if ($_.words) { "- **$($_.text)** — his words: $($_.words)" } else { "- **$($_.text)**" }
+            }) + @('', '_A floor, not a total: defects reported outside this tool are not counted._', '')
+        }
+    ) + @(
         '## What he said',
         ''
     ) + $(if (@($Feedback).Count -gt 0) { @($Feedback) | ForEach-Object { "> $_" } }
@@ -752,3 +858,5 @@ function Invoke-MediaLint {
     }
     return [pscustomobject]$out
 }
+
+

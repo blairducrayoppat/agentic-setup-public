@@ -189,7 +189,7 @@ if ($hasPy) {
             $mutRun = Invoke-WithTimeout -CommandLine 'uv run --no-project --with mutmut --with pytest mutmut run pytest' -WorkDir $Path -TimeoutSec 150
             $mutRes = Invoke-WithTimeout -CommandLine 'uv run --no-project --with mutmut mutmut results'                  -WorkDir $Path -TimeoutSec 30
             $mutParsed = ConvertFrom-MutmutOutput -Output ($mutRun.Output + "`n" + $mutRes.Output) -TimedOut $mutRun.TimedOut
-            $mutNote   = Get-MutationSignalNote -Survived $mutParsed.Survived -Total $mutParsed.Total -TimedOut $mutParsed.Sampled
+            $mutNote   = Get-MutationSignalNote -Survived $mutParsed.Survived -Total $mutParsed.Total -TimedOut $mutParsed.Sampled -TotalKnown ([bool]$mutParsed.TotalKnown)
             Add-Result 'py:mutation' 'pass' $mutRun.Seconds $mutNote
         }
     }

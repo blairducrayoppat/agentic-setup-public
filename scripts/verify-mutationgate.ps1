@@ -180,6 +180,70 @@ Assert-True ([regex]::IsMatch($vp, "Invoke-GateCheck 'py:test'")) `
 Assert-True ([regex]::IsMatch($vp, "Add-Result 'py:mutation' 'skip'")) `
     'W11 [kill] py:mutation has a skip path (no tests or source -> skip, never error)'
 
+
+# ---------------------------------------------------------------------------
+# #1393 -- a known numerator must survive a missing denominator.
+#
+# Get-MutationSignalNote tested $Total first and returned "no mutants measured"
+# while $Survived already held a real count. ConvertFrom-MutmutOutput matches
+# survivors and totals with SEPARATE, INDEPENDENT regex passes, so "Survived: 3"
+# -- a genuine mutmut 2.x label carrying no total on the same line -- parses to
+# Survived=3 Total=0 and published as the one phrase meaning the opposite of
+# what was found. Proved by executing the extracted functions, not by reading.
+# ---------------------------------------------------------------------------
+
+Section '#1393 -- an orphaned survivor count is never discarded'
+
+# M1: THE DEFECT. A real survivor count with no parsable total must still report the survivors.
+$n = Get-MutationSignalNote -Survived 3 -Total 0
+Assert-Contains    $n '3'                    'M1 [kill] survivors known, total unknown -> the COUNT survives'
+Assert-NotContains $n 'no mutants measured'  'M2 [kill] 3 survivors must never publish as "no mutants measured"'
+Assert-Contains    $n 'weak tests'           'M3 [kill] it still reads as the weak-test signal the reviewer acts on'
+
+# M4: THE TOGGLE. Genuinely nothing measured must STILL say so -- otherwise M2 would pass on a
+# function that had simply deleted the "no mutants measured" phrase entirely.
+$n = Get-MutationSignalNote -Survived 0 -Total 0
+Assert-Contains $n 'no mutants measured'     'M4 [kill] nothing measured STILL says nothing was measured'
+
+# M5: the end-to-end path, driven through the parser rather than hand-built arguments -- the
+# defect lived in the SEAM between the two functions, not in either one alone.
+$p = ConvertFrom-MutmutOutput -Output 'Survived: 3'
+Assert-True ($p.Survived -eq 3 -and $p.Total -eq 0) 'M5 [kill] the parser really does orphan the count on this input'
+$n = Get-MutationSignalNote -Survived $p.Survived -Total $p.Total
+Assert-NotContains $n 'no mutants measured'  'M6 [kill] end-to-end: parser + note never lose a real survivor count'
+
+# M7: a complete run is untouched by the fix.
+$n = Get-MutationSignalNote -Survived 2 -Total 10
+Assert-Contains $n '2 of 10'                 'M7 [kill] a complete run still reports N of M'
+
+
+Section '#1393 item 1 -- Total=0 stops being a sentinel doing two jobs'
+
+# M8: a MEASURED zero. mutmut ran and had nothing to mutate -- that is a real result and must
+# not borrow the words of a run whose total could not be parsed.
+$p = ConvertFrom-MutmutOutput -Output 'Killed: 0 of 0'
+Assert-True ([bool]$p.TotalKnown) 'M8 [kill] "Killed: 0 of 0" is a KNOWN total, not an unparsed one'
+$n = Get-MutationSignalNote -Survived $p.Survived -Total $p.Total -TotalKnown ([bool]$p.TotalKnown)
+Assert-Contains    $n 'ZERO mutants'         'M9 [kill] a measured zero says it measured zero'
+Assert-NotContains $n 'no mutants measured'  'M10 [kill] a measured zero never borrows the unparsed phrase'
+
+# M11: THE TOGGLE. Nothing parsed must still be TotalKnown=False, or M8 proves nothing.
+$p = ConvertFrom-MutmutOutput -Output 'mutmut could not start'
+Assert-True (-not [bool]$p.TotalKnown) 'M11 [kill] an unparsed run reports TotalKnown=False'
+
+# M12: a normal run is unchanged.
+$p = ConvertFrom-MutmutOutput -Output 'Killed: 8 of 10'
+Assert-True ([bool]$p.TotalKnown -and $p.Total -eq 10) 'M12 [kill] a normal run still parses its total'
+
+# M13: NO CONTROL CHARACTERS IN THE LIBRARY. This exists because I broke it: writing these
+# regexes through a heredoc turned every  word boundary into a literal backspace (0x08), so
+# the M8 predicate could never match and the branch above was dead code that still passed the
+# suite. A regex silently emptied of its anchors is unreadable at a glance and invisible in a
+# diff; a byte check is not.
+$libRaw = Get-Content (Join-Path $PSScriptRoot 'fleet-lib.ps1') -Raw
+$ctrl = [regex]::Matches($libRaw, '[ --]')
+Assert-True ($ctrl.Count -eq 0) ("M14 [kill] fleet-lib.ps1 carries no stray control characters (found {0})" -f $ctrl.Count)
+
 # ===========================================================================
 Section 'Result'
 Write-Host ("  Passed:  {0}" -f $script:Pass) -ForegroundColor Green

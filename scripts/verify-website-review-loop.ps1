@@ -401,13 +401,58 @@ try {
                                 -Clauses $null -Links $null -Exam $null -Media $evil | Out-Null
         (Get-Content -LiteralPath $rm5 -Raw) -notmatch '<script>alert'
     }
-    Check 'the REAL picture grader finds the REAL repeated photograph' {
-        $rb = @(Get-WebsiteBuilds) | Where-Object { $_.Name -like '*b9-pottery*' } | Select-Object -First 1
-        if (-not $rb) { $true }
-        else {
-            $r = Invoke-MediaLint -SitePath $rb.Path
-            $r.Measured -and (@($r.Findings | Where-Object { $_.severity -eq 'high' }).Count -ge 1)
-        }
+    # THE SIBLING OF THE LINK-CHECKER FIX, and it was missed by the fix that named the problem.
+    # `aa2a949` rebuilt the link check hermetically because it pinned its subject to
+    # `Get-WebsiteBuilds | Select -First 1` — the LIVE `~/projects` sandbox, which every dispatch
+    # archives and recreates. This check, one function away, had the identical shape and the
+    # identical fail-open (`if (-not $rb) { $true }` passes VACUOUSLY when no B9 build happens to
+    # be sitting there). `git diff f05b951 aa2a949` touches zero MediaLint lines.
+    #
+    # That is lesson 342 — sweep for siblings — and it was cited in a commit on this repo the same
+    # afternoon (`2238a1d`, "the web-static hint had the identical defect"). Applied there, not
+    # applied here, hours apart. A fix that names its own class and does not grep for it is half a
+    # fix.
+    #
+    # The tree is BUILT HERE. Three items sharing one photograph crosses the grader's own
+    # REPEAT_THRESHOLD of 3 and must produce a HIGH finding.
+    $medTree = Join-Path $tmp 'media-tree'
+    New-Item -ItemType Directory -Force -Path (Join-Path $medTree 'public\assets') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $medTree 'data') | Out-Null
+    foreach ($img in @('mug.png', 'bowl.png')) {
+        [System.IO.File]::WriteAllBytes((Join-Path $medTree "public\assets\$img"), [byte[]](1..64))
+    }
+    Set-Content -LiteralPath (Join-Path $medTree 'public\index.html') -Encoding utf8 -Value @'
+<!doctype html><html><body><img src="assets/mug.png"><img src="assets/bowl.png"></body></html>
+'@
+    $medRepeated = @(
+        @{ id = 1; name = 'Classic Mug';  description = 'a mug';  category = 'mug';  price = 25; image = 'assets/mug.png' }
+        @{ id = 2; name = 'Garden Mug';   description = 'a mug';  category = 'mug';  price = 30; image = 'assets/mug.png' }
+        @{ id = 3; name = 'Travel Mug';   description = 'a mug';  category = 'mug';  price = 28; image = 'assets/mug.png' }
+        @{ id = 4; name = 'Rustic Bowl';  description = 'a bowl'; category = 'bowl'; price = 35; image = 'assets/bowl.png' }
+    )
+    Set-Content -LiteralPath (Join-Path $medTree 'data\pieces.json') -Encoding utf8 `
+                -Value ($medRepeated | ConvertTo-Json -Depth 4)
+
+    Check 'the REAL picture grader finds a real repeated photograph in a real tree' {
+        $r = Invoke-MediaLint -SitePath $medTree
+        $r.Measured -and (@($r.Findings | Where-Object { $_.severity -eq 'high' }).Count -ge 1)
+    }
+    # The toggle. Without it, a grader that cried "repeated" at every gallery would pass the
+    # check above and read as a working instrument: "found the repetition" and "always says
+    # repetition" are the same green. Giving each piece its own picture is the only difference.
+    Check 'and the SAME tree reads clean once every piece has its own picture' {
+        [System.IO.File]::WriteAllBytes((Join-Path $medTree 'public\assets\vase.png'), [byte[]](1..64))
+        [System.IO.File]::WriteAllBytes((Join-Path $medTree 'public\assets\cup.png'), [byte[]](1..64))
+        $distinct = @(
+            @{ id = 1; name = 'Classic Mug'; description = 'a mug';  category = 'mug';  price = 25; image = 'assets/mug.png' }
+            @{ id = 2; name = 'Rustic Bowl'; description = 'a bowl'; category = 'bowl'; price = 35; image = 'assets/bowl.png' }
+            @{ id = 3; name = 'Modern Vase'; description = 'a vase'; category = 'vase'; price = 45; image = 'assets/vase.png' }
+            @{ id = 4; name = 'Tea Cup';     description = 'a cup';  category = 'cup';  price = 20; image = 'assets/cup.png' }
+        )
+        Set-Content -LiteralPath (Join-Path $medTree 'data\pieces.json') -Encoding utf8 `
+                    -Value ($distinct | ConvertTo-Json -Depth 4)
+        $r = Invoke-MediaLint -SitePath $medTree
+        $r.Measured -and (@($r.Findings | Where-Object { $_.severity -eq 'high' }).Count -eq 0)
     }
     Check 'the picture grader refuses a path that does not exist' {
         $r = Invoke-MediaLint -SitePath (Join-Path $tmp 'no-such-site')
@@ -603,15 +648,41 @@ ope\python.exe'
     }
 
     # The REAL module, driven end to end — the fixtures above prove the rendering, this
-    # proves the thing being rendered is produced by the actual checker over a real tree.
-    Check 'the REAL link checker finds the REAL escaped link in the delivered site' {
-        $realBuild = @(Get-WebsiteBuilds) | Where-Object { $_.Name -like '*b9-pottery*' } | Select-Object -First 1
-        if (-not $realBuild) { $true }   # no B9 build on this box: nothing to assert against
-        else {
-            $r = Invoke-LinkLint -SitePath $realBuild.Path
-            $r.Measured -and $r.Broken -ge 1 -and
-            (@($r.Findings) | Where-Object { $_.reference -match 'piece-detail' }).Count -ge 1
-        }
+    # proves the thing being rendered is produced by the actual checker over a real tree
+    # on disk. The tree is BUILT HERE, deliberately.
+    #
+    # This pair replaces a check that pinned its subject to `Get-WebsiteBuilds | Select -First 1`
+    # — which resolves to the LIVE sandbox, a directory every dispatch archives and recreates.
+    # It asserted that the delivered B9 site contains a broken `piece-detail` reference. That is
+    # a fact about a past artifact, not a property of this code, and it went red the moment a
+    # killed run left a different tree in that path (the 08-11 remnant: four pages, no
+    # `piece-detail.html`, nothing broken to find). A regression lock must not be hostage to a
+    # mutable working directory — that evidence belongs in the archive and on #1367/#1375, and
+    # re-deriving it nightly makes the lock measure the sandbox instead of the checker. Same
+    # class as BlarAI's tests/security/test_evidence_is_immutable.py (#1355).
+    $lnkTree = Join-Path $tmp 'real-tree'
+    New-Item -ItemType Directory -Force -Path (Join-Path $lnkTree 'public') | Out-Null
+    Set-Content -LiteralPath (Join-Path $lnkTree 'public\index.html') -Encoding utf8 -Value @'
+<!doctype html><html><body>
+  <a href="pieces.html">Pieces</a>
+  <a href="piece-detail.html">View Details</a>
+</body></html>
+'@
+    Set-Content -LiteralPath (Join-Path $lnkTree 'public\pieces.html') -Encoding utf8 -Value '<!doctype html><html><body>ok</body></html>'
+
+    Check 'the REAL link checker finds a real dead reference in a real tree' {
+        $r = Invoke-LinkLint -SitePath $lnkTree
+        $r.Measured -and $r.Broken -ge 1 -and
+        (@($r.Findings) | Where-Object { $_.reference -match 'piece-detail' }).Count -ge 1
+    }
+    # The toggle. Without it, a checker that reported "broken" unconditionally would pass the
+    # check above and nobody would know: "found the defect" and "always says defect" are the
+    # same green. Building the missing page is the only difference between the two trees.
+    Check 'and reports the SAME tree clean once the missing page exists' {
+        Set-Content -LiteralPath (Join-Path $lnkTree 'public\piece-detail.html') -Encoding utf8 `
+                    -Value '<!doctype html><html><body>detail</body></html>'
+        $r = Invoke-LinkLint -SitePath $lnkTree
+        $r.Measured -and $r.Broken -eq 0
     }
     Check 'the link checker refuses a path that does not exist, and says why' {
         $r = Invoke-LinkLint -SitePath (Join-Path $tmp 'no-such-site')
@@ -679,8 +750,118 @@ ope\python.exe'
         $j.Contains('skipped_tasks') -and $j.Contains('verdict_at_review') -and
         $j.Contains('operator_feedback')
     }
+    # SPLIT 2026-08-14 (lesson 350). This was one check asserting the literal
+    # `operator-website-review/v2`, so a LEGITIMATE schema bump reddened the check whose NAME says
+    # "the schema is bumped" — the assertion defended the version it was written against. The
+    # property and the version now travel separately: a real bump reds only the second one, whose
+    # message says so, while the property keeps guarding.
     Check 'the schema is bumped, so a pre-checklist review is not read as an unanswered one' {
-        $recFull.Json.schema -eq 'operator-website-review/v2'
+        $s = [string]$recFull.Json.schema
+        ($s -match '^operator-website-review/v(\d+)$') -and ([int]$Matches[1] -ge 2)
+    }
+    Check 'the CURRENT schema version is the one this suite was written against' {
+        # Bumping the schema is allowed and expected; bumping it without updating this line is
+        # what must be caught. If you are here after a deliberate bump, move the version and say
+        # in the commit what the new field is.
+        $recFull.Json.schema -eq 'operator-website-review/v3'
+    }
+
+    # ---- escaped defects (DoD capability 12) ----
+    # A defect the GATES PASSED and he then found. Derived from marks already taken: a clause he
+    # marked `not-met` on a build the pipeline banded is, by definition, one they missed.
+    $escapedMarks = @(
+        [pscustomobject]@{ Id='c1'; Mark='not-met'; Words='the View Details button goes to a JSON error' }
+        [pscustomobject]@{ Id='c2'; Mark='met';     Words='' }
+    )
+    $recEsc = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses `
+                                       -Clauses $clausesOk -Marks $escapedMarks -Feedback @()
+
+    Check 'a clause he marked NOT-MET on a banded build is counted as an escaped defect' {
+        $e = $recEsc.Json.escaped_defects
+        $e -and ($e.measured -eq $true) -and ($e.count -eq 1)
+    }
+    Check 'the escaped-defect count carries its denominator, so it can become a RATE' {
+        $e = $recEsc.Json.escaped_defects
+        ($e.denominator -ge $e.count) -and ($e.denominator -eq 2)
+    }
+    Check 'the escaped clauses are NAMED and carry his words, not just counted' {
+        $c = @($recEsc.Json.escaped_defects.clauses)
+        ($c.Count -eq 1) -and [string]$c[0].text -and ($c[0].words -match 'JSON error')
+    }
+    Check 'the band the gates gave is recorded beside the count' {
+        [string]$recEsc.Json.escaped_defects.verdict_at_review
+    }
+    Check 'the count states that it is a FLOOR, not a total' {
+        [string]$recEsc.Json.escaped_defects.scope_note -match 'FLOOR'
+    }
+    Check 'the markdown NAMES what the gates missed, in his words' {
+        ($recEsc.Markdown -match 'What the gates missed') -and
+        ($recEsc.Markdown -match 'JSON error') -and ($recEsc.Markdown -match 'floor, not a total')
+    }
+    # --- the three ways this must refuse to report a zero -------------------------------------
+    Check 'a genuinely clean review reads as NONE FOUND, measured' {
+        $e = $recFull.Json.escaped_defects       # marks: met + could-not-tell, no not-met
+        ($e.measured -eq $true) -and ($e.count -eq 0)
+    }
+    Check 'could-not-tell is NOT counted as an escaped defect' {
+        # $recFull carries a could-not-tell and counts zero — silence is not a defect.
+        @($recFull.Json.escaped_defects.clauses).Count -eq 0
+    }
+    Check 'NO checklist means NOT MEASURED, never a count of zero' {
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses -Clauses $null `
+                                      -Marks @() -Feedback @('x')
+        $e = $r.Json.escaped_defects
+        ($e.measured -eq $false) -and ($null -eq $e.count) -and ($e.reason -match 'not a count of zero')
+    }
+    Check 'NO verdict means NOT MEASURED either — escaped is relative to a gate that passed it' {
+        $noVerdict = [pscustomobject]@{
+            Found=$true; CardId='B9'; Repo='r'; Path='p'; GoalVerbatim='g'; Reason=''
+            RunId='run-x'; Goal='g'; Verdict=''; Skipped=@()
+        }
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $noVerdict -Clauses $clausesOk `
+                                      -Marks $escapedMarks -Feedback @()
+        $e = $r.Json.escaped_defects
+        ($e.measured -eq $false) -and ($null -eq $e.count)
+    }
+    # THE THIRD REFUSAL — found by adversarial review of the first version, 2026-08-14.
+    Check 'a checklist he answered NONE of is NOT MEASURED, never a count of zero' {
+        # review-website.ps1:233 breaks on `q` BEFORE the first mark is recorded, and the
+        # free-text prompt afterwards still writes a record. Checklist loaded, verdict present,
+        # zero marks. The old code reported measured=true/count=0 and rendered "None found."
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses `
+                                      -Clauses $clausesOk -Marks @() -Feedback @('the photos are too big')
+        $e = $r.Json.escaped_defects
+        ($e.measured -eq $false) -and ($null -eq $e.count) -and ($e.reason -match 'answered none of it')
+    }
+    Check 'and its markdown does NOT say none found' {
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses `
+                                      -Clauses $clausesOk -Marks @() -Feedback @('x')
+        ($r.Markdown -match 'Not measured') -and ($r.Markdown -notmatch 'None found')
+    }
+    Check 'the DENOMINATOR is clauses he DECIDED, not the checklist length' {
+        # An un-reviewed clause carries no ground truth. Counting it as a non-escape puts an
+        # unmeasured item on the "everything is fine" side of the ratio.
+        $partial = @(
+            [pscustomobject]@{ Id='c1'; Mark='not-met'; Words='the button is dead' }
+            [pscustomobject]@{ Id='c2'; Mark='could-not-tell'; Words='could not find it' }
+        )
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses `
+                                      -Clauses $clausesOk -Marks $partial -Feedback @()
+        $e = $r.Json.escaped_defects
+        ($e.count -eq 1) -and ($e.denominator -eq 1) -and ($e.reviewed -eq 2) -and ($e.clauses_total -eq 2)
+    }
+    Check 'abandoning a review cannot flatter the rate — coverage is stated beside it' {
+        $one = @([pscustomobject]@{ Id='c1'; Mark='met'; Words='' })
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses `
+                                      -Clauses $clausesOk -Marks $one -Feedback @()
+        ($r.Json.escaped_defects.denominator -eq 1) -and
+        ($r.Markdown -match 'definitive answer on 1 of 2')
+    }
+
+    Check 'the markdown says NOT MEASURED rather than none, when there is no checklist' {
+        $r = New-OperatorReviewRecord -Build $buildLive -Claims $claimsForClauses -Clauses $null `
+                                      -Marks @() -Feedback @('x')
+        ($r.Markdown -match 'What the gates missed') -and ($r.Markdown -match 'Not measured')
     }
     Check 'drift is banked in the record, not only drawn on the page' {
         $recFull.Json.checklist.Contains('goal_drift_checked') -and
@@ -777,6 +958,49 @@ ope\python.exe'
         try { Assert-ServingThisBuild -Port 8480 -Token 't' -Proc $dead -LogPath $log | Out-Null }
         catch { $threw = $_.Exception.Message -match 'EADDRINUSE' }
         $threw
+    }
+
+    # -----------------------------------------------------------------------
+    # DoD row 16 — the RATCHET for the class that actually bit, rather than the
+    # one that is easy to scan for.
+    #
+    # A check here pinned its subject to `Get-WebsiteBuilds | Select -First 1`.
+    # That helper returns live `~/projects` sandboxes AND archived builds
+    # interleaved, newest first — so the first item is the LIVE tree, which
+    # every dispatch rewrites. It went red when a reboot-killed run left a
+    # different tree there, on a file byte-identical to HEAD.
+    #
+    # WHY NOT PORT BlarAI's test_evidence_is_immutable INSTEAD, which row 16
+    # names as the missing equivalent (#1385): I measured it. That gate matches
+    # path LITERALS, and this repo's verifiers hold five such literals — all of
+    # them DATA handed to pure functions (a journal string compared by
+    # Get-BlockingRunOwner, a path only Split-Path'd for its name), none of them
+    # subjects read from disk. Porting it would convict five times and catch
+    # zero real instances, and a gate that cries wolf stops being read. The
+    # offending line contained no literal at all; it reached the mutable root at
+    # RUNTIME. A literal scanner is blind to that in any language.
+    #
+    # So this checks the shape that actually failed, and nothing wider.
+    Check 'no verifier takes the FIRST build off the enumerator unfiltered (row 16 ratchet)' {
+        $offenders = @()
+        foreach ($f in Get-ChildItem -Path $PSScriptRoot -Filter '*.ps1' -File) {
+            $n = 0
+            foreach ($line in (Get-Content -LiteralPath $f.FullName)) {
+                $n++
+                # COMMENTS ARE SKIPPED, and that is not tidiness: the two lines in this very
+                # file that DOCUMENT the fixed defect quote the forbidden expression verbatim.
+                # A gate matching its own explanation is the vacuity shape this repo keeps
+                # catching — it would have "found" two offenders and been wrong about both.
+                if ($line -match '^\s*#') { continue }
+                if ($line -match 'Get-WebsiteBuilds' -and
+                    $line -notmatch 'Where-Object' -and
+                    ($line -match '\|\s*Select(-Object)?\s+-First' -or $line -match '\)\s*\[0\]')) {
+                    $offenders += "$($f.Name):$n"
+                }
+            }
+        }
+        if ($offenders.Count) { Write-Host "      offenders: $($offenders -join ', ')" -ForegroundColor Yellow }
+        $offenders.Count -eq 0
     }
 
     Write-Host ''

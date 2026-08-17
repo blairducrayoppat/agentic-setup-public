@@ -75,6 +75,13 @@ param(
     [string]$AppExe = '',
     [switch]$SkipTier1,
     [switch]$SkipTier2,
+    # #1394: the multi-page sweep's wall-clock budget, OWNED BY THE CALLER. Its single owner
+    # is shared/fleet/swap_ops.py::WEB_CAPTURE_SWEEP_BUDGET_S, registered in
+    # shared/timeout_registry.py, because it has to fit inside that caller's
+    # EXEC_SMOKE_TIMEOUT_S and two numbers in two repositories with nothing reconciling them
+    # is exactly what #1394 filed. Zero means "let the capture use its own default" — kept so
+    # a hand invocation of this script stays as simple as it was.
+    [int]$SweepBudgetMs = 0,
     [int]$Tier1TimeoutSec = 90,
     [int]$Tier2LaunchTimeoutSec = 40,
     [double]$Tier2SettleSec = 1.0,
@@ -393,6 +400,39 @@ if (-not $resolvedExe) {
                     Write-Tier web "app server spawn failed ($($_.Exception.Message)) -> file:// static fallback"
                 }
             }
+            # ---- EVERY DELIVERED PAGE, not just the entry (#1375) ------------------------
+            # A five-page site had ONE page rendered. `pieces.html` and `piece-detail.html` were
+            # never opened by any instrument, so the floor's "served + loaded + zero console
+            # errors" was earned on the entry page and reported for the product -- while both
+            # of the operator's central pages showed "Failed to load pieces." He found them by
+            # clicking; four gates did not.
+            #
+            # Only when the SERVER is up. Over file:// a sibling page is a different document
+            # with different resolution rules, and a multi-page verdict gathered that way would
+            # not describe what a visitor gets. No server -> capture the entry alone, as today.
+            #
+            # Bounded at 12: the CDP session is reused (one Edge, sequential navigations), but
+            # each page costs a load plus the settle, and this runs inside a 120 s floor timeout
+            # (swap_ops.EXEC_SMOKE_TIMEOUT_S). A site with more pages than that gets the first
+            # 12 and the sidecar records BOTH numbers, so a truncated sweep can never read as a
+            # complete one.
+            $extraPages = @()
+            if ($srvUp) {
+                $mount = Split-Path $indexHtml -Parent
+                $entryName = Split-Path $indexHtml -Leaf
+                $found = @(Get-ChildItem -Path $mount -Recurse -Include '*.html','*.htm' -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -notmatch '\\(node_modules|\.git)\\' -and $_.Name -ne $entryName } |
+                    Sort-Object Name)
+                $capped = @($found | Select-Object -First 12)
+                foreach ($pg in $capped) {
+                    $rel = $pg.FullName.Substring($mount.Length).TrimStart('\', '/') -replace '\\', '/'
+                    $extraPages += "http://127.0.0.1:$port/$rel"
+                }
+                if ($extraPages.Count -gt 0) {
+                    Write-Host "Tier web: $($extraPages.Count) further page(s) beside the entry will be opened$(if ($found.Count -gt $capped.Count) { " (of $($found.Count) found -- capped at 12)" })"
+                }
+            }
+
             try {
                 # ---- H8/H9 (#823): CDP console-capturing helper FIRST, msedge --screenshot fallback ----
                 # capture-web-cdp.mjs drives Edge over the DevTools Protocol, so it captures the browser
@@ -408,8 +448,16 @@ if (-not $resolvedExe) {
                 $node = Get-Command node -ErrorAction SilentlyContinue
                 if ($node -and (Test-Path $cdpScript)) {
                     try {
-                        & $node.Source $cdpScript --url $uri --out $OutPng --console-out $sidecar `
-                            --app-dir $AppDir --timeout-ms ($WebTimeoutSec * 1000) --profile-dir $cdpProfile *> $null
+                        $cdpArgs = @('--url', $uri, '--out', $OutPng, '--console-out', $sidecar,
+                                     '--app-dir', $AppDir, '--timeout-ms', ($WebTimeoutSec * 1000),
+                                     '--profile-dir', $cdpProfile)
+                        # Absent when there is nothing beside the entry, so a single-page site
+                        # produces a byte-identical invocation to the one proven before this.
+                        if ($extraPages.Count -gt 0) { $cdpArgs += @('--extra-pages', ($extraPages -join ',')) }
+                        # #1394: forwarded only when the caller supplied one, so an invocation
+                        # without it stays byte-identical to the one proven before this change.
+                        if ($SweepBudgetMs -gt 0) { $cdpArgs += @('--sweep-budget-ms', $SweepBudgetMs) }
+                        & $node.Source $cdpScript @cdpArgs *> $null
                         if ($LASTEXITCODE -eq 0 -and (Test-Path $OutPng) -and (Get-Item $OutPng).Length -gt 100) {
                             $m = [System.IO.File]::ReadAllBytes($OutPng) | Select-Object -First 4
                             if ($m.Count -ge 4 -and $m[0] -eq 0x89 -and $m[1] -eq 0x50 -and $m[2] -eq 0x4E -and $m[3] -eq 0x47) {

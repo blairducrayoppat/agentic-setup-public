@@ -295,26 +295,76 @@ $MaxVerifyAttempts = $__budget.Build   # = N, the best-of-N candidate budget
 $MaxReviewPasses   = $__budget.Review
 $Prompt = Add-ComplexityHint -Prompt $Prompt -Complexity $Complexity
 if ($Complexity) { Write-Host "  Task complexity (upstream signal): $Complexity -> up to $MaxVerifyAttempts candidate(s), review budget $MaxReviewPasses" -ForegroundColor DarkCyan }
+
+# #1398 / DoD row 19 clause 2: "the choice AND its reason are recorded on the run".
+#
+# The REASON was banked (acceptance.json carries spec.build_plan.complexity). The CHOICE — the
+# budget that label resolved to — existed only as the prose line above, inside a .log. Measured
+# on run 20260814-230237-bd: a walk of every key in acceptance.json matching
+# complex|budget|candidate|pass|review returns exactly one hit, the label. No JSON anywhere on
+# the run carried the 3 or the 2.
+#
+# That matters beyond tidiness because row 19's THIRD clause is a CROSS-RUN comparison — "hard
+# tasks demonstrably get more attempts than trivial ones" — and prose in a per-task log cannot
+# be aggregated. A number only a human can read is not a measurement.
+#
+# Written beside the report, the same sidecar idiom as .coder-test-qa.json. Fail-soft: a
+# sidecar that cannot be written must never sink a dispatch.
+try {
+    $__known = @('simple', 'moderate', 'complex')
+    $__label = if ($Complexity) { $Complexity.Trim().ToLower() } else { '' }
+    @{
+        schema           = 'pass-budget/v1'
+        task             = $Task
+        complexity_label = $__label
+        # An unrecognised label is NOT the same as an absent one, and neither is the same as a
+        # recognised one that happens to map to the caller's defaults. A reader asking "why 3?"
+        # gets a different answer in each case.
+        label_present    = [bool]$__label
+        label_recognised = ($__known -contains $__label)
+        build_passes     = $MaxVerifyAttempts
+        review_passes    = $MaxReviewPasses
+        staged_floor     = [bool]$buildProfile.staged
+    } | ConvertTo-Json | Set-Content -Path ($Report -replace '\.txt$', '.pass-budget.json') -Encoding utf8
+} catch {
+    Write-Host "  (pass-budget sidecar not written: $($_.Exception.Message))" -ForegroundColor DarkGray
+}
 # INCREMENT-3 STAGED PROMPT (#676): a STAGED surface (winui/desktop-gui) gets the core-then-shell staging
 # instruction so the coder EXTENDS the offline-building tests instead of inventing a framework. Gated on
 # $buildProfile.staged -> non-staged surfaces are byte-identical. Computed ONCE here (every candidate
 # inherits it via $Prompt). The original prompt is preserved verbatim (Add-StagedHint appends).
 $Prompt = Add-StagedHint -Prompt $Prompt -Staged ([bool]$buildProfile.staged)
 if ($buildProfile.staged) { Write-Host "  Staged build (core first, then shell): the coder extends the seeded Calculator core + Tests/ before theming the shell." -ForegroundColor DarkCyan }
-# F3 (#670): the OFFLINE-WEB hint for a `web` scaffold -- the coder EXTENDS the seeded offline Node
-# skeleton and stays offline (inline SVG/data: URIs, port-0 tests) instead of pulling a CDN image and
-# fetching an unstarted port (the live failure). Gated on the RESOLVED scaffold (set by surface OR the
-# keyword heuristic), so it fires whenever the web seed is placed and non-web tasks are byte-identical;
-# mutates $Prompt above the resample loop like the other hints (survives a reset-to-base resample).
-$Prompt = Add-WebHint -Prompt $Prompt -Web ([bool]($scaffold -eq 'web'))
-if ($scaffold -eq 'web') { Write-Host "  Offline web build: the coder extends the seeded offline Node skeleton (no external assets; port-0 tests)." -ForegroundColor DarkCyan }
+# F3 (#670): the OFFLINE-WEB hint -- the coder EXTENDS the seeded offline Node skeleton and stays
+# offline (inline SVG/data: URIs, port-0 tests) instead of pulling a CDN image and fetching an
+# unstarted port (the live failure), builds the FRONT DOOR at public/index.html (#1367), and keeps
+# everything the browser loads under the SERVED ROOT (#1375).
+#
+# GATE CORRECTED 2026-08-14. This read `($scaffold -eq 'web')`. `$scaffold` answers "what should I
+# SEED?", and Resolve-TaskScaffold's first line is `if ($HasProject) { return '' }` -- correct for
+# seeding, fatal as a proxy for "is this a web build". Once the sandbox is seeded every LATER task
+# resolved '' and got NO web brief: measured, exactly one banked agent log in state/reports contains
+# "OFFLINE WEB BUILD", and no B9 coder has ever seen it. B9 authors seven tasks, so one dispatch was
+# briefed and six were not -- which is why a coder created `home.html` without knowing what a visitor
+# reaches, and another fetched a data file from outside the served root. Both briefs existed; neither
+# was delivered. Test-WebBuild asks the right question and keeps the seeding decision untouched.
+$__isWebBuild = Test-WebBuild -Scaffold $scaffold -Surface $Surface -ProjectRoot $wt
+$Prompt = Add-WebHint -Prompt $Prompt -Web $__isWebBuild
+if ($__isWebBuild) { Write-Host "  Offline web build: the coder extends the seeded offline Node skeleton (no external assets; port-0 tests; front door at public/index.html)." -ForegroundColor DarkCyan }
 # #886: the STATIC-PAGE hint for a `web-static` scaffold -- the coder EXTENDS the single seeded
 # self-contained index.html and stays static + offline (inline SVG/data: URIs, NO server, NO fetch,
 # NO package.json) instead of adding a node server that leaves a "Loading..." box hung on file://.
 # Gated on the RESOLVED scaffold (set by the surface -> profile mapping); non-static tasks are byte-
 # identical; mutates $Prompt above the resample loop like the other hints (survives a reset-to-base).
-$Prompt = Add-WebStaticHint -Prompt $Prompt -WebStatic ([bool]($scaffold -eq 'web-static'))
-if ($scaffold -eq 'web-static') { Write-Host "  Static web page: the coder extends the ONE self-contained index.html (no server, no build step, no fetch)." -ForegroundColor DarkCyan }
+# GATE CORRECTED 2026-08-14 alongside the web hint, because the same reasoning applies and a
+# sibling sweep found this was the ONE other injection sharing the defect: `$scaffold` answers
+# the SEEDING question and returns '' once a project exists, so a multi-task static site briefed
+# its seeding dispatch and no other. Latent rather than measured only because web-static has run
+# once. Test-WebStaticBuild reads the seed's own shape (a root index.html with NO package.json,
+# server or public/), which is mutually exclusive with the web scaffold's signature.
+$__isWebStatic = Test-WebStaticBuild -Scaffold $scaffold -Surface $Surface -ProjectRoot $wt
+$Prompt = Add-WebStaticHint -Prompt $Prompt -WebStatic $__isWebStatic
+if ($__isWebStatic) { Write-Host "  Static web page: the coder extends the ONE self-contained index.html (no server, no build step, no fetch)." -ForegroundColor DarkCyan }
 # W4 (#714, UC-010 SEAM A): if BlarAI pre-generated raster image assets into the seeded worktree
 # (its on-device image generator, before the coder ran), tell the coder to USE the local files
 # (offline, relative path) instead of drawing an <svg> placeholder. DYNAMIC + gated on ACTUAL FILE
@@ -598,7 +648,22 @@ if ($hasChanges -and -not $gitFailed -and (Test-Path $wt)) {
     # neither is ever charged to the coder), and it is the same anchor $hasChanges and a resample measure
     # against -- so the exam examined is exactly the exam this task wrote. Without it the scan reads the
     # whole delivered tree, and on a five-task night task N pays the FIX laps for tasks 1..N-1.
-    $coderQa = Invoke-CoderTestQa -Repo $wt -BlarAiRepo $BlarAiRepo -Since $codeBase
+    #
+    # DoD row 4: point the scanner at the statistics the [2/5] gate now persists, so
+    # PropertyExecutionMeasured stops being false on every production run ever made. Passed
+    # ONLY when the capture is really on disk -- an absent one must keep reporting UNMEASURED
+    # rather than pointing at nothing, which is the disclosure this row exists to protect.
+    #
+    # -RequireProperty is STILL NOT PASSED, and that is a ceremony boundary rather than an
+    # oversight: it is what turns a missing property test into a HARD finding, and a new way
+    # for a build to fail is the operator's call (#1345). This makes the measurement honest;
+    # it does not make it blocking.
+    $__statsPath = Join-Path $wt '.blarai-hypothesis-stats.txt'
+    $coderQa = if (Test-Path -LiteralPath $__statsPath) {
+        Invoke-CoderTestQa -Repo $wt -BlarAiRepo $BlarAiRepo -Since $codeBase -StatsPath $__statsPath
+    } else {
+        Invoke-CoderTestQa -Repo $wt -BlarAiRepo $BlarAiRepo -Since $codeBase
+    }
 }
 $coderTestHard = [int]$coderQa.Hard
 $coderQaBlock = Format-CoderTestQaBlock -Result $coderQa `
@@ -710,6 +775,14 @@ while ($hasChanges -and -not $dispatchCancelled -and -not $gitFailed -and (Test-
     if ($hasChanges -and -not $gitFailed -and (Test-Path $wt)) {
         # #1201: the SAME baseline as the pre-review scan. A FIX lap adds commits on top of the
         # candidate; it never moves the floor the task started from, so re-anchoring here would be wrong.
+        #
+        # DoD row 4: -StatsPath is DELIBERATELY NOT PASSED HERE, and this is the more careful
+        # half of that change. The FIX lap rewrote the tree and the [2/5] gate is NOT re-run
+        # between the two scans, so .blarai-hypothesis-stats.txt still describes the PRE-FIX
+        # tree. Pointing at it would publish a measurement of code that no longer exists --
+        # the same defect as a truncation count that survives the plan it counted (#1279).
+        # UNMEASURED is the honest answer for a re-scan whose evidence was not regenerated.
+        # If the FIX lap ever re-runs [2/5], wire it here THEN, deliberately.
         $coderQa = Invoke-CoderTestQa -Repo $wt -BlarAiRepo $BlarAiRepo -Since $codeBase
     } else {
         $coderQa = New-CoderTestQaResult -Status 'not-applicable' -Detail 'no captured changes to examine after the review-FIX lap'

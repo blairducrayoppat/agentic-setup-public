@@ -33,6 +33,33 @@ function Assert-Eq($Expected, $Actual, $Msg) { if ([string]$Expected -ceq [strin
 function Assert-True($Cond, $Msg) { if ($Cond) { _pass $Msg } else { _fail "$Msg (expected True, got False)" } }
 function Assert-Contains($H, $N, $Msg) { if ($H -and $H.ToString().Contains($N)) { _pass $Msg } else { _fail "$Msg (did not find '$N')" } }
 
+function Remove-AnsiCodes {
+    # Strip SGR/CSI escapes before matching captured tool output (2026-08-14, #1386).
+    #
+    # H1b/H1c assert `\b\d+ passed\b` against pytest's output and were failing on a seed that
+    # runs its tests perfectly well. The captured bytes read `ESC[32m2 passed` -- pytest
+    # colourises when FORCE_COLOR is set, and Claude Code sets FORCE_COLOR=3 in the sessions
+    # these verifiers get run from. `m` is a word character, so there is NO word boundary
+    # between it and the `2`, and the digit the regex needs becomes unreachable. The literal
+    # "2 passed" is right there in the string; `-match` simply cannot see it.
+    #
+    # WHICH MAKES THE FAILURE MODE THE ONE THIS PROJECT CARES ABOUT MOST: a check reporting
+    # "the tests did not run" when the truth is "I could not see that they ran" (#1241). It
+    # fails toward alarm here, which is the safe direction, but the same `\b\d+ ... passed\b`
+    # shape is used to decide real outcomes at shared/fleet/oracle_qa.py:1422 with no stripping
+    # anywhere in the fleet -- and THERE it would fail toward "not measured".
+    #
+    # Verified NOT firing in production: FORCE_COLOR is set by neither the User nor the Machine
+    # environment, the battery runs from a scheduled task that inherits neither, and no banked
+    # oracle-qa.json in state/fleet-runs contains an escape byte. So this is a verifier-only
+    # correction. The fleet-side hardening is #1386 and deliberately does NOT land tonight:
+    # fleet-lib.ps1 is on the battery's execution path and the 23:00 run must not be decohered
+    # by a same-day change to it (#740 one-change-per-run).
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    return ($Text -replace "`e\[[0-9;?]*[ -/]*[@-~]", '')
+}
+
 # ----------------------------------------------------------------------------
 Section 'Unit tests: Resolve-TaskScaffold (which skeleton to seed)'
 $rocket = 'Create a space rocket calculator: a window with number buttons, a resizable rocket-shaped window, and a display.'
@@ -269,7 +296,7 @@ try {
         $before = Get-TreeFingerprint -Root $wtH
         $r = Invoke-WithTimeout -CommandLine $gateCmd -WorkDir $wtH -TimeoutSec 300
         Assert-True ((-not $r.TimedOut) -and ($r.ExitCode -eq 0)) 'H1 [kill] a fresh python seed is GREEN out of the box under the fleet gate command'
-        Assert-True ($r.Output -match '(?m)\b\d+ passed\b') 'H1b ...and tests actually RAN (a hollow exit-0 with zero tests would prove nothing)'
+        Assert-True ((Remove-AnsiCodes $r.Output) -match '(?m)\b\d+ passed\b') 'H1b ...and tests actually RAN (a hollow exit-0 with zero tests would prove nothing)'
         Assert-True ($before -ceq (Get-TreeFingerprint -Root $wtH)) 'H3 [kill] the seeded tests leave the tree byte-identical (tmp_path-isolated; no repo-root data store)'
 
         # H1c: the CANONICAL -PackageName form -- the form production plan-graph jobs actually
@@ -279,7 +306,7 @@ try {
         $null = @(Copy-ScaffoldInto -Scaffold 'python' -Worktree $wtHC -PackageName 'flashcard_app')
         $rc = Invoke-WithTimeout -CommandLine $gateCmd -WorkDir $wtHC -TimeoutSec 300
         Assert-True ((-not $rc.TimedOut) -and ($rc.ExitCode -eq 0)) 'H1c [kill] the canonical -PackageName seed is GREEN out of the box under the fleet gate command'
-        Assert-True ($rc.Output -match '(?m)\b\d+ passed\b') 'H1c ...with tests actually running in the canonical form too'
+        Assert-True ((Remove-AnsiCodes $rc.Output) -match '(?m)\b\d+ passed\b') 'H1c ...with tests actually running in the canonical form too'
 
         # H5 (negative): a seeded test that writes into the repo tree IS caught by the purity check.
         $rootLeak = Join-Path $tmpH 'root-leak'

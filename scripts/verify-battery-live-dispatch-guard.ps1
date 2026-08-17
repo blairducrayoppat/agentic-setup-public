@@ -335,8 +335,18 @@ Start-Sleep -Seconds 300') -NoNewWindow -PassThru
     # ORDER MATTERS: the process witness must be consulted BEFORE the journal scan, so a
     # run with no journal.log yet (measured 11 minutes wide on a real operator dispatch)
     # is refused rather than skipped by the scan's `continue`.
+    #
+    # Re-anchored 2026-08-14 (#1380). The journal scan was 45 lines inline and its anchor
+    # here was `$liveOwner = $null`, the scan's first statement. It is now the function
+    # Get-BlockingRunOwner -- extracted precisely so it could be tested -- so the anchor
+    # is its CALL SITE. Anchoring on the definition would silently invert this check, since
+    # the function is defined near Get-LiveDispatch, hundreds of lines above both call
+    # sites: an ordering assertion must point at the order things RUN in, not the order
+    # they are written in. A -1 from IndexOf is failed explicitly rather than compared,
+    # because -1 is less than every offset and would make a missing lock look correct.
     $iProc = $src.IndexOf('$liveDispatch = Get-LiveDispatch')
-    $iJrnl = $src.IndexOf('$liveOwner = $null')
+    $iJrnl = $src.IndexOf('$blockingOwner = Get-BlockingRunOwner')
+    Check "S7 both archive locks are present at their call sites" (($iProc -ge 0) -and ($iJrnl -ge 0))
     Check "S7 the archive guard checks the process BEFORE the journal scan" `
         ($iProc -gt 0 -and $iJrnl -gt 0 -and $iProc -lt $iJrnl)
     # The refusal must be a CLEAN STAND-DOWN, not a bare throw and not a silent continue.
@@ -345,17 +355,51 @@ Start-Sleep -Seconds 300') -NoNewWindow -PassThru
     # admission record, and the AO teardown. The first cut of this guard threw; the check
     # below asserts all four halves of the correct behaviour, because "it refuses" was too
     # weak a property and passed on the throwing version.
-    $iRefuse = $src.IndexOf('archive guard: REFUSING')
-    $iExit   = $src.IndexOf('Stop-Transcript | Out-Null; exit 0', $iRefuse)
-    $window  = if ($iRefuse -gt 0 -and $iExit -gt $iRefuse) { $src.Substring($iRefuse, $iExit - $iRefuse) } else { '' }
-    Check "S7 the archive refusal writes a SKIP REPORT (no stale morning read)" `
-        ($window -match 'Write-SkipReport')
-    Check "S7 the archive refusal records admission provenance" `
-        ($window -match "Write-AdmissionRecord 'skipped-live-dispatch'")
-    Check "S7 the archive refusal TEARS DOWN an AO this night owns (no resident 14B)" `
-        ($window -match 'Stop-OwnedAo')
-    Check "S7 the archive refusal exits cleanly rather than throwing past the teardown" `
-        ($iExit -gt $iRefuse)
+    # EVERY refusal site, not the first one (#1380, found in review 2026-08-14).
+    #
+    # This used `$src.IndexOf('archive guard: REFUSING')` -- the FIRST occurrence -- and built
+    # one window from it. That was correct while LOCK 1 was the only clean stand-down. When
+    # #1380 gave LOCK 2 the same treatment there were two, and the second sat OUTSIDE the
+    # window entirely (measured: LOCK 1 at 1494, window ending 1526; LOCK 2 at 1583). One
+    # assertion also hard-coded 'skipped-live-dispatch', which only LOCK 1 writes.
+    #
+    # So all four of these checks were measuring LOCK 1 twice over, and REVERTING LOCK 2 TO
+    # THE BARE THROW #1380 REMOVED WOULD HAVE LEFT EVERY SUITE GREEN -- the precise
+    # regression the ticket exists to prevent, unprotected by the suite written to protect
+    # it. A window anchored on the first match is a census of one.
+    $refusals = @()
+    $iScan = $src.IndexOf('archive guard: REFUSING')
+    while ($iScan -ge 0) {
+        $iEnd = $src.IndexOf('Stop-Transcript | Out-Null; exit 0', $iScan)
+        $refusals += [pscustomobject]@{
+            Start  = $iScan
+            End    = $iEnd
+            Window = if ($iEnd -gt $iScan) { $src.Substring($iScan, $iEnd - $iScan) } else { '' }
+            Line   = ($src.Substring(0, $iScan) -split "`n").Count
+        }
+        $iScan = $src.IndexOf('archive guard: REFUSING', $iScan + 1)
+    }
+    Check "S7 BOTH archive locks have a refusal site (got $($refusals.Count); a census of one is how LOCK 2 went unguarded)" `
+        ($refusals.Count -ge 2)
+    foreach ($rf in $refusals) {
+        Check "S7 refusal at line $($rf.Line) writes a SKIP REPORT (no stale morning read)" `
+            ($rf.Window -match 'Write-SkipReport')
+        # Matched by SHAPE, not by a hard-coded outcome string: each lock writes its own
+        # value ('skipped-live-dispatch' / 'skipped-blocking-run-owner') and a future third
+        # lock will write a third. What must hold is that it records SOMETHING skipped.
+        Check "S7 refusal at line $($rf.Line) records admission provenance (a skipped-* outcome)" `
+            ($rf.Window -match "Write-AdmissionRecord\s+'skipped-[a-z-]+'")
+        Check "S7 refusal at line $($rf.Line) TEARS DOWN an AO this night owns (no resident 14B)" `
+            ($rf.Window -match 'Stop-OwnedAo')
+        Check "S7 refusal at line $($rf.Line) exits cleanly rather than throwing past the teardown" `
+            ($rf.End -gt $rf.Start)
+    }
+    # And the negative: no archive-guard refusal may reach a bare `throw` before its exit.
+    # This is the mutation the old window could not see.
+    foreach ($rf in $refusals) {
+        Check "S7 refusal at line $($rf.Line) contains no bare throw before the clean exit" `
+            ($rf.Window -notmatch '(?m)^\s*throw\s')
+    }
 
     # THE SELF-MATCH ORDERING, ENCODED. `-m tools.dispatch_harness.` matches the battery's
     # OWN children: the admission probe (`-m tools.dispatch_harness.probe`) and the runner

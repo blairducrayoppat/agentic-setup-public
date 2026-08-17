@@ -1043,7 +1043,12 @@ function Test-ShouldRunReview {
 #: #1195 -- the statuses Invoke-CoderTestQa can return. Kept as a named set because the whole point of
 #: this layer is that "the scan found nothing" and "the scan did not happen" are DIFFERENT FACTS, and a
 #: caller that collapses them re-creates the defect one layer up.
-$script:CoderTestQaStatuses = @('clean', 'findings', 'no-tests', 'disabled', 'unavailable', 'not-applicable')
+#: #1416 adds 'not-covered': the candidate WROTE an exam and this grader cannot read its
+#: language. Deliberately distinct from 'no-tests' (there was no exam) and from
+#: 'unavailable' (the scanner broke) -- three different facts that were one string, which is
+#: how "it wrote no exam for its own work" came to be published against 55 website
+#: deliveries holding real .test.js files.
+$script:CoderTestQaStatuses = @('clean', 'findings', 'no-tests', 'not-covered', 'disabled', 'unavailable', 'not-applicable')
 
 function Get-JsonField {
     # #1201: read one field off a ConvertFrom-Json object WITHOUT assuming it is there. A bare
@@ -1053,6 +1058,30 @@ function Get-JsonField {
     # An exception there would turn a detected skew into a crashed dispatch.
     param($Object, [Parameter(Mandatory)][string]$Name, $Default = '')
     if ($null -eq $Object) { return $Default }
+    $prop = $Object.PSObject.Properties[$Name]
+    if (-not $prop) { return $Default }
+    return $prop.Value
+}
+
+function Get-ResultField {
+    # #1416: read a field off a RESULT OBJECT without assuming it is there, for BOTH shapes a
+    # result can take. Get-JsonField is the sibling of this and is NOT interchangeable with it:
+    # it reads `$Object.PSObject.Properties[$Name]`, which sees a PSCustomObject's properties
+    # (what ConvertFrom-Json produces) but NOT a Hashtable's KEYS -- and New-CoderTestQaResult
+    # returns a Hashtable. Using Get-JsonField here returned the default for every field that
+    # was actually present, turning a defensive read into a silencer: the language breakdown
+    # rendered as absent on results that carried it. Caught by the positive-direction assertion
+    # (verify-coder-test-qa.ps1 SM2), which exists because a guard that never throws and never
+    # answers looks exactly like a guard that works.
+    #
+    # The bare `$Object.Name` read is not an option either: under Set-StrictMode -Version Latest
+    # it THROWS on an absent property, which is the crash this whole helper exists to prevent.
+    param($Object, [Parameter(Mandatory)][string]$Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $Default
+    }
     $prop = $Object.PSObject.Properties[$Name]
     if (-not $prop) { return $Default }
     return $prop.Value
@@ -1072,6 +1101,12 @@ function New-CoderTestQaResult {
         # FIX laps on an exam the coder never wrote, so the scope rides the result rather than being
         # inferred at each surface.
         ScopeMode = ''; ScopeChangedFiles = 0
+        # #1416: WHICH languages were read, and which exams could not be read at all. A single
+        # FilesScanned total cannot answer "was the website half of this delivery graded",
+        # and that unanswerable total is what hid an entire ecosystem going ungraded for 55
+        # consecutive records. Uncovered is never empty-meaning-clean: it is the list of exams
+        # that exist and were NOT examined.
+        NodeFilesScanned = 0; PythonFilesScanned = 0; Uncovered = @()
         # #1195 residual: the [2/5] pytest gate runs `pytest -x -q` with NO --hypothesis-show-statistics
         # and never persists its output, so there is no statistics artifact to hand the scanner's --stats.
         # The `unexecuted_property` class is therefore UNMEASURABLE from this seam today. Recorded as a
@@ -1198,21 +1233,65 @@ function Invoke-CoderTestQa {
     if ($obj.counts) { foreach ($p in $obj.counts.PSObject.Properties) { $counts[$p.Name] = [int]$p.Value } }
     $out.Counts = $counts
     $out.PropertyExecutionMeasured = [bool]$StatsPath
-    $out.Measured = $true
+    # #1416: read the scanner's OWN honesty bit rather than asserting it. This line was
+    # `$out.Measured = $true`, set unconditionally after a successful parse, which is why
+    # `measured: true` and `files_scanned: 0` sat in the same record for 55 consecutive
+    # website deliveries. coder_test_qa computes it as `parsed > 0` and has emitted it since
+    # #1223; the wrapper simply overwrote the answer it had asked for.
+    #
+    # Absent key => a scanner predating #1223. Fall back to the derivation rather than to
+    # $false: defaulting a missing field to "not measured" would silently switch the whole
+    # instrument off against an older checkout, which is a worse failure than the one fixed.
+    $measuredProp = $obj.PSObject.Properties['measured']
+    if ($measuredProp) { $out.Measured = [bool]$measuredProp.Value }
+    else { $out.Measured = ($out.FilesScanned -gt 0) }
+
+    # #1416: which languages were actually READ, and which exams could not be read at all.
+    # Both default to the honest empty, and both are absent from a pre-#1416 scanner -- for
+    # which every website record was `no-tests`, so the fallback below reproduces exactly the
+    # old behaviour minus the false sentence.
+    $langs = Get-JsonField -Object $obj -Name 'languages'
+    $nodeFiles = 0; $pyFiles = 0
+    if ($langs) {
+        $nodeFiles = [int](Get-JsonField -Object $langs -Name 'node' -Default 0)
+        $pyFiles = [int](Get-JsonField -Object $langs -Name 'python' -Default 0)
+    }
+    $out.NodeFilesScanned = $nodeFiles
+    $out.PythonFilesScanned = $pyFiles
+    $out.Uncovered = @(@(Get-JsonField -Object $obj -Name 'uncovered' -Default @()) |
+        ForEach-Object { "$_" })
+
     if ($out.Findings.Count -gt 0) {
         $out.Status = 'findings'
+    } elseif ($out.FilesScanned -eq 0 -and $out.Uncovered.Count -gt 0) {
+        # #1416: the candidate DID write an exam and this grader cannot read its language.
+        # Before, this fell into `no-tests` and told the operator the coder "wrote no exam
+        # for its own work" -- a confident, wrong, human-readable accusation produced by a
+        # check that never looked. It is an ABSENT measurement, so Measured is forced false
+        # and the status is a not-measured value, never a finding about the coder.
+        $out.Measured = $false
+        $out.Status = 'not-covered'
+        $shown = @($out.Uncovered | Select-Object -First 3) -join ', '
+        $more = ''
+        if ($out.Uncovered.Count -gt 3) { $more = " (and $($out.Uncovered.Count - 3) more)" }
+        $out.Detail = "this candidate's exam is in a language this grader cannot read, so it was NOT examined -- $($out.Uncovered.Count) test file(s) went ungraded: $shown$more. This is a gap in the GRADER, not a fault of the coder"
     } elseif ($out.FilesScanned -eq 0) {
-        # Zero files is NOT a clean exam -- there is no exam. A dotnet/node candidate lands here, and so
-        # does a python candidate that shipped no tests at all; both would read as "clean" if this branch
-        # were folded into the one below, which is the same collapse this function exists to refuse.
-        # #1201: say WHICH zero this is. Under a scoped scan the sentence "no python test files under the
+        # Zero files is NOT a clean exam -- there is no exam. A candidate that shipped no tests
+        # at all lands here; it would read as "clean" if this branch were folded into the one
+        # below, which is the same collapse this function exists to refuse.
+        # #1201: say WHICH zero this is. Under a scoped scan the sentence "no test files under the
         # candidate" would be false whenever the tree has tests the task simply did not touch -- and the
         # fact worth reporting there is the stronger one: this task wrote no exam at all.
         $out.Status = 'no-tests'
         if ($out.ScopeMode -ne 'changed-since') {
-            $out.Detail = 'no python test files under the candidate -- there was no exam to examine'
+            $out.Detail = 'no test files under the candidate in any language this grader reads -- there was no exam to examine'
         } elseif ([int]$out.ScopeChangedFiles -gt 0) {
-            $out.Detail = "this task changed $($out.ScopeChangedFiles) file(s) and NONE of them was a python test -- it wrote no exam for its own work"
+            # #1416: was "NONE of them was a python test -- it wrote no exam for its own work".
+            # The accusation was true only of python and was published against 55 website
+            # deliveries holding real .test.js files. The grader now reads node too, so this
+            # sentence is reachable only when the task genuinely wrote no exam -- and it still
+            # names the limit rather than the coder's character.
+            $out.Detail = "this task changed $($out.ScopeChangedFiles) file(s) and none of them was a test file in a language this grader reads (python, node) -- no exam of its own work was found"
         } else {
             # A DIFFERENT fact, and the caller only reaches here having already decided there ARE
             # changes -- but it decides that from a COMMIT COUNT against the baseline, while the scope
@@ -1249,6 +1328,30 @@ function ConvertTo-FleetAscii {
     return ($out -replace '[^\x09\x0A\x0D\x20-\x7E]', '?')
 }
 
+function Format-CoderTestQaLanguages {
+    # #1416: " (python 3, node 9)" -- or '' when the scanner did not report a breakdown, which
+    # is how a pre-#1416 checkout stays silent rather than printing a fabricated "(python 0)".
+    # PURE, so verify-coder-test-qa.ps1 can lock it without python or a model.
+    #
+    # Reads via Get-ResultField, NOT `$Result.NodeFilesScanned`. The first draft used
+    # `if ($null -ne $Result.PythonFilesScanned)` as its own guard, which is the bug it was
+    # guarding against: under `Set-StrictMode -Version Latest` a bare read of an ABSENT
+    # property THROWS, so the guard crashed on exactly the old-shaped result it existed to
+    # tolerate. Get-JsonField's own comment says this in terms, and it was written for
+    # #1201 after the same mistake. Measured under pwsh 7.6.5 before and after.
+    # Get-ResultField, not Get-JsonField: the latter reads PSObject.Properties, which does
+    # not see a Hashtable's KEYS, and these results are Hashtables. See its definition.
+    param($Result)
+    if ($null -eq $Result) { return '' }
+    $py = [int](Get-ResultField -Object $Result -Name 'PythonFilesScanned' -Default 0)
+    $node = [int](Get-ResultField -Object $Result -Name 'NodeFilesScanned' -Default 0)
+    if (($py + $node) -le 0) { return '' }
+    $parts = @()
+    if ($py -gt 0) { $parts += "python $py" }
+    if ($node -gt 0) { $parts += "node $node" }
+    return " ($($parts -join ', '))"
+}
+
 function Format-CoderTestQaBlock {
     # #1195: the operator-facing block for the task report + console. PURE -> unit-tested without python
     # or a model (verify-coder-test-qa.ps1). The first line is unindented and starts 'CODER TEST QA:' so
@@ -1265,9 +1368,32 @@ function Format-CoderTestQaBlock {
         $lead = 'CODER TEST QA: NOT MEASURED'
         if ($status -eq 'disabled') { $lead = 'CODER TEST QA: NOT MEASURED (kill-switch off)' }
         elseif ($status -eq 'not-applicable') { $lead = 'CODER TEST QA: NOT MEASURED (nothing to examine)' }
+        # #1416: the one absent-measurement whose cause is THIS GRADER rather than the
+        # candidate. It must not read like the coder's failing, because for 55 website
+        # deliveries it did exactly that.
+        elseif ($status -eq 'not-covered') { $lead = 'CODER TEST QA: NOT MEASURED (this grader cannot read the exam''s language)' }
+        # #1416: 'no-tests' now arrives HERE, because Measured is read from the scanner and
+        # the scanner has always said measured=false for a scan that parsed nothing. That is
+        # the honest bit -- an empty path list is an unexamined project, not an examined one
+        # that found nothing. But NOT MEASURED is a weaker sentence than the true one, and
+        # this branch keeps the sharper wording: there was no exam, which is a FACT about the
+        # candidate rather than a gap in the grader. Losing that distinction while fixing a
+        # different one would be a poor trade.
+        elseif ($status -eq 'no-tests') { $lead = 'CODER TEST QA: NO EXAM' }
         # $detail can carry python's own last words, so it gets the same fold as a finding message.
         $line = "$lead - $detail."
-        return (ConvertTo-FleetAscii -Text ($line + " The coder's own tests were NOT examined; this is an ABSENT measurement, not a clean one."))
+        # #1416, corrected in review: the comment above claimed this branch KEEPS the sharper
+        # `no-tests` wording, and it kept only half of it. The lead said NO EXAM and the tail
+        # still said "this is an ABSENT measurement", which is the grader-shaped sentence --
+        # while the true fact here is about the CANDIDATE: it wrote no exam. The reviewer
+        # found the old branch below had become unreachable in production and its sentence
+        # lost with it, and that F2's fixture forces Measured=$true so it was still testing a
+        # path nothing can reach. Both sentences now live on the path that actually runs.
+        $tail = " The coder's own tests were NOT examined; this is an ABSENT measurement, not a clean one."
+        if ($status -eq 'no-tests') {
+            $tail = " The TESTS line above rests on no coder-authored test at all."
+        }
+        return (ConvertTo-FleetAscii -Text ($line + $tail))
     }
     $files = [int]$Result.FilesScanned
     $hard = [int]$Result.Hard
@@ -1287,14 +1413,21 @@ function Format-CoderTestQaBlock {
         # examined here, because on this candidate there was no exam to examine.
         [void]$lines.Add("CODER TEST QA: NO EXAM - $detail. The TESTS line above rests on no coder-authored test at all.")
     } elseif ($status -eq 'clean') {
-        [void]$lines.Add("CODER TEST QA: clean - $files test file(s) examined$subject, no findings.")
+        # #1416: name the LANGUAGE MIX on a clean line. "9 test file(s) examined, no findings"
+        # is the same sentence whether the website half was graded or skipped entirely, and
+        # telling those apart at a glance is the whole point of the ticket.
+        [void]$lines.Add("CODER TEST QA: clean - $files test file(s) examined$subject$(Format-CoderTestQaLanguages -Result $Result), no findings.")
     } else {
         $n = @($Result.Findings).Count
         $tail = 'the merge gate is UNCHANGED (advisory by design).'
         if ($SkipWithdrawn) {
             $tail = "the green-gate review SKIP was WITHDRAWN so the reviewer looks at this exam; the merge gate is UNCHANGED (advisory by design)."
         }
-        [void]$lines.Add("CODER TEST QA: $n finding(s) over $files test file(s)$subject, $hard PROVEN - $tail")
+        # #1416: the language mix belongs on the FINDINGS line too, not only the clean one.
+        # The first draft put it only on 'clean' and the real archived delivery went straight
+        # past it, because that delivery HAS a finding -- so the one line most likely to be
+        # read on a website was the one still unable to say a website had been read.
+        [void]$lines.Add("CODER TEST QA: $n finding(s) over $files test file(s)$subject$(Format-CoderTestQaLanguages -Result $Result), $hard PROVEN - $tail")
         $shown = 0
         foreach ($f in @($Result.Findings)) {
             if ($shown -ge $MaxFindings) { break }
@@ -1307,7 +1440,28 @@ function Format-CoderTestQaBlock {
         if ($n -gt $shown) { [void]$lines.Add("  - (+$($n - $shown) more finding(s) in the sidecar JSON)") }
     }
     if (@($Result.Unparsed).Count -gt 0) {
-        [void]$lines.Add("  - NOT EXAMINED: $(@($Result.Unparsed).Count) test file(s) would not parse, so they were skipped by the scan.")
+        # #1416, review: "would not parse" is accurate for a syntax error and WRONG for the
+        # other thing that lands here -- a file whose language scanner was unavailable, which
+        # is a fact about the grader rather than the file. This module's whole thesis is that
+        # those are different, and its own operator line was collapsing them. The two are
+        # still carried in one list (both mean NOT EXAMINED, and both are excluded from the
+        # verdict identically); what changes is that the sentence no longer asserts a cause
+        # it cannot know from here.
+        [void]$lines.Add("  - NOT EXAMINED: $(@($Result.Unparsed).Count) test file(s) could not be read (a syntax error, or no scanner available for their language), so they were skipped by the scan and the verdict above does not cover them.")
+    }
+    # #1416, added in review: `uncovered` reached the operator ONLY through the `not-covered`
+    # status, which requires that NOTHING was scanned. On a mixed tree -- one python exam and
+    # three ruby ones -- the line he read was "clean - 1 test file(s) examined, no findings"
+    # while three exams went ungraded and were named nowhere he would look. The whole ticket
+    # is that an unexamined exam must not be able to hide inside a clean-looking line, and the
+    # field built to prevent it was invisible in the one case where something else passed.
+    # Mirrors the Unparsed line above, because it is the same kind of disclosure.
+    $uncoveredList = @(Get-ResultField -Object $Result -Name 'Uncovered' -Default @())
+    if ($uncoveredList.Count -gt 0 -and $status -ne 'not-covered') {
+        $head = @($uncoveredList | Select-Object -First 3) -join ', '
+        $rest = ''
+        if ($uncoveredList.Count -gt 3) { $rest = " (and $($uncoveredList.Count - 3) more)" }
+        [void]$lines.Add("  - NOT EXAMINED: $($uncoveredList.Count) test file(s) are in a language this grader cannot read, so they were NOT graded at all: $head$rest. The verdict above does not cover them.")
     }
     if (-not [bool]$Result.PropertyExecutionMeasured) {
         # Disclosed, not silently absent: the counts map would otherwise carry unexecuted_property: 0,
@@ -1336,6 +1490,18 @@ function ConvertTo-CoderTestQaSidecarJson {
         # regexing the prose block, so the attribution is a first-class field here too.
         scope_mode = "$($r.ScopeMode)"
         scope_changed_files = [int]$r.ScopeChangedFiles
+        # #1416: WHICH languages this record's numbers describe, and which exams went ungraded.
+        # These belong here and not only in the prose block, because the audit that FOUND #1416
+        # was computed over 95 of these sidecars -- without them a future audit still could not
+        # ask "was the website half of this delivery graded" without re-parsing scanner_json.
+        # A fix invisible to the instrument that would next look for it is not finished.
+        # Get-JsonField, never a bare read: under StrictMode `$r.NodeFilesScanned` THROWS when
+        # the property is absent, which is precisely the old-shaped result this must tolerate.
+        languages = [ordered]@{
+            python = [int](Get-ResultField -Object $r -Name 'PythonFilesScanned' -Default 0)
+            node = [int](Get-ResultField -Object $r -Name 'NodeFilesScanned' -Default 0)
+        }
+        uncovered = @(@(Get-ResultField -Object $r -Name 'Uncovered' -Default @()) | ForEach-Object { "$_" })
         unparsed = @(@($r.Unparsed) | ForEach-Object { "$_" })
         counts = $r.Counts
         findings = @(@($r.Findings) | ForEach-Object {
@@ -1745,12 +1911,105 @@ function Add-WebHint {
     $note = @'
 This build ships a pre-wired, DEPENDENCY-FREE Node skeleton that already builds and tests OFFLINE: a `node:http` server in `src/server.js` (REST routes + static files from `public/`), a front-end in `public/index.html` + `public/app.js`, and `node --test` tests in `test/` that import the server and bind an EPHEMERAL port. EXTEND it -- add your feature to these files; do NOT re-scaffold or add a second project, and run `npm test` as you go until it is green.
 ACT FIRST -- your FIRST tool call should be an EDIT to `public/index.html`. The seed files and their layout are described right here, so do NOT spend turns reading the seed before you start (every exploratory read is a chance to stall). Edit the page first, then the tests, then run `npm test`.
+THE FRONT DOOR -- `public/index.html` is the page a visitor GETS AT `/`. The server mounts the site root to it, so it is the only page anyone reaches without typing a filename.
+- If the goal has a home page, a landing page, or a main page, THAT PAGE IS `public/index.html`. Build it there. Do NOT create a second home page beside it (`home.html`, `main.html`, `landing.html`, `start.html`) -- a visitor never reaches it, the site opens on the leftover placeholder, and the delivery looks empty however many pages you wrote.
+- Every OTHER page is a sibling file in `public/`, and `public/index.html` must LINK to each one, or there is no way to navigate to them.
+- If a shared header or menu is asked for, its "home" link points at `index.html` -- the same page the server serves at `/`. One home page, one name for it, used everywhere.
+- Never leave the seed's placeholder content (`<h1>App</h1>`, the lettered circle, `Loading...`) in the delivered `index.html`. If it is still there at the end, the front door was never built.
+THE SERVED ROOT -- the server serves `public/` AND NOTHING ELSE (`src/server.js`: `const PUBLIC = join(here, '..', 'public')`). A file outside `public/` exists on disk and is a 404 in the browser.
+- EVERYTHING the page loads at runtime lives under `public/`: pages, scripts, styles, images, and any DATA FILE you write. If pages share a data file, put it at `public/data/<name>.json` and fetch `./data/<name>.json` -- writing it to `data/` beside `public/` makes it unreachable, and the page will render its own "Failed to load" message while looking otherwise fine.
+- After writing any `fetch('...')`, check the path resolves from `public/` as the root. `fetch('./data/pieces.json')` needs the file at `public/data/pieces.json`.
+- A page that catches a failed fetch and shows an error string still COUNTS AS BROKEN. Do not ship a page whose normal state is "Failed to load", "Error", "undefined" or "NaN" -- if you see one of those in your own output, the data path is wrong.
 OFFLINE RULES (this box has NO network -- breaking these is why the build fails):
 - NEVER reference an external URL: no CDN, no remote image/script/style/font, no `fetch` to the internet. For an image use an inline `<svg>...</svg>` or a `data:` URI -- NOT `<img src="https://...">`. An external asset will not load and any test that requests one will fail.
 - TEST OFFLINE, the way the seed does: in a test, `import { server }`, `await new Promise(r => server.listen(0, r))`, read `server.address().port`, `fetch` THAT port, then `server.close()`. Or assert the static files directly (read `public/index.html` and check its contents). NEVER `fetch` a hardcoded port (8081, 3000, ...) you did not start in that same test -- it is connection-refused and the test fails.
 - The page is also checkable with the browser tool on a `file:///` path or the localhost port YOU started -- a clean console means done.
 '@
     return "$Prompt`n`n--- OFFLINE WEB BUILD (extend the seeded offline skeleton; no external assets) ---`n$note"
+}
+
+function Test-WebBuild {
+    # IS THIS A WEB BUILD? -- a DIFFERENT question from "should I seed a web scaffold?" (#1367/#1375).
+    #
+    # THE DEFECT THIS FIXES, measured 2026-08-14. Add-WebHint was gated on `$scaffold -eq 'web'`,
+    # and `$scaffold` comes from Resolve-TaskScaffold, whose FIRST line is `if ($HasProject) {
+    # return '' }` -- correctly, because its job is to decide what to SEED and it must never
+    # clobber an existing project. The consequence nobody had traced: once the sandbox has been
+    # seeded, EVERY LATER TASK resolves to '' and the web brief is not injected at all.
+    #
+    # For a one-task build that is invisible. For a multi-page site it is most of the run: B9
+    # authors seven tasks, so ONE dispatch got the web brief and SIX did not. Measured across
+    # every banked agent log in state/reports: exactly one contains "OFFLINE WEB BUILD", and it
+    # is a 2026-07-27 single-task job. **No B9 coder has ever been shown the web brief.**
+    #
+    # That is upstream of both of the operator's own eyeball findings. The coder that created
+    # `home.html` instead of building `public/index.html` (#1367) had never been told which file
+    # a visitor reaches; the coder that wrote `fetch('./data/pieces.json')` against a file outside
+    # the served root (#1375) had never been told what the server serves. Both briefs existed and
+    # neither was delivered.
+    #
+    # Returns $true when this task builds into a web project, by any of three independent signals.
+    # Deliberately NOT a rename of the scaffold question: the seeding decision stays exactly as it
+    # is, because it is correct.
+    param(
+        [string]$Scaffold = '',      # the RESOLVED scaffold (fresh dispatches only)
+        [string]$Surface = '',       # the planner's declared surface, if any
+        [string]$ProjectRoot = ''    # the worktree, to ask what the tree actually IS
+    )
+    # 1. Today's signal, preserved byte-for-byte: a fresh dispatch that seeds the web scaffold.
+    if ($Scaffold -eq 'web') { return $true }
+    # 2. The planner declared a web surface. True whether or not a project already exists, which
+    #    is precisely the case the scaffold question has to answer 'no' to.
+    if ($Surface) {
+        $p = Resolve-BuildProfile -Surface $Surface
+        if ($p.scaffold -eq 'web') { return $true }
+    }
+    # 3. The tree IS the web seed. BOTH markers are required -- `public/` alone appears in plenty
+    #    of non-web projects, and `src/server.js` alone is a bare node service. Together they are
+    #    this scaffold's signature, and requiring both keeps a python or dotnet repo from ever
+    #    collecting web instructions it cannot act on.
+    if ($ProjectRoot) {
+        $hasPublic = Test-Path -LiteralPath (Join-Path $ProjectRoot 'public') -PathType Container
+        $hasServer = Test-Path -LiteralPath (Join-Path $ProjectRoot 'src/server.js') -PathType Leaf
+        if ($hasPublic -and $hasServer) { return $true }
+    }
+    return $false
+}
+
+function Test-WebStaticBuild {
+    # The web-static sibling of Test-WebBuild, fixed in the SAME change because the reasoning
+    # that found the web defect is a PREDICATE, not an explanation of one site (lesson 342).
+    #
+    # Swept every hint injected by new-agent-task.ps1 on 2026-08-14. Five gate on something
+    # sound -- the upstream complexity signal, the build PROFILE (computed straight from the
+    # surface, never through Resolve-TaskScaffold), or the worktree. Exactly ONE shared the
+    # web hint's defect: `Add-WebStaticHint` was gated on `$scaffold -eq 'web-static'`, and
+    # `$scaffold` returns '' the moment a project exists. So a multi-task static site briefs
+    # its seeding dispatch and no other -- the same silence, in the one other place it could
+    # occur, latent rather than measured only because web-static has run once.
+    #
+    # Its seed is the opposite shape to the web one: ONE self-contained `index.html` at the
+    # ROOT, with deliberately no package.json, no src/server.js, no public/ (#886). So the
+    # tree signature is index.html PLUS the ABSENCE of the server-scaffold markers, which
+    # also makes it mutually exclusive with Test-WebBuild -- a tree cannot answer yes to both.
+    param(
+        [string]$Scaffold = '',
+        [string]$Surface = '',
+        [string]$ProjectRoot = ''
+    )
+    if ($Scaffold -eq 'web-static') { return $true }
+    if ($Surface) {
+        $p = Resolve-BuildProfile -Surface $Surface
+        if ($p.scaffold -eq 'web-static') { return $true }
+    }
+    if ($ProjectRoot) {
+        $hasIndex  = Test-Path -LiteralPath (Join-Path $ProjectRoot 'index.html') -PathType Leaf
+        $hasPkg    = Test-Path -LiteralPath (Join-Path $ProjectRoot 'package.json') -PathType Leaf
+        $hasServer = Test-Path -LiteralPath (Join-Path $ProjectRoot 'src/server.js') -PathType Leaf
+        $hasPublic = Test-Path -LiteralPath (Join-Path $ProjectRoot 'public') -PathType Container
+        if ($hasIndex -and -not $hasPkg -and -not $hasServer -and -not $hasPublic) { return $true }
+    }
+    return $false
 }
 
 function Add-WebStaticHint {
@@ -3523,13 +3782,31 @@ function Invoke-CandidateBuild {
             $env:PYTHONPATH = $wt
             Push-Location $wt
             try {
-                $testOut = (uv run --no-project --with pytest --with hypothesis pytest -x -q 2>&1 | Out-String)
+                # DoD row 4: --hypothesis-show-statistics ADDED (#1195 residual). Half that row's
+                # proof set -- `unexecuted_property` -- could not fire in production for one
+                # reason: this line produced no statistics artifact, so `-StatsPath` had nothing
+                # to point at and `PropertyExecutionMeasured` was false on every run ever made.
+                # A dead `@given` and a real one were indistinguishable in the report.
+                #
+                # SAFE BY CONSTRUCTION, and that is why it is done here rather than argued: the
+                # flag only ADDS output. Hypothesis is already installed on this very line
+                # (`--with hypothesis`), so the argument is recognised; the exit code is
+                # untouched, so no build's pass/fail moves.
+                $testOut = (uv run --no-project --with pytest --with hypothesis pytest -x -q --hypothesis-show-statistics 2>&1 | Out-String)
                 $testResult = if ($LASTEXITCODE -eq 0) { 'pass' } elseif ($LASTEXITCODE -eq 5) { 'none' } else { 'fail' }
             } finally {
                 Pop-Location
                 if ($null -eq $prevPP) { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue } else { $env:PYTHONPATH = $prevPP }
             }
             Write-Host ($testOut.Trim())
+            # DoD row 4: PERSIST the statistics so a later stage can point at them. The capture
+            # already exists in $testOut and was written only to the console, which is why
+            # `-StatsPath` had nothing to reference and PropertyExecutionMeasured was false on
+            # every production run ever made. Written INTO THE WORKTREE deliberately: the QA
+            # stage runs in a different process after candidate selection and already holds
+            # $wt, so this needs no cross-process plumbing and dies with the worktree.
+            # Fail-soft -- a stats file that cannot be written must never sink a build.
+            try { Set-Content -LiteralPath (Join-Path $wt '.blarai-hypothesis-stats.txt') -Value $testOut -Encoding utf8 } catch { }
         } else { Write-Host "[2/5] No test setup found - skipping." }
     }
     $testError = if ($testResult -eq 'fail') { "The test step failed:`n" + ((($testOut -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 25) -join "`n") } else { '' }
@@ -3751,14 +4028,28 @@ function Invoke-VisualFixPass {
         # 1. Run the coder on the FIX prompt.
         $run = @(& $RunCoder)[-1]
         if ($run -isnot [hashtable]) { $run = @{ TimedOut = $false; ExitCode = $null } }
-        if ($run.TimedOut) {
-            return @{ Applied = $false; Reason = 'coder timed out on the FIX pass; kept the prior merged version'; Verify = '' }
-        }
+        # #1370: a BOUNDED coder is not an EMPTY one. This used to `return` here, discarding
+        # whatever the coder had written before its clock ran out — without committing it,
+        # without verifying it, without offering it to anything. MEASURED across two B9 runs
+        # (2026-08-09/10): 35 fix cycles, 11 applied, 24 discarded, and every one of the 24
+        # was this branch. Not one was rejected on merit. `create-home-page` lost 3 of 3 on
+        # both runs, which is why #1367's placeholder front door survived a whole night of a
+        # loop explicitly trying to fix it.
+        #
+        # Stages 2-4 below ARE the gate, and they already behave correctly: CommitFix reports
+        # whether anything was actually written, Verify refuses to merge a broken rebuild over
+        # a working one, and ReMerge fails soft on conflict. The 11 passes that reached them
+        # landed cleanly. This early return protected none of that — it only prevented the
+        # work from being looked at. The base-candidate path says it plainly: "work kept, the
+        # gate decides the merge." This path now says the same.
+        $boundedNote = if ($run.TimedOut) { ' (coder was time-bounded; judged on what it had written)' } else { '' }
 
-        # 2. Commit the FIX; a no-op coder (no new commit) is a benign abort.
+        # 2. Commit the FIX; a no-op coder (no new commit) is a benign abort. A bounded coder
+        # that wrote nothing lands here and is reported as such — which is the honest answer,
+        # and one this function could not previously distinguish from "wrote something good".
         $committed = [bool](@(& $CommitFix)[-1])
         if (-not $committed) {
-            return @{ Applied = $false; Reason = 'the FIX pass produced no changes; kept the prior merged version'; Verify = '' }
+            return @{ Applied = $false; Reason = "the FIX pass produced no changes; kept the prior merged version$boundedNote"; Verify = '' }
         }
 
         # 3. Re-verify the build. Only a real 'fail' blocks (mirrors the merge gate).
@@ -3767,16 +4058,16 @@ function Invoke-VisualFixPass {
         # parameter and a string assignment would trip the type-coercion guard.
         $verifyResult = "$(@(& $Verify)[-1])".Trim().ToLower()
         if ($verifyResult -eq 'fail') {
-            return @{ Applied = $false; Reason = 'the rebuilt app FAILED the verify gate; kept the prior merged version (not merged)'; Verify = $verifyResult }
+            return @{ Applied = $false; Reason = "the rebuilt app FAILED the verify gate; kept the prior merged version (not merged)$boundedNote"; Verify = $verifyResult }
         }
 
         # 4. Re-merge into the base branch. A conflict / error aborts fail-soft.
         $didMerge = [bool](@(& $ReMerge)[-1])
         if (-not $didMerge) {
-            return @{ Applied = $false; Reason = 'the FIX re-merge did not apply cleanly (conflict/error); kept the prior merged version'; Verify = $verifyResult }
+            return @{ Applied = $false; Reason = "the FIX re-merge did not apply cleanly (conflict/error); kept the prior merged version$boundedNote"; Verify = $verifyResult }
         }
 
-        return @{ Applied = $true; Reason = 'FIX pass merged'; Verify = $verifyResult }
+        return @{ Applied = $true; Reason = "FIX pass merged$boundedNote"; Verify = $verifyResult }
     } catch {
         # Any mechanism throwing is an abort, never a task failure.
         return @{ Applied = $false; Reason = "FIX pass aborted on an error (kept the prior merged version): $($_.Exception.Message)"; Verify = '' }
@@ -3826,7 +4117,16 @@ function ConvertFrom-MutmutOutput {
             $survived = if ($total -gt $k) { $total - $k } else { 0 }
         }
     }
-    return @{ Survived = $survived; Total = $total; Sampled = $TimedOut }
+    # #1393 item 1: TOTAL=0 WAS A SENTINEL DOING TWO JOBS -- "no total could be parsed" and
+    # "mutmut ran and had zero mutants to test" produced the identical value, and the note
+    # below could not tell them apart. $totalKnown is set by the SAME branches that assign a
+    # total, so the fact and the number cannot drift; a caller reading only .Total is
+    # unaffected. The two halves are still matched by separate passes, which is the deeper
+    # shape this ticket names -- what changes here is that their DISAGREEMENT is now visible
+    # to the renderer instead of collapsing into a zero.
+    $totalKnown = ($total -gt 0) -or ($Output -match '(?i)\bKilled[:\s]+\d+\s+of\s+0\b') `
+                  -or ($Output -match '(?i)Mutants\s+run:\s*\d+\s*/\s*0\b')
+    return @{ Survived = $survived; Total = $total; Sampled = $TimedOut; TotalKnown = $totalKnown }
 }
 
 function Get-MutationSignalNote {
@@ -3834,9 +4134,29 @@ function Get-MutationSignalNote {
     # SOFT SIGNAL CONTRACT: this note is ALWAYS used with status='pass' or 'skip',
     # NEVER 'fail'. Surviving mutants are a test-coverage hint for the LLM reviewer,
     # not a merge block. Pure; unit-testable without running mutmut; ASCII-only.
-    param([int]$Survived = 0, [int]$Total = 0, [bool]$TimedOut = $false)
+    param([int]$Survived = 0, [int]$Total = 0, [bool]$TimedOut = $false, [bool]$TotalKnown = $false)
     $cap = if ($TimedOut) { ' (time-boxed, partial run)' } else { '' }
     if ($Total -eq 0) {
+        # #1393: A KNOWN NUMERATOR MUST SURVIVE A MISSING DENOMINATOR. This branch tested
+        # $Total first and returned "no mutants measured" while $Survived already held a real
+        # count -- so "Survived: 3" (a genuine mutmut 2.x label that carries no total in the
+        # same line) published as the one phrase that means the OPPOSITE of what was found.
+        # Proved by execution, not by reading: ConvertFrom-MutmutOutput returns Survived=3
+        # Total=0 on that input, because survivors and totals are matched by separate,
+        # independent regex passes and nothing requires both to succeed.
+        #
+        # Same effect class as #1231/#1389/#1391 through a fourth mechanism: nothing here
+        # shrinks a denominator, a real numerator is ORPHANED by a missing one and then
+        # discarded. Three surviving mutants is exactly the weak-test evidence the reviewer
+        # is meant to act on.
+        if ($Survived -gt 0) {
+            return "mutation: $Survived surviving mutant(s) found, but the run's total could not be parsed$cap -- weak tests; add property-based or edge-case tests (soft signal, NOT a merge block)"
+        }
+        if ($TotalKnown) {
+            # #1393 item 1: mutmut RAN and had nothing to mutate. That is a measured zero and
+            # must not borrow the words of an unparsed one.
+            return "mutation: the run reported ZERO mutants to test$cap -- nothing to measure here (soft signal, not a merge block)"
+        }
         return "mutation: no mutants measured$cap (soft signal, not a merge block)"
     }
     if ($Survived -eq 0) {

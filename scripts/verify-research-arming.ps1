@@ -78,14 +78,32 @@ $snapCfg = $env:BLARAI_FLEET_DRIVER_CONFIG
 try {
     Write-Host "== #1206 research-docs arming verification ==" -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '-- A0. the SHIPPED manifest is DORMANT --' -ForegroundColor DarkCyan
-    # The landed-dormant claim, asserted against the file that actually ships. This is the line that
-    # must fail if a future change arms the capability without an LA go-live + a battery-attribution
-    # window (#740 one-change-per-run) -- flipping it is deliberate, never a drive-by.
+    Write-Host '-- A0. the SHIPPED manifest matches the ACKNOWLEDGED posture --' -ForegroundColor DarkCyan
+    # The tripwire: this line must fail if a future change moves the capability without an LA
+    # go-live + a battery-attribution window (#740 one-change-per-run) -- flipping it is
+    # deliberate, never a drive-by.
+    #
+    # IT USED TO ASSERT THE LITERAL $false, AND THAT MADE IT A ONE-SHOT (2026-08-14). The LA
+    # armed the capability in person on 2026-08-06 (ffe258a, "the capability stops being
+    # furniture"). The tripwire fired, correctly -- and then stayed red for eight days,
+    # announcing an authorized ceremony as a failure on every run. A red that can never go
+    # green is not a tripwire; it is furniture, and it hides the next real one. #1384 is the
+    # same shape one floor up: verify-fleet-driver.ps1 has asserted driver=='stdin' since the
+    # acp go-live of 2026-07-11 and has been failing accurately, and unread, for a month.
+    #
+    # So the baseline is now DECLARED, with the change that authorized it. A drive-by flip
+    # still fails -- it will not match this constant either -- but an acknowledged ceremony is
+    # recorded here in the same motion that performs it, and the suite returns to green so the
+    # NEXT unacknowledged change is visible. Moving this constant without an LA go-live and a
+    # #740 attribution window is the thing it exists to prevent; the reviewer's question is
+    # always "what authorized the new value", and the answer belongs on the line below.
+    $ACKNOWLEDGED_RESEARCH_DOCS = $true   # armed 2026-08-06, LA in person, agentic ffe258a (#1206)
     Remove-Item Env:\BLARAI_FLEET_DRIVER_CONFIG -ErrorAction SilentlyContinue
     $shipped = Get-FleetDriverConfig -ScriptRoot $PSScriptRoot -Fresh
-    Assert ($shipped.research_docs -eq $false) `
-        "A0 configs/fleet-driver.json ships research_docs=false (got '$($shipped.research_docs)')"
+    Assert ($shipped.research_docs -eq $ACKNOWLEDGED_RESEARCH_DOCS) `
+        ("A0 shipped research_docs '$($shipped.research_docs)' == acknowledged " +
+         "'$ACKNOWLEDGED_RESEARCH_DOCS' (ffe258a). If a divergence here was authorized, move the " +
+         "baseline in the same commit and cite what authorized it -- otherwise it is a drive-by.")
 
     Write-Host ''
     Write-Host '-- A. the manifest is the authority (pure verdict) --' -ForegroundColor DarkCyan

@@ -162,9 +162,24 @@ the model.**
   denied read doesn't abort the legit task, a gitleaks secret-scan gate, and the
   **human merge-review gate**. Result: 3/3 injection/exfil evals SECURE.
   → BlarAI: this layered model is the template; don't rely on any single control.
-- 🔬 **`ask` permissions FAIL CLOSED when headless** (auto-reject) — *that* is what
-  makes egress/bash/external-dir safe unattended. Verify this property in BlarAI's
-  own runtime before trusting it.
+- ⚠️ **SUPERSEDED 2026-08-14 — `ask` permissions FAIL CLOSED when headless.** This was
+  TRUE and PROVEN under the `stdin` driver, and it is FALSE under the `acp` driver that
+  has been live since 2026-07-11. It reads as a standing property of the system and is a
+  property of a driver we no longer use.
+  **What is true now:** BlarAI's ACP client answers every permission request with an
+  ALLOW, unconditionally — `tools/dispatch_harness/acp_coder.py:647-662` accepts a
+  `tool_call` argument and never reads it. Measured across 2,671 banked agent logs: 287
+  `asking` events, **zero** replied or denied, **265/265** ask-gated commands completed,
+  including deletions inside `tests/`. `ask` is an alias for `allow` while looking like a
+  control. `deny` IS still enforced (opencode enforces it itself and never consults the
+  client), which is what makes a fix viable — see #1376.
+  **The transferable lesson, which is the reason this entry is corrected rather than
+  deleted:** a security posture proven under one driver is not proven under another. The
+  swap of any component that MEDIATES a control invalidates every measurement taken
+  through the old one, and nothing here noticed for a month. The original entry's own last
+  sentence — *"verify this property in BlarAI's own runtime before trusting it"* — was
+  exactly right, and the verification it asked for is what nobody re-ran after the flip.
+  Tracked: #1376 (posture), #1384 (no automated posture gate).
 - 🔬 **gitleaks is format-based:** it blocks well-known credential shapes (proven
   fail-closed on a GitHub PAT) but misses arbitrary strings. The real guarantee
   against a specific secret is the **read-deny** (value never obtained), not the
