@@ -107,6 +107,57 @@ Assert-True ([regex]::IsMatch($addTask, '\$item\.complexity\s*=\s*\$Complexity')
 Assert-True ([regex]::IsMatch($nat, 'Resolve-PassBudget[^\r\n]*-Staged \(\[bool\]\$buildProfile\.staged\)')) 'W10 wiring: the runner passes -Staged ([bool]$buildProfile.staged) so a GUI surface gets the build-budget floor'
 
 # ----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# #1398 / DoD row 19 clause 2 — "the choice AND its reason are recorded".
+#
+# The REASON was banked (acceptance.json carries spec.build_plan.complexity).
+# The CHOICE — the budget that label resolved to — existed only as a prose line
+# in a per-task .log. Measured on run 20260814-230237-bd: a walk of every key in
+# acceptance.json matching complex|budget|candidate|pass|review returned exactly
+# one hit, the label. No JSON on the run carried the 3 or the 2.
+#
+# Row 19's THIRD clause is a CROSS-RUN comparison — hard tasks demonstrably get
+# more attempts than trivial ones — and prose in a log cannot be aggregated.
+# ---------------------------------------------------------------------------
+
+Section '#1398 -- the resolved budget is recordable, not just printable'
+
+# B1-B3: every recognised label resolves to a DISTINCT pair, or "more attempts for harder
+# tasks" is unmeasurable however well it is banked.
+$bs = Resolve-PassBudget -Complexity 'simple'
+$bm = Resolve-PassBudget -Complexity 'moderate'
+$bc = Resolve-PassBudget -Complexity 'complex'
+Assert-True ($bs.Build -lt $bm.Build -and $bm.Build -lt $bc.Build) `
+    'B1 [kill] build budget strictly increases simple < moderate < complex'
+Assert-True ($bs.Review -le $bm.Review -and $bm.Review -le $bc.Review) `
+    'B2 [kill] review budget never decreases as difficulty rises'
+Assert-True (@($bs.Build, $bm.Build, $bc.Build) | Select-Object -Unique).Count -eq 3 `
+    'B3 [kill] the three labels are genuinely distinguishable by their build budget'
+
+# B4-B5: THE STATE THE SIDECAR EXISTS TO SEPARATE. An unrecognised label and an absent one both
+# fall through to the caller's defaults -- SAME NUMBERS, DIFFERENT REASONS. A record that
+# stores only the budget cannot tell them apart, and a reader asking "why 3?" gets the wrong
+# answer for one of them.
+$bUnknown = Resolve-PassBudget -Complexity 'wildly-hard' -DefaultBuild 3 -DefaultReview 2
+$bAbsent  = Resolve-PassBudget -Complexity ''            -DefaultBuild 3 -DefaultReview 2
+Assert-True ($bUnknown.Build -eq $bAbsent.Build) `
+    'B4 [kill] an unrecognised label and an absent one resolve to the SAME budget'
+$known = @('simple', 'moderate', 'complex')
+Assert-True (($known -contains 'wildly-hard') -eq $false -and [bool]'wildly-hard') `
+    'B5 [kill] ...and are still distinguishable: present=true, recognised=false'
+
+Section '#1398 -- new-agent-task.ps1 actually writes the sidecar'
+
+$nat = Get-Content (Join-Path $PSScriptRoot 'new-agent-task.ps1') -Raw
+Assert-True ($nat -match 'pass-budget/v1')       'B6 [kill] the schema is emitted'
+Assert-True ($nat -match 'pass-budget\.json')    'B7 [kill] it is written beside the report'
+Assert-True ($nat -match 'build_passes')         'B8 [kill] the CHOICE is banked, not only the label'
+Assert-True ($nat -match 'label_recognised')     'B9 [kill] present-but-unrecognised is distinguishable from absent'
+# Fail-soft: a sidecar that cannot be written must never sink a dispatch.
+Assert-True ($nat -match 'pass-budget sidecar not written') 'B10 [kill] the write is fail-soft and says so'
+
+
 Section 'Result'
 Write-Host ("  Passed:  {0}" -f $script:Pass) -ForegroundColor Green
 if ($script:Fail) {

@@ -429,7 +429,15 @@ Section 'LK* -- web-tier Edge teardown is unconditional (#1027 leak regression l
 Assert-True ([regex]::IsMatch($capSrc, 'function Stop-EdgeCapture'))       'LK1 [kill] capture-app.ps1 defines Stop-EdgeCapture (kill by --user-data-dir match, not by PID handle)'
 Assert-True ([regex]::IsMatch($capSrc, '(?s)finally\s*\{.{0,600}?Stop-EdgeCapture')) 'LK2 [kill] Stop-EdgeCapture runs in the web tier finally (teardown is unconditional on every arm)'
 Assert-True ([regex]::IsMatch($capSrc, 'LEAK-DETECTED'))                   'LK3 the survivor re-scan fail-louds into the tier log'
-Assert-True ([regex]::IsMatch($capSrc, '--profile-dir \$cdpProfile'))      'LK4 [kill] the ps1 owns the CDP helper profile dir (passes --profile-dir; cleanup survives a helper crash)'
+# Re-anchored 2026-08-14 (#1375). This matched the literal adjacent text `--profile-dir
+# $cdpProfile`, which held only while the helper was invoked with inline arguments. Building the
+# argument list as an array -- needed so `--extra-pages` can be omitted entirely on a single-page
+# site -- separates the flag from its value in the source and turned this red while the PROPERTY
+# was untouched. Third implementation-anchored assertion to fight a correct change today (W18 and
+# the S7 refusal window were the others). What matters is that the ps1 OWNS the profile dir and
+# HANDS IT to the helper, not the syntax by which it does so.
+Assert-True (([regex]::IsMatch($capSrc, '--profile-dir')) -and ([regex]::IsMatch($capSrc, '\$cdpProfile'))) 'LK4 [kill] the ps1 owns the CDP helper profile dir (passes --profile-dir; cleanup survives a helper crash)'
+Assert-True ([regex]::IsMatch($capSrc, '--profile-dir.{0,20}\$cdpProfile')) 'LK4b [kill] ...and the value it passes is the dir it created (not some other path)'
 $lkCdpSrc = Get-Content "$ScriptDir\capture-web-cdp.mjs" -Raw
 Assert-True ([regex]::IsMatch($lkCdpSrc, "process\.on\('exit', teardownSync\)")) 'LK5 [kill] capture-web-cdp.mjs registers exit-synchronous teardown (every exit path kills the tree)'
 Assert-True ([regex]::IsMatch($lkCdpSrc, "'/T', '/F'"))                    'LK6 the mjs teardown kills the process TREE (taskkill /T), not just the launcher PID'
@@ -498,6 +506,40 @@ Assert-Match $dsLoopSrc    '\[string\]\$DeclaredSurface'                    'DS1
 Assert-Match $dsLoopSrc    '-DeclaredSurface \$DeclaredSurface'             'DS18 critique-loop.ps1 PASSES it onward to capture-app.ps1'
 
 # =============================================================================
+Section 'PS* -- every delivered page is opened, not just the entry (#1375)'
+# THE DEFECT: the web floor rendered ONE page of a five-page site. `pieces.html` and
+# `piece-detail.html` were never opened by any instrument, so "served + loaded + zero console
+# errors" was earned on the entry page and reported for the product -- while both of the
+# operator's central pages showed "Failed to load pieces." He found them by clicking, in under
+# a minute; four gates did not.
+$capSrc = Get-Content (Join-Path $PSScriptRoot 'capture-app.ps1') -Raw
+$cdpSrc = Get-Content (Join-Path $PSScriptRoot 'capture-web-cdp.mjs') -Raw
+
+Assert-True ($capSrc -match '\$extraPages\s*=\s*@\(\)') 'PS1 capture-app builds a page list'
+Assert-True ($capSrc -match '(?s)if \(\$srvUp\)\s*\{.{0,400}?\$mount\s*=') 'PS2 [kill] the sweep runs ONLY when the server is up (a file:// sibling is a different document with different resolution)'
+Assert-True ($capSrc -match 'Select-Object -First 12') 'PS3 the sweep is BOUNDED (it runs inside a 120s floor timeout)'
+Assert-True ($capSrc -match 'node_modules') 'PS4 node_modules/.git are excluded from the enumeration'
+Assert-True ($capSrc -match '--extra-pages') 'PS5 [kill] the list is PASSED to the capture helper (else the enumeration is dormant)'
+Assert-True ($capSrc -match '(?s)if \(\$extraPages\.Count -gt 0\)\s*\{\s*\$cdpArgs') 'PS6 [kill] the flag is OMITTED when nothing sits beside the entry (single-page invocation byte-identical)'
+
+Assert-True ($cdpSrc -match "args\['extra-pages'\]") 'PS7 the helper reads --extra-pages'
+Assert-True ($cdpSrc -match 'const pages = \[entrySnapshot\]') 'PS8 every page gets its own record'
+Assert-True (($cdpSrc -match 'pagesRequested') -and ($cdpSrc -match 'pagesVisited')) 'PS9 [kill] the sidecar records BOTH counts, so a truncated sweep can never read as a complete one'
+Assert-True ($cdpSrc -match 'rec\.visited = true') 'PS10 a page is marked visited only after it was actually reached'
+Assert-True ($cdpSrc -match "rec\.error = cleanText\('navigate failed") 'PS11 [kill] an unreachable page is recorded as an ERROR, never as clean'
+Assert-True ($cdpSrc -match 'export function scanErrorText') 'PS12 the operator-visible failure-text scanner exists (a caught rejection raises no console error)'
+
+# THE ADVISORY PROPERTY, and it is the load-bearing one. Extra pages must NEVER enter the
+# top-level console/pageErrors arrays that swap_ops._web_console_error_lines reads, or this
+# capture silently becomes a NEW WAY FOR A BUILD TO FAIL -- which is the operator's ceremony,
+# not a wiring decision (#1345, where link_lint shipped advisory for exactly this reason).
+$loopStart = $cdpSrc.IndexOf('for (const pageUrl of extraPages)')
+$loopEnd   = if ($loopStart -ge 0) { $cdpSrc.IndexOf('writeSidecar(sidecarPath', $loopStart) } else { -1 }
+$loopBody  = if ($loopStart -ge 0 -and $loopEnd -gt $loopStart) { $cdpSrc.Substring($loopStart, $loopEnd - $loopStart) } else { '' }
+Assert-True ($loopBody.Length -gt 0) 'PS13 the multi-page loop is present and locatable'
+Assert-True (($loopBody -notmatch 'consoleEntries\.push') -and ($loopBody -notmatch 'pageErrors\.push')) 'PS14 [kill] ADVISORY: the loop never pushes into the arrays the VERDICT reads'
+Assert-True (($loopBody -match 'consoleEntries\.slice\(cBefore\)') -and ($loopBody -match 'pageErrors\.slice\(eBefore\)')) 'PS15 a page''s own errors are SLICED from the shared arrays, not re-read'
+
 Section 'Result'
 Write-Host ("  Passed:  {0}" -f $script:Pass) -ForegroundColor Green
 if ($script:Skip) { Write-Host ("  Skipped: {0}" -f $script:Skip) -ForegroundColor Yellow }

@@ -94,6 +94,13 @@ $blockClean = Format-CoderTestQaBlock -Result $clean
 Assert-Contains $blockClean 'CODER TEST QA: clean' 'F1: a measured clean exam says clean'
 Assert-Contains $blockClean '4 test file(s)' 'F1: and names how many files carried the verdict'
 
+# NOTE (#1416, 2026-08-16): this fixture forces Measured=$true, which production can no
+# longer produce for `no-tests` -- Invoke-CoderTestQa now reads the scanner's honest
+# measured, and a scan that parsed nothing is measured=false. So F2 exercises the
+# defensive branch at fleet-lib's `if ($status -eq 'no-tests')` and NOT the path a real
+# dispatch takes. It is kept because that branch still exists and should stay correct;
+# the REACHABLE path is locked by RV2/RV2b below. Flagged in review, where it was
+# passing while the sentence it asserts had been lost from production output.
 $noTests = & $mkResult 'no-tests' $true 0 @() 0 'no python test files under the candidate -- there was no exam to examine' $true
 $blockNoTests = Format-CoderTestQaBlock -Result $noTests
 Assert-Contains $blockNoTests 'NO EXAM' 'F2 [kill] zero files scanned is NOT reported as clean -- there was no exam, which is a different fact'
@@ -357,8 +364,18 @@ try {
         [void](Add-CtqCommit -Repo $night -Rel 'app/widget.py' -Body "def widget():`n    return 1" -Message 'task 4: code, no test')
         $noExam = Invoke-CoderTestQa -Repo $night -BlarAiRepo $BlarAiRepo -Since $beforeCodeOnly
         Assert-Eq 'no-tests' $noExam.Status 'S11 [kill] a task that changed code but wrote no test is `no-tests`, not `clean` -- the tree HAS tests, they just are not this task''s'
-        Assert-Contains $noExam.Detail 'wrote no exam' 'S11 [kill] and the detail states the task-level fact, not the tree-level one it would now be wrong about'
-        Assert-Contains (Format-CoderTestQaBlock -Result $noExam) 'NO EXAM' 'S11: which reaches the operator-facing block'
+        # #1416: this asserted the detail contained 'wrote no exam', which pinned the exact
+        # sentence the ticket exists to delete -- "NONE of them was a python test -- it wrote
+        # no exam for its own work", published against 55 website deliveries holding real
+        # .test.js files. The ASSERTION'S INTENT survives unchanged and is what is checked
+        # here: the detail must state the TASK-level fact, not the tree-level one. What
+        # changes is that it names the grader's language coverage instead of accusing the
+        # coder, and says which languages those are so the claim is checkable.
+        Assert-Contains $noExam.Detail 'no exam of its own work' 'S11 [kill] and the detail states the task-level fact, not the tree-level one it would now be wrong about'
+        Assert-Contains $noExam.Detail 'python, node' 'S11 [kill] naming the languages it CAN read, so "no test file" is a checkable claim rather than an accusation'
+        Assert-NotContains $noExam.Detail 'wrote no exam for its own work' 'S11 [kill] #1416: the accusation sentence must not come back'
+        Assert-False ([bool]$noExam.Measured) 'S11 [kill] #1416: a scan that parsed NOTHING is not a measurement -- this was hardcoded $true, which is why measured:true and files_scanned:0 shipped in the same record'
+        Assert-Contains (Format-CoderTestQaBlock -Result $noExam) 'NO EXAM' 'S11: which reaches the operator-facing block, still in the sharper wording'
 
         # The caller decides there ARE changes from a COMMIT COUNT against the baseline (Test-CaptureFault
         # counts with git rev-list); the scope is a CONTENT diff against the same baseline. A coder that
@@ -480,6 +497,130 @@ Assert-Eq $natCalls.Count (@($natCalls | Where-Object { $_.Value -match '-Since 
 Assert-True ([regex]::IsMatch($nat, '(?m)^\$codeBase = \(git -C \$wt rev-parse HEAD')) 'W13 [kill] and $codeBase is still the coder BASELINE commit, the same anchor $hasChanges and a resample use'
 $iBase = $nat.IndexOf('$codeBase = (git -C $wt rev-parse HEAD')
 Assert-True (($iBase -ge 0) -and ($iBase -lt $nat.IndexOf('Invoke-CoderTestQa'))) 'W13: computed before the scan needs it'
+
+# ----------------------------------------------------------------------------
+Section 'Node (#1416): the website half, which 55 consecutive records never reached'
+# Every check below is driven through the REAL Invoke-CoderTestQa against a REAL node tree.
+# The defect these retire was invisible for 55 website deliveries for exactly one reason:
+# nobody ever ran this pair against a website. A mocked result object would have reproduced
+# that blind spot faithfully.
+$nodeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ctq-node-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$rbRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ctq-rb-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+try {
+    New-Item -ItemType Directory -Path (Join-Path $nodeRoot 'test') -Force | Out-Null
+    # A real exam, transcribed in shape from the 08-14 pottery delivery's test/header.test.js.
+    Set-Content -Encoding UTF8 -Path (Join-Path $nodeRoot 'test/header.test.js') -Value @'
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+test('Header contains the logo', () => {
+  assert.ok('<header><img src="assets/logo.png"></header>'.includes('logo.png'));
+});
+'@
+    $nodeOk = Invoke-CoderTestQa -Repo $nodeRoot -BlarAiRepo $BlarAiRepo
+    Assert-Eq 'clean' $nodeOk.Status 'N1 [kill] a real WEBSITE exam is examined and comes back clean -- it returned `no-tests` for all 55 banked website records'
+    Assert-True ([bool]$nodeOk.Measured) 'N1b and it is a real measurement'
+    Assert-Eq 1 $nodeOk.FilesScanned 'N1c the .test.js file is COUNTED -- files_scanned was 0 while measured said true'
+    Assert-Eq 1 $nodeOk.NodeFilesScanned 'N1d and counted as node, so "was the website half graded" is answerable'
+    Assert-Contains (Format-CoderTestQaBlock -Result $nodeOk) 'node 1' 'N1e the operator-facing block names the language mix'
+    Assert-NotContains (Format-CoderTestQaBlock -Result $nodeOk) 'wrote no exam' 'N1f [kill] THE regression: the false accusation must never return'
+
+    # A website exam that cannot fail. Row 5's withdrawal trigger has never fired on a
+    # node task, and row 5's own text called that a cadence gap -- it was structural.
+    Set-Content -Encoding UTF8 -Path (Join-Path $nodeRoot 'test/empty.test.js') -Value @'
+import { test } from 'node:test';
+test('the studio page renders', () => {});
+'@
+    $nodeBad = Invoke-CoderTestQa -Repo $nodeRoot -BlarAiRepo $BlarAiRepo
+    Assert-Eq 'findings' $nodeBad.Status 'N2 [kill] a website test that provably cannot fail is CONVICTED'
+    Assert-True ([int]$nodeBad.Hard -ge 1) 'N2b [kill] and it is HARD, so the green-gate review skip can be withdrawn on a WEBSITE -- row 5 could not fire on node at all before this'
+    Assert-Contains (Format-CoderTestQaBlock -Result $nodeBad -SkipWithdrawn $true) 'WITHDRAWN' 'N2c and the operator is told the reviewer was called in'
+
+    # An exam this grader cannot read at all. The generalisation: fixed once, for the next
+    # ecosystem too, rather than per language after each surprise.
+    New-Item -ItemType Directory -Path (Join-Path $rbRoot 'spec') -Force | Out-Null
+    Set-Content -Encoding UTF8 -Path (Join-Path $rbRoot 'spec/widget_spec.rb') -Value "describe 'x' do`nend"
+    $rb = Invoke-CoderTestQa -Repo $rbRoot -BlarAiRepo $BlarAiRepo
+    Assert-Eq 'not-covered' $rb.Status 'N3 [kill] an exam in an unreadable language is NOT-COVERED -- distinct from `no-tests` (no exam) and from `unavailable` (the scanner broke)'
+    Assert-False ([bool]$rb.Measured) 'N3b [kill] and it is an ABSENT measurement, never a clean one'
+    Assert-Eq 1 @($rb.Uncovered).Count 'N3c the ungraded exam is NAMED, so an absence cannot be served as nothing-to-read'
+    Assert-Contains $rb.Detail 'gap in the GRADER' 'N3d [kill] and the sentence blames the grader, not the coder -- the whole lesson of #1416'
+    Assert-NotContains $rb.Detail 'wrote no exam' 'N3e [kill] especially here, which is the case that produced the accusation'
+    Assert-Contains $rb.Uncovered[0] 'spec/widget_spec.rb' 'N3f named repo-relative: this field exists to be READ by a person'
+
+    # The SIDECAR is what an audit reads. #1416 itself was found by computing over 95 of these;
+    # a fix the next audit cannot see from the bank is a fix wired into nothing.
+    $sidecarNode = ConvertTo-CoderTestQaSidecarJson -Result $nodeOk | ConvertFrom-Json
+    Assert-Eq 1 $sidecarNode.languages.node 'N4 [kill] the banked sidecar carries the language breakdown -- without it the next audit still cannot ask "was the website half graded" without re-parsing scanner_json'
+    Assert-Eq 0 $sidecarNode.languages.python 'N4b both languages are always present, at zero, so absence is never read as "no such language here"'
+    $sidecarRb = ConvertTo-CoderTestQaSidecarJson -Result $rb | ConvertFrom-Json
+    Assert-Eq 1 @($sidecarRb.uncovered).Count 'N4c and the ungraded exams are named IN THE BANK, not only in prose the operator may never read'
+    $sidecarNull = ConvertTo-CoderTestQaSidecarJson -Result $null | ConvertFrom-Json
+    Assert-Eq 0 $sidecarNull.languages.node 'N4d [kill] even a null result serialises the new fields rather than omitting them -- a missing key is what a consumer reads as zero'
+} finally {
+    Remove-Item -Recurse -Force $nodeRoot, $rbRoot -ErrorAction SilentlyContinue
+}
+
+# ----------------------------------------------------------------------------
+Section 'Review findings (#1416, 2026-08-16): the ungraded exam must reach the OPERATOR'
+# Both of these were found by an independent reviewer AFTER the fix was written, and both
+# are the ticket's own defect class committed inside its repair.
+$rv = New-CoderTestQaResult -Status 'clean'
+$rv.Measured = $true; $rv.FilesScanned = 1; $rv.PythonFilesScanned = 1; $rv.NodeFilesScanned = 0
+$rv.Uncovered = @('spec/cart_spec.rb', 'spec/order_spec.rb', 'spec/user_spec.rb')
+$rvBlock = Format-CoderTestQaBlock -Result $rv
+Assert-Contains $rvBlock 'NOT EXAMINED' 'RV1 [kill] `uncovered` reached the operator ONLY through the not-covered status, which needs NOTHING to have been scanned -- so a MIXED tree rendered "clean - 1 test file(s) examined, no findings" while three exams went ungraded and were named nowhere he would look'
+Assert-Contains $rvBlock 'cart_spec.rb' 'RV1b and it NAMES them, the same disclosure the Unparsed line already gives'
+Assert-Contains $rvBlock 'does not cover them' 'RV1c and says plainly that the verdict above excludes them'
+
+# The no-tests sentence, on the path production can actually reach. The reviewer found the
+# old branch had become unreachable (no-tests always implies Measured=$false now) and its
+# sharper sentence lost with it -- while the verifier's F2 fixture forces Measured=$true and
+# so was still certifying a path nothing runs.
+$rvNoExam = New-CoderTestQaResult -Status 'no-tests' -Detail 'no test files under the candidate in any language this grader reads -- there was no exam to examine'
+$rvNoExam.Measured = $false
+$rvNoExamBlock = Format-CoderTestQaBlock -Result $rvNoExam
+Assert-Contains $rvNoExamBlock 'NO EXAM' 'RV2 [kill] a genuinely exam-less candidate keeps the SHARP wording on the REACHABLE path (Measured=$false), not only on the synthetic one'
+Assert-Contains $rvNoExamBlock 'rests on no coder-authored test at all' 'RV2b [kill] and the tail states the fact about the CANDIDATE, not the grader-shaped "ABSENT measurement" -- the first fix kept the lead and lost the tail'
+Assert-NotContains $rvNoExamBlock 'ABSENT measurement' 'RV2c [kill] the two sentences are different facts and must not both be printed'
+
+# ----------------------------------------------------------------------------
+Section 'StrictMode (#1416): the new fields must not crash a dispatch on an old-shaped result'
+# This is a REAL defect that shipped in the first draft of #1416 and was caught by probing
+# rather than by reading. `Format-CoderTestQaLanguages` guarded itself with
+# `if ($null -ne $Result.PythonFilesScanned)` -- which IS the unsafe read: under
+# `Set-StrictMode -Version Latest` a bare reference to an ABSENT property THROWS, so the
+# guard crashed on exactly the object it existed to tolerate. Get-JsonField was written for
+# #1201 after the same mistake and its comment says so in terms.
+#
+# Severity is why this is locked rather than noted: a misgrade costs a task, a THROW inside
+# the report path costs the whole dispatch.
+$strict = {
+    Set-StrictMode -Version Latest
+    # A result object shaped the way it was BEFORE #1416 added three fields.
+    $legacy = @{
+        Status = 'clean'; Measured = $true; Hard = 0; Findings = @(); Counts = @{}
+        FilesScanned = 4; Unparsed = @(); Detail = ''; Json = ''
+        ScopeMode = 'changed-since'; ScopeChangedFiles = 3
+        PropertyExecutionMeasured = $false
+    }
+    [void](Format-CoderTestQaLanguages -Result $legacy)
+    [void](Format-CoderTestQaBlock -Result $legacy)
+    [void](ConvertTo-CoderTestQaSidecarJson -Result $legacy)
+    $legacy.Status = 'findings'; $legacy.Hard = 1
+    $legacy.Findings = @(@{ Class = 'vacuous_test'; Message = 'm'; Subject = 's' })
+    [void](Format-CoderTestQaBlock -Result $legacy)
+    [void](Format-CoderTestQaLanguages -Result $null)
+    'ok'
+}
+$strictResult = $null
+try { $strictResult = & $strict } catch { $strictResult = "THREW: $($_.Exception.Message)" }
+Assert-Eq 'ok' $strictResult 'SM1 [kill] reading the #1416 fields off a PRE-#1416 result does not throw under Set-StrictMode -Version Latest -- a bare $Result.NodeFilesScanned read does, and a throw in the report path kills the dispatch rather than misgrading one task'
+
+# And the positive direction: the values still arrive when they ARE present.
+$withLangs = New-CoderTestQaResult -Status 'clean'
+$withLangs.Measured = $true; $withLangs.FilesScanned = 9
+$withLangs.NodeFilesScanned = 9; $withLangs.PythonFilesScanned = 0
+Assert-Eq ' (node 9)' (Format-CoderTestQaLanguages -Result $withLangs) 'SM2 the defensive read is not a silencer -- a real breakdown still renders'
 
 # ----------------------------------------------------------------------------
 Section 'Result'

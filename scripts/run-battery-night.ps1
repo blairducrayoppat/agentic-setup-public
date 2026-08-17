@@ -828,6 +828,145 @@ function Get-LiveDispatch {
     }
 }
 
+function Get-BlockingRunOwner {
+    # LOCK 2, extracted (#1380). Returns $null when no prior fleet run still owns
+    # $RepoPath, else a descriptor naming the owner and WHY it could not be cleared.
+    # Never throws.
+    #
+    # WHY THIS IS A FUNCTION NOW. It was 45 lines inline in the per-job loop, which made
+    # it the one lock in this file with NO verifier -- security principle 12 asks every
+    # control to ship with a proof it fails when disengaged, and an inline block cannot be
+    # driven by anything. verify-battery-archive-guard.ps1 extracts THIS function by AST,
+    # so the tests exercise the shipped text rather than a paraphrase. The extraction is
+    # the reason the boot predicate below could be toggle-proved at all.
+    #
+    # THE QUESTION IT ANSWERS is "does a prior run still own this repo", which the process
+    # check (LOCK 1) deliberately does not: LOCK 1 is box-wide and cannot say WHICH repo,
+    # and it misses a DETACHED swap driver that outlives the runner that spawned it (the
+    # original b7af0a0 case). The two locks stay independent; that is the point of two.
+    param(
+        [Parameter(Mandatory)][string]$FleetRunsDir,
+        [Parameter(Mandatory)][string]$RepoPath,
+        # The machine's last boot. DEFAULTS TO MinValue, which clears nothing: an unknown
+        # boot time must never be an excuse to archive somebody's live build. The caller
+        # passes the real value; the verifier injects synthetic ones to prove both sides.
+        [datetime]$BootTime = [datetime]::MinValue,
+        [int]$Window = 12
+    )
+    if (-not (Test-Path $FleetRunsDir)) { return $null }
+
+    foreach ($rd in (Get-ChildItem $FleetRunsDir -Directory -ErrorAction SilentlyContinue |
+                     Sort-Object Name -Descending | Select-Object -First $Window)) {
+        $jl = Join-Path $rd.FullName 'journal.log'
+        if (-not (Test-Path $jl)) { continue }
+        $txt = Get-Content $jl -Raw -ErrorAction SilentlyContinue
+        if (-not $txt) { continue }
+        # Names THIS repo, has started a task, and has not finished it.
+        if ($txt -notmatch [regex]::Escape($RepoPath)) { continue }
+        $starts = ([regex]::Matches($txt, 'TASK-START')).Count
+        $ends   = ([regex]::Matches($txt, 'TASK-END')).Count
+        if ($starts -le $ends) { continue }
+
+        # UNBALANCED IS NOT THE SAME AS LIVE (#1360, 2026-08-09).
+        # A run KILLED mid-task -- budget elapsed, tree-kill, doom stop -- never writes
+        # its final TASK-END, so its journal stays unbalanced FOREVER and this lock blocks
+        # every later run on that repo until a human intervenes. Measured: run
+        # 20260809-154357-bd was killed at 10,901 s with 4 TASK-START / 3 TASK-END, and
+        # the next battery stood down 42 s after launch. It would have done so every night
+        # after.
+        #
+        # EXCULPATION 1 -- the run's own terminal record. Restoring the 14B is the swap
+        # driver's LAST act, written to swap-progress.log after the 30B is stopped. A run
+        # that got that far is over, whatever its journal balance says.
+        $sp = Join-Path $rd.FullName 'swap-progress.log'
+        $spTxt = ''
+        if (Test-Path $sp) { $spTxt = Get-Content $sp -Raw -ErrorAction SilentlyContinue }
+        if ($spTxt -and ($spTxt -match '14B is back')) {
+            Write-Log ("archive guard: run $($rd.Name) has an unbalanced journal " +
+                       "($starts TASK-START / $ends TASK-END) but its swap-back " +
+                       "COMPLETED, so it is FINISHED, not live -- killed mid-task " +
+                       "and never wrote its last TASK-END. Not blocking.")
+            continue
+        }
+
+        # EXCULPATION 2 -- THE MACHINE'S CLOCK, NOT THE RUN'S (#1380, 2026-08-14).
+        # Exculpation 1 asks the run to testify to its own death, so it is unavailable in
+        # exactly the deaths that leave no testimony: power loss, a forced Windows Update
+        # restart, a hard reset. The swap driver dies with everything else and never writes
+        # its marker, so a rebooted box blocks PERMANENTLY -- and the 12-run window can only
+        # advance when the battery creates a new run, which is the thing being blocked. That
+        # deadlock cost five nights (2026-08-10 through 2026-08-14) and had already cost one
+        # on 08-11, cleared by hand instead of by code.
+        #
+        # A REBOOT DESTROYS EVERY PROCESS ON THE BOX. So if the OS booted AFTER this run
+        # last wrote anything, no process of that run survived and none has written since:
+        # it is provably dead, on evidence that does not depend on the dying run having been
+        # well enough to speak. This gives the guard BETTER evidence; it does not loosen it.
+        # Every other path still blocks, and an unknown boot time (MinValue) clears nothing.
+        #
+        # WHY THIS CANNOT ARCHIVE A LIVE BUILD, which is the only failure that would matter
+        # -- it destroys work rather than costing a night.
+        #
+        # THE INVARIANT, and it is self-sufficient. A boot kills every process, so a run
+        # that is genuinely still building necessarily STARTED after the last boot. A run
+        # that started after the boot has written after the boot -- its own TASK-START line
+        # is in the journal this scan just read. So `$BootTime -gt $newest` is UNREACHABLE
+        # for any run with a live process, and the predicate can only ever adjudicate runs
+        # whose last write already precedes the boot. It decides whether an absent process
+        # died recently or long ago; both answers are "not building".
+        #
+        # That argument holds without appeal to LOCK 1, which matters, because LOCK 1 is a
+        # weaker witness than it looks: its matcher covers four invocation shapes and a
+        # coder subprocess mid-build (node, vitest, npm, opencode) matches none of them,
+        # and -IgnoreLiveDispatch disables it outright. It is a real second layer, not the
+        # load-bearing one.
+        #
+        # WHAT THE INVARIANT DOES DEPEND ON: that the REPORTED boot time does not drift
+        # forward past a live run's writes. Corrected 2026-08-14 after review -- the first
+        # version of this comment claimed "every boot event in the window reports type 0x0
+        # ... and there are no Kernel-Power 107 resume events at all". That was a property
+        # of the four-day window I happened to measure, stated as a property of the machine,
+        # and it is FALSE: over 14 days this box shows 9 boots of type 0x2 (resume from
+        # hibernate) against 7 of type 0x0, and 8 Kernel-Power 107 resumes. The last one
+        # fell just outside my window. Hibernate is the one sleep state available here, and
+        # unlike the states I checked it PRESERVES processes across resume.
+        #
+        # The conclusion survives, on a better measurement: hibernate does not move the boot
+        # basis, because that basis is biased interrupt time and absorbs the sleep. Measured
+        # across an 11.5 h hibernate (07-31 22:55 -> 08-01 10:22): wall-clock elapsed
+        # 67,348.5 s against an uptime delta of 67,350 s, so the implied boot moved ONE
+        # SECOND. A same-session hibernate on 08-07 moved it not at all.
+        #
+        # The kernel-log cross-check below is the belt for the case where that ever changes.
+        $newest = $null
+        foreach ($f in (Get-ChildItem $rd.FullName -File -Recurse -ErrorAction SilentlyContinue)) {
+            if ($null -eq $newest -or $f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime }
+        }
+        if ($null -ne $newest -and $BootTime -gt $newest) {
+            Write-Log ("archive guard: run $($rd.Name) has an unbalanced journal " +
+                       "($starts TASK-START / $ends TASK-END) and never wrote a swap-back, " +
+                       "but the machine BOOTED at $BootTime and that run last wrote at " +
+                       "$newest -- a reboot kills every process, so it is provably dead. " +
+                       "Not blocking.")
+            continue
+        }
+
+        return [pscustomobject]@{
+            Why         = 'unbalanced-journal'
+            RunId       = $rd.Name
+            Starts      = $starts
+            Ends        = $ends
+            NewestWrite = $newest
+            Detail      = ("its journal has more TASK-START than TASK-END ($starts/$ends), it " +
+                           "never recorded a completed swap-back, and the machine has not " +
+                           "rebooted since it last wrote" +
+                           $(if ($null -ne $newest) { " (at $newest)" } else { '' }) +
+                           " -- so a prior dispatch may still be building there")
+        }
+    }
+    return $null
+}
+
 # ---- 2. dispatch guard --------------------------------------------------------
 # Presence checks (LASTINPUTINFO idle + BlarAI app window) removed 2026-07-09 by
 # LA direction: the battery launches at 23:00 regardless of operator presence.
@@ -1320,12 +1459,18 @@ Write-AdmissionRecord 'admitted'
 # Fresh sandbox repos: archive last night's (rename — zero deletion), re-init.
 $cards = Get-ChildItem "$BlarMeasuredRoot\evals\battery\B*.json"
 $repoArchive = "$NightDir\repos-archived"
+# #1367/#1375: remember what each job builds into, so the postlude can SERVE the
+# night's sites and hand the operator an address. He asked for this to be standard:
+# "i will of course need it handed to me served and running." A delivery he cannot
+# open is a delivery he cannot judge, and three consecutive nights proved it.
+$NightSiteRepos = @()
 foreach ($j in $jobs) {
     $card = $cards | Where-Object { $_.BaseName -eq $j } | Select-Object -First 1
     if (-not $card) { throw "no battery card for job $j" }
     $repoName = (Get-Content $card.FullName -Raw | ConvertFrom-Json).repo
     if (-not $repoName.StartsWith("battery-")) { throw "card $j repo '$repoName' violates the battery- prefix rule" }
     $repoPath = Join-Path $ProjectsDir $repoName
+    $NightSiteRepos += $repoName
 
     # ADMISSION: refuse to archive a sandbox a PRIOR DISPATCH STILL OWNS.
     # 2026-08-07, B9 runs 1 and 3: run 1's runner exited at 17:45 but its swap driver is
@@ -1358,10 +1503,10 @@ foreach ($j in $jobs) {
         #   * Write-AdmissionRecord, so the night leaves no provenance;
         #   * the LEG A teardown below, so a scheduled night that already claimed and
         #     booted an AO leaves the 14B resident - the measured #1045 harm.
-        # LOCK 2's throw below has the same shape and predates this change, but it is
-        # REPO-scoped and rare; LOCK 1 is box-wide, which would have made a rare path the
-        # routine one. Fixed here for LOCK 1; LOCK 2 is left alone deliberately so this
-        # commit changes one thing, and it is ticketed.
+        # LOCK 2 below had the same shape and the same three consequences. It was left for
+        # its own commit and ticketed as #1380; the prediction that "REPO-scoped and rare"
+        # made it the lesser risk was wrong -- it wedged permanently and cost five nights.
+        # Both locks now stand down the same way.
         Write-Log ("archive guard: REFUSING - a dispatch is LIVE${named}: $($liveDispatch.Detail). " +
                    "Archiving $repoName would pull the directory out from under a running build.")
         # THE ESCAPE IS IN THE REPORT, not in someone's memory. If the process is actually a
@@ -1401,54 +1546,81 @@ foreach ($j in $jobs) {
     # process check does not, namely which REPO a run owns, and it still catches the
     # original b7af0a0 case where a DETACHED swap driver outlives the runner that spawned
     # it. Weaker on its own (see above); independent of lock 1, which is the point.
-    $liveOwner = $null
-    $fleetRuns = Join-Path $AgenticRoot 'state\fleet-runs'
-    if (Test-Path $fleetRuns) {
-        foreach ($rd in (Get-ChildItem $fleetRuns -Directory -ErrorAction SilentlyContinue |
-                         Sort-Object Name -Descending | Select-Object -First 12)) {
-            $jl = Join-Path $rd.FullName 'journal.log'
-            if (-not (Test-Path $jl)) { continue }
-            $txt = Get-Content $jl -Raw -ErrorAction SilentlyContinue
-            if (-not $txt) { continue }
-            # Names THIS repo, has started a task, and has not finished it.
-            if ($txt -match [regex]::Escape($repoPath)) {
-                $starts = ([regex]::Matches($txt, 'TASK-START')).Count
-                $ends   = ([regex]::Matches($txt, 'TASK-END')).Count
-                if ($starts -gt $ends) {
-                    # UNBALANCED IS NOT THE SAME AS LIVE (#1360, 2026-08-09).
-                    # A run KILLED mid-task -- budget elapsed, tree-kill, doom stop --
-                    # never writes its final TASK-END, so its journal stays unbalanced
-                    # FOREVER and this lock blocks every later run on that repo until a
-                    # human intervenes. Measured: run 20260809-154357-bd was killed at
-                    # 10,901 s with 4 TASK-START / 3 TASK-END, and the next battery stood
-                    # down 42 s after launch. It would have done so every night after.
-                    #
-                    # The swap driver's OWN account is the independent evidence. Restoring
-                    # the 14B is its LAST act, written to swap-progress.log after the 30B
-                    # is stopped. A run that got that far is over, whatever its journal
-                    # balance says -- and reading the run's own terminal record keeps this
-                    # lock independent of LOCK 1's process check, which is the point of
-                    # having two.
-                    $sp = Join-Path $rd.FullName 'swap-progress.log'
-                    $spTxt = ''
-                    if (Test-Path $sp) { $spTxt = Get-Content $sp -Raw -ErrorAction SilentlyContinue }
-                    if ($spTxt -and ($spTxt -match '14B is back')) {
-                        Write-Log ("archive guard: run $($rd.Name) has an unbalanced journal " +
-                                   "($starts TASK-START / $ends TASK-END) but its swap-back " +
-                                   "COMPLETED, so it is FINISHED, not live -- killed mid-task " +
-                                   "and never wrote its last TASK-END. Not blocking.")
-                        continue
-                    }
-                    $liveOwner = $rd.Name; break
-                }
+    # The scan itself lives in Get-BlockingRunOwner so it can be tested (#1380).
+    # Its regression lock is scripts\verify-battery-archive-guard.ps1 -- named here because
+    # a control nothing points at is a control someone deletes.
+    # THE TRY/CATCH IS NOT ENOUGH ON ITS OWN, and this was caught in review before it ever
+    # ran (#1380). It defends against Get-CimInstance THROWING; it does not defend against
+    # the instance coming back WITHOUT the property. Verified: reading an absent property
+    # returns $null with no exception, and `-BootTime $null` then fails parameter binding
+    # with "Cannot convert null to type System.DateTime" -- an UNCAUGHT throw, in a
+    # top-level foreach with no enclosing try, which would exit straight over
+    # Write-SkipReport, Write-AdmissionRecord and the LEG A teardown. That is precisely the
+    # bare-throw harm this whole change exists to remove, reintroduced one line above the
+    # fix. A degraded WMI repository is the trigger.
+    #
+    # So: $null is normalised to MinValue, which clears nothing. Fail-closed twice over.
+    $bootTime = [datetime]::MinValue
+    try { $bootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch {
+        # Fail-closed: an unreadable boot time clears nothing, it just costs the run the
+        # benefit of the reboot evidence. Named rather than swallowed.
+        Write-Log "archive guard: could not read the machine's last boot time ($($_.Exception.Message)); the reboot evidence is unavailable for this scan."
+    }
+    if ($null -eq $bootTime) {
+        Write-Log "archive guard: the OS instance carried no LastBootUpTime; treating the boot time as unknown, which clears nothing."
+        $bootTime = [datetime]::MinValue
+    }
+
+    # BELT: cross-check against the kernel's own boot record and keep the OLDER of the two.
+    # LastBootUpTime is the value that would move in the dangerous direction if this box ever
+    # gained a sleep state that freezes processes rather than killing them -- hibernate is the
+    # only such state available here (Fast Startup is off, S1/S2/S3 and modern standby are all
+    # unavailable). Taking the older reading means a boot time that has drifted FORWARD cannot
+    # clear a run that the kernel log says booted earlier. If the event log is unreadable the
+    # CIM value stands, because this is a belt and not the trousers.
+    try {
+        $bootEvt = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-General'; Id=12} -MaxEvents 1 -ErrorAction Stop
+        if ($bootEvt -and $bootEvt.TimeCreated -and $bootEvt.TimeCreated -lt $bootTime) {
+            Write-Log ("archive guard: kernel boot record ($($bootEvt.TimeCreated)) is older than the reported boot time ($bootTime); using the older, which is the conservative direction.")
+            $bootTime = $bootEvt.TimeCreated
+        }
+    } catch { }
+    $blockingOwner = Get-BlockingRunOwner -FleetRunsDir (Join-Path $AgenticRoot 'state\fleet-runs') `
+                                          -RepoPath $repoPath -BootTime $bootTime
+    if ($blockingOwner) {
+        # A CLEAN STAND-DOWN, NOT A BARE `throw` -- closing the deferral this file recorded
+        # at LOCK 1 ("LOCK 2's throw below has the same shape ... left alone deliberately so
+        # this commit changes one thing, and it is ticketed"). That ticket is #1380, and the
+        # harm it predicted was measured twice: the throw jumps over Write-SkipReport (so the
+        # operator's morning read shows LAST night's success), over Write-AdmissionRecord (so
+        # the night leaves no provenance), and over the LEG A teardown (so a night that
+        # already booted an AO leaves the 14B resident -- 12.33 GB on 2026-08-11, 11.66 GB on
+        # 2026-08-14, both stopped by hand).
+        Write-Log ("archive guard: REFUSING - fleet run $($blockingOwner.RunId) still owns $repoName " +
+                   "($repoPath): $($blockingOwner.Detail). Archiving now would corrupt both runs.")
+        Write-SkipReport ("A previous night's build may still be running in the folder tonight's job needs, " +
+                          "so the battery stood down rather than archive it. Nothing was changed, moved or " +
+                          "deleted.`n`n" +
+                          "The run it is waiting on is $($blockingOwner.RunId), which recorded " +
+                          "$($blockingOwner.Starts) task starts and only $($blockingOwner.Ends) task finishes.`n`n" +
+                          "IF THAT RUN IS ACTUALLY DEAD, this stands down every night and banks nothing. Since " +
+                          "2026-08-14 the guard clears this by itself whenever the machine has REBOOTED since " +
+                          "the run last wrote anything, because a reboot kills every process. So if you are " +
+                          "seeing this message at all, that run wrote something AFTER the last restart.`n`n" +
+                          "WHAT TO DO: restarting the machine is the ordinary fix - it makes the guard's own " +
+                          "test true, and the next scheduled night runs normally. There is deliberately no " +
+                          "override switch for this one, so nothing here needs typing.")
+        $script:AdmissionPath = 'blocking-run-owner'
+        Write-AdmissionRecord 'skipped-blocking-run-owner'
+        if ($AoOwnedByThisNight) {
+            try {
+                $null = Stop-OwnedAo -SentinelPath $AoOwnerSentinel -BlarAiRepo $BlarRuntimeRoot `
+                    -StopAssistantPath $StopAssistantPath -Context "stood down for a blocking run owner ($Stamp)" -Log ${function:Write-Log}
+            } catch {
+                Write-Log "ao-ownership: stand-down teardown errored ($($_.Exception.Message)) - non-fatal; the claim is kept for the next night's reclaim."
             }
         }
-    }
-    if ($liveOwner) {
-        throw ("REFUSING to archive $repoName — fleet run $liveOwner still owns it " +
-               "($repoPath): its journal has more TASK-START than TASK-END, so a prior " +
-               "dispatch is still building there. Archiving now would corrupt both runs. " +
-               "Let it finish, or reap it, then re-run.")
+        Stop-Transcript | Out-Null; exit 0
     }
 
     if (Test-Path $repoPath) {
@@ -1792,6 +1964,96 @@ try {
     $lines += ""
     $lines += "* !! the validation exercise could not be produced: $($_.Exception.Message)"
     $lines += "  This is a fault in the checking machinery, not a quiet morning. Nothing was validated."
+}
+
+
+
+# --- SERVE THE NIGHT'S SITES (#1367/#1375, LA-directed 2026-08-10) -------------------
+# "insofar as the pottery website evaluation and validation, i will of course need it
+#  handed to me served and running. that should be standard. i am non-technical."
+#
+# Until this, a night ended with a merged tree and nothing to look at. Review Website.cmd
+# existed and simply never fired: on 2026-08-10 every review snapshot on the box was from
+# 08-08, so the site built overnight sat unseen -- the exact failure that tool was written
+# to end. And when a served copy WAS finally opened, the gallery was dead (#1375) on a run
+# whose deterministic gates were all green.
+#
+# LAUNCHED DETACHED, AND NEVER CAPTURED. review-website.ps1 leaves a node server running
+# on purpose, and that child inherits the parent's stdout. Reading such a pipe to
+# end-of-stream never returns -- proven twice on 2026-08-10: it is the same mechanism that
+# let `node src/server.js &` hang a coder for 602 s (#1357), and it hung a 36-minute
+# capture of THIS script an hour before this code was written. So: -RedirectStandardOutput
+# to a FILE (the file case terminates; the pipe case does not), no `$r = & ...`, ever.
+#
+# The port is read from the artifact the tool already writes -- REVIEW.html carries
+# `127.0.0.1:<port>` -- rather than from its return value, which is unreachable detached.
+#
+# NON-FATAL by construction: the scorecards are already on disk and a serving problem must
+# never change a completed night's verdict.
+$lines += ""
+$lines += "## The sites this night built"
+$reviewRoot = "$AgenticRoot\state\operator-review"
+$servedCount = 0
+foreach ($repoName in ($NightSiteRepos | Select-Object -Unique)) {
+    try {
+        $repoPath = Join-Path $ProjectsDir $repoName
+        $isSite = (Test-Path (Join-Path $repoPath 'public')) -or
+                  (Test-Path (Join-Path $repoPath 'index.html'))
+        if (-not $isSite) { continue }   # not a web card; nothing to serve
+
+        $before = @(Get-ChildItem $reviewRoot -Directory -ErrorAction SilentlyContinue |
+                    Where-Object Name -like "*-$repoName" | ForEach-Object { $_.Name })
+        $serveLog = "$NightDir\review-serve-$repoName.log"
+        Start-Process -FilePath 'pwsh' -WindowStyle Hidden -RedirectStandardOutput $serveLog `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',
+                          "$AgenticRoot\scripts\review-website.ps1",
+                          '-Name',$repoName,'-NoBrowser','-NoFeedback' | Out-Null
+
+        # Bounded wait for the snapshot the tool writes. 180 s: the copy + static
+        # verification took ~90 s on the 2026-08-10 pottery build. A timeout is REPORTED,
+        # never swallowed -- "no address" must read as a fault, not as "no site".
+        $url = ''
+        $deadline = (Get-Date).AddSeconds(180)
+        while ((Get-Date) -lt $deadline -and -not $url) {
+            Start-Sleep -Seconds 5
+            $fresh = Get-ChildItem $reviewRoot -Directory -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -like "*-$repoName" -and $before -notcontains $_.Name } |
+                     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($fresh) {
+                $rh = Join-Path $fresh.FullName 'REVIEW.html'
+                if (Test-Path $rh) {
+                    $m = [regex]::Match((Get-Content $rh -Raw), '127\.0\.0\.1:(\d+)')
+                    if ($m.Success) { $url = "http://127.0.0.1:$($m.Groups[1].Value)/" }
+                }
+            }
+        }
+
+        if ($url) {
+            $servedCount++
+            $lines += ""
+            $lines += "**$repoName** - open it: **$url**"
+            $lines += ""
+            $lines += "It is already running; you do not need to start anything."
+            $lines += "To go through it one question at a time, in your own words,"
+            $lines += "double-click ``Review Website.cmd`` in $AgenticRoot."
+            Write-Log "served $repoName for review at $url"
+        } else {
+            $lines += ""
+            $lines += "* !! **$repoName** was built but no address appeared within 3 minutes."
+            $lines += "  The build is intact; the serving is what failed. Double-click"
+            $lines += "  ``Review Website.cmd`` to try it by hand."
+            Write-Log "!! review serve for $repoName produced no URL within the wait"
+        }
+    } catch {
+        $lines += ""
+        $lines += "* !! **$repoName** was built but could NOT be served: $($_.Exception.Message)"
+        $lines += "  The build is intact; only the serving failed."
+        Write-Log "!! review serve FAILED for $repoName - $($_.Exception.Message)"
+    }
+}
+if ($servedCount -eq 0) {
+    $lines += ""
+    $lines += "*No web build this night, or none could be served. Nothing to open.*"
 }
 
 $report = $lines -join "`n"

@@ -255,8 +255,134 @@ Assert-True ($whinted -match '(?i)server\.listen\(0' -or $whinted -match '(?i)EP
 Assert-True ($whinted -match '(?i)NEVER `?fetch`? a hardcoded port') 'WH7 [kill] the hint forbids fetching a hardcoded port the test did not start (the localhost:8081 failure)'
 Assert-True ($whinted -match '(?i)EXTEND it')      'WH8 the hint says EXTEND the seeded skeleton (do not re-scaffold)'
 Assert-True ($whinted -match '(?i)ACT FIRST' -or $whinted -match '(?i)FIRST tool call should be an EDIT') 'WH8b [kill] the hint pushes ACT-FIRST (edit before exploratory reads -- the F2 stall mitigation, LESSONS Exp 3)'
+
+# THE FRONT DOOR (#1367, 2026-08-14). Measured live: B9 delivered six pages and the operator
+# opened the site to `<h1>App</h1>`. `public/index.html` was the scaffold placeholder, untouched
+# by all seven tasks, and `src/server.js` mounts `/` to it -- so the front door reached nothing
+# the coder had built. The cause was three surfaces disagreeing: the seed brief said "edit
+# public/index.html", the decomposer asked for a task named `create-home-page` and named no file,
+# and the coder reasonably created `home.html`. The delivered pages then split their navigation --
+# the shared header linked `home.html` while three pages linked `index.html`.
+#
+# link_lint's `entry-reaches-nothing` (BlarAI, #1367) DETECTS the result. These assertions cover
+# the CAUSE: the brief must state the entry-point contract so the coder builds the front door
+# rather than a sibling nobody reaches. A detector without this reports the same defect nightly.
+Assert-True ($whinted -match '(?i)FRONT DOOR') 'WH8c the hint names the FRONT DOOR contract'
+Assert-True ($whinted -match '(?i)visitor\s+GETS\s+AT\s+`?/`?' -or $whinted -match '(?i)page a visitor (gets|lands)') 'WH8d [kill] it says index.html is what a visitor reaches at the site root'
+Assert-True ($whinted -match '(?i)THAT PAGE IS `public/index\.html`') 'WH8e [kill] a home/landing page must BE index.html (the create-home-page -> home.html failure)'
+Assert-True ($whinted -match '(?i)home\.html' -and $whinted -match '(?i)do NOT create a second home page') 'WH8f [kill] it forbids a second home page BY NAME (home.html/main.html/landing.html)'
+Assert-True ($whinted -match '(?i)must LINK to each') 'WH8g [kill] every sibling page must be linked FROM index.html (nothing reaches an unlinked page)'
+Assert-True ($whinted -match '(?i)"home" link points at `index\.html`' -or $whinted -match '(?i)One home page, one name') 'WH8h [kill] a shared header links home at index.html (the split-navigation half of #1367)'
+Assert-True ($whinted -match '(?i)Never leave the seed.s placeholder') 'WH8i [kill] the delivered index.html must not still be the placeholder'
+
+# THE SERVED ROOT (#1375, 2026-08-14). The operator opened pieces.html and read "Failed to load
+# pieces." Both central pages ran `fetch('./data/pieces.json')` while the file sat at the PROJECT
+# ROOT, a sibling of `public/` -- and `src/server.js` serves `public/` and nothing else, so the
+# browser got a 404. Every instrument that touched that data read it FROM DISK; nothing ever
+# fetched it the way a visitor does, so the file existed and was never served.
+#
+# link_lint's `extract_fetch_targets` (BlarAI, #1375) now RESOLVES fetch() string literals and
+# catches the result. These assertions cover the CAUSE: before this, the brief said nothing
+# whatsoever about where a data file must live -- measured, zero mentions of `data/`.
+Assert-True ($whinted -match '(?i)SERVED ROOT') 'WH8j the hint names the SERVED ROOT contract'
+Assert-True ($whinted -match '(?i)serves `?public/`? AND NOTHING ELSE') 'WH8k [kill] it states only public/ is served (a file outside it is a 404)'
+Assert-True ($whinted -match '(?i)public/data/') 'WH8l [kill] it says a shared data file belongs at public/data/ (the pieces.json failure)'
+Assert-True ($whinted -match '(?i)after writing any `?fetch') 'WH8m [kill] it tells the coder to check every fetch path resolves from public/'
+Assert-True ($whinted -match '(?i)Failed to load') 'WH8n [kill] a page whose normal state is an error string counts as BROKEN (the exact words he read)'
 # Gating: a NON-web scaffold gets the prompt back UNCHANGED (strictly additive -- the byte-identical kill).
 Assert-Eq $wbase (Add-WebHint -Prompt $wbase -Web $false) 'WH9 [kill] a NON-web scaffold ($Web $false) -> prompt returned VERBATIM (no web hint; non-web profiles are byte-identical)'
+
+Section 'Unit tests: Test-WebBuild -- the hint reaches tasks 2..N of a multi-page build (#1367/#1375)'
+# THE DEFECT, measured 2026-08-14. Add-WebHint was gated on `$scaffold -eq 'web'`. `$scaffold` comes
+# from Resolve-TaskScaffold, whose FIRST line is `if ($HasProject) { return '' }` -- correct, because
+# its job is deciding what to SEED and it must not clobber an existing project. But used as a proxy
+# for "is this a web build" it silences the brief for every task after the seed.
+#
+# B9 authors SEVEN tasks. One dispatch got the web brief; six did not. Measured across every banked
+# agent log in state/reports: exactly ONE contains "OFFLINE WEB BUILD", a 2026-07-27 single-task job,
+# and NO B9 coder has ever seen it. That is upstream of both operator-found defects -- the coder that
+# built `home.html` had never been told what a visitor reaches (#1367), and the one that fetched a
+# file from outside `public/` had never been told what the server serves (#1375).
+$__wbRoot = Join-Path ([IO.Path]::GetTempPath()) ("webbuild-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force (Join-Path $__wbRoot 'public') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $__wbRoot 'src') | Out-Null
+Set-Content -LiteralPath (Join-Path $__wbRoot 'src/server.js') -Value '// seed server' -Encoding utf8
+$__wbBare = Join-Path ([IO.Path]::GetTempPath()) ("webbuild-bare-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force $__wbBare | Out-Null
+try {
+    Assert-True (Test-WebBuild -Scaffold 'web')                        'WB1 a fresh dispatch that seeds the web scaffold is a web build (today''s signal, preserved)'
+    Assert-True (Test-WebBuild -Surface 'web')                         'WB2 a declared web SURFACE is a web build even with no scaffold (the HasProject case)'
+    Assert-True (Test-WebBuild -ProjectRoot $__wbRoot)                 'WB3 [kill] an ALREADY-SEEDED web tree (public/ + src/server.js) is a web build -- the six silent B9 tasks'
+    Assert-True (-not (Test-WebBuild))                                 'WB4 [kill] no scaffold, no surface, no tree -> NOT a web build'
+    Assert-True (-not (Test-WebBuild -Scaffold 'python' -Surface 'library' -ProjectRoot $__wbBare)) 'WB5 [kill] a python task in a bare tree is NOT a web build (strictly additive)'
+    Assert-True (-not (Test-WebBuild -ProjectRoot $__wbBare))          'WB6 [kill] a tree with NEITHER marker is not a web build'
+    # BOTH markers required, so an ordinary project with a public/ folder cannot collect web
+    # instructions it cannot act on.
+    $__wbPubOnly = Join-Path ([IO.Path]::GetTempPath()) ("webbuild-pub-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Force (Join-Path $__wbPubOnly 'public') | Out-Null
+    Assert-True (-not (Test-WebBuild -ProjectRoot $__wbPubOnly))       'WB7 [kill] public/ ALONE is not enough (a docs site, a dotnet wwwroot -- no web brief)'
+    Remove-Item $__wbPubOnly -Recurse -Force -ErrorAction SilentlyContinue
+    $__wbSrvOnly = Join-Path ([IO.Path]::GetTempPath()) ("webbuild-srv-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Force (Join-Path $__wbSrvOnly 'src') | Out-Null
+    Set-Content -LiteralPath (Join-Path $__wbSrvOnly 'src/server.js') -Value '//' -Encoding utf8
+    Assert-True (-not (Test-WebBuild -ProjectRoot $__wbSrvOnly))       'WB8 [kill] src/server.js ALONE is not enough (a bare node service)'
+    Remove-Item $__wbSrvOnly -Recurse -Force -ErrorAction SilentlyContinue
+
+    # THE REGRESSION THIS EXISTS FOR, end to end: the same task, once fresh and once into a seeded
+    # tree, must BOTH receive the brief. Under the old gate the second returned the prompt verbatim.
+    $__g = 'Create the home page for the pottery studio site'
+    $__sFresh = Resolve-TaskScaffold -Prompt $__g -HasProject $false -Surface 'web'
+    $__sAfter = Resolve-TaskScaffold -Prompt $__g -HasProject $true  -Surface 'web'
+    Assert-Eq 'web' $__sFresh 'WB9 the seeding dispatch resolves the web scaffold'
+    Assert-Eq ''    $__sAfter 'WB10 a later task resolves NO scaffold (correct: never clobber an existing project)'
+    Assert-True ((Add-WebHint -Prompt $__g -Web (Test-WebBuild -Scaffold $__sFresh -Surface 'web' -ProjectRoot $__wbRoot)) -match '(?i)OFFLINE WEB BUILD') 'WB11 task 1 of a multi-page build receives the web brief'
+    Assert-True ((Add-WebHint -Prompt $__g -Web (Test-WebBuild -Scaffold $__sAfter -Surface 'web' -ProjectRoot $__wbRoot)) -match '(?i)OFFLINE WEB BUILD') 'WB12 [kill] task 2..N receives it TOO -- the six-of-seven silence this fixes'
+    # And the pre-fix gate demonstrably did NOT, so WB12 is not a pass that could never fail.
+    Assert-Eq $__g (Add-WebHint -Prompt $__g -Web ([bool]($__sAfter -eq 'web'))) 'WB13 [control] the OLD gate ($scaffold -eq ''web'') returns task 2..N VERBATIM -- the defect is real'
+} finally {
+    Remove-Item $__wbRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $__wbBare -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Section 'Unit tests: Test-WebStaticBuild -- the SIBLING that shared the defect (lesson 342)'
+# The reasoning that found the web defect is a PREDICATE, not an explanation of one site, so it
+# was run over every hint new-agent-task injects. Five gate on something sound (the complexity
+# signal, the build PROFILE computed straight from the surface, or the worktree). Exactly ONE
+# shared it: Add-WebStaticHint was gated on `$scaffold -eq 'web-static'`. Latent rather than
+# measured only because web-static has run once -- the mechanism is identical.
+$__wsRoot = Join-Path ([IO.Path]::GetTempPath()) ("webstatic-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force $__wsRoot | Out-Null
+Set-Content -LiteralPath (Join-Path $__wsRoot 'index.html') -Value '<h1>seed</h1>' -Encoding utf8
+$__wsServer = Join-Path ([IO.Path]::GetTempPath()) ("webstatic-srv-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force (Join-Path $__wsServer 'public') | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $__wsServer 'src') | Out-Null
+Set-Content -LiteralPath (Join-Path $__wsServer 'src/server.js') -Value '//' -Encoding utf8
+Set-Content -LiteralPath (Join-Path $__wsServer 'index.html') -Value '<h1>x</h1>' -Encoding utf8
+try {
+    Assert-True (Test-WebStaticBuild -Scaffold 'web-static')          'WS1 a fresh dispatch that seeds web-static is a static build (today''s signal, preserved)'
+    Assert-True (Test-WebStaticBuild -Surface 'web-static')           'WS2 a declared web-static SURFACE is a static build even with a project present'
+    Assert-True (Test-WebStaticBuild -ProjectRoot $__wsRoot)          'WS3 [kill] an ALREADY-SEEDED static tree (root index.html, no package.json/server/public) is a static build'
+    Assert-True (-not (Test-WebStaticBuild))                          'WS4 [kill] no scaffold, no surface, no tree -> not a static build'
+    # MUTUAL EXCLUSION: the two seeds are opposite shapes and a tree must never claim both,
+    # or a coder would be handed "extend the node skeleton" and "add no server" together.
+    Assert-True (-not (Test-WebStaticBuild -ProjectRoot $__wsServer)) 'WS5 [kill] a SERVER tree (public/ + src/server.js) is NOT a static build even with a root index.html'
+    Assert-True (Test-WebBuild -ProjectRoot $__wsServer)              'WS6 ...and that same tree IS a web build (the two signatures are mutually exclusive)'
+    Assert-True (-not (Test-WebBuild -ProjectRoot $__wsRoot))         'WS7 [kill] ...and the static tree is NOT a web build (no false double-brief)'
+    # The regression, end to end: task 2..N of a multi-task STATIC site.
+    $__gs = 'Add the contact section to the page'
+    $__ssAfter = Resolve-TaskScaffold -Prompt $__gs -HasProject $true -Surface 'web-static'
+    Assert-Eq '' $__ssAfter 'WS8 a later static task resolves NO scaffold (correct seeding behaviour)'
+    Assert-True ((Add-WebStaticHint -Prompt $__gs -WebStatic (Test-WebStaticBuild -Scaffold $__ssAfter -Surface 'web-static' -ProjectRoot $__wsRoot)) -match '(?i)STATIC') 'WS9 [kill] task 2..N of a static build receives the static brief'
+    Assert-Eq $__gs (Add-WebStaticHint -Prompt $__gs -WebStatic ([bool]($__ssAfter -eq 'web-static'))) 'WS10 [control] the OLD gate returns task 2..N VERBATIM -- the sibling defect is real'
+} finally {
+    Remove-Item $__wsRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $__wsServer -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Section 'Wiring: new-agent-task gates the web hint on Test-WebBuild, not the seeding decision'
+$__natSrc = Get-Content (Join-Path $PSScriptRoot 'new-agent-task.ps1') -Raw
+Assert-True ($__natSrc -match 'Test-WebBuild\s+-Scaffold\s+\$scaffold\s+-Surface\s+\$Surface\s+-ProjectRoot\s+\$wt') 'WB14 [kill] new-agent-task calls Test-WebBuild with the worktree (else the tree signal is dormant)'
+Assert-True ($__natSrc -notmatch 'Add-WebHint\s+-Prompt\s+\$Prompt\s+-Web\s+\(\[bool\]\(\$scaffold\s+-eq\s+''web''\)\)') 'WB15 [kill] the OLD seeding-decision gate is GONE from the call site'
 
 Section 'Unit tests: the web hint is driven by the RESOLVED scaffold (end to end, no model)'
 # Drive the REAL gating exactly as new-agent-task does: resolve the scaffold, then pass ($scaffold -eq 'web')
@@ -277,7 +403,12 @@ $natW = Get-Content "$PSScriptRoot\new-agent-task.ps1" -Raw
 $libW = Get-Content "$PSScriptRoot\fleet-lib.ps1" -Raw
 Assert-True ([regex]::IsMatch($libW, '(?m)^\s*function\s+Add-WebHint\b')) 'W17 fleet-lib defines Add-WebHint (pure -> unit-testable without a model)'
 # [kill] new-agent-task must CALL Add-WebHint gated on the resolved scaffold == 'web' (else dormant on the real run).
-Assert-True ([regex]::IsMatch($natW, 'Add-WebHint\s+-Prompt\s+\$Prompt\s+-Web\s+\(\[bool\]\(\$scaffold\s+-eq\s+''web''\)\)')) 'W18 [kill] new-agent-task calls Add-WebHint gated on ($scaffold -eq ''web'') (the hint reaches the coder ONLY for a web scaffold)'
+# W18 asserted the literal gate `-Web ([bool]($scaffold -eq 'web'))` and so PINNED THE DEFECT: any
+# correct fix to the gate had to fail this check first. The property it was reaching for is that the
+# hint is GATED at all -- never unconditional, never absent -- not which expression does the gating.
+# Re-anchored 2026-08-14 (#1367/#1375); WB14/WB15 above assert the specific new call shape.
+Assert-True ([regex]::IsMatch($natW, 'Add-WebHint\s+-Prompt\s+\$Prompt\s+-Web\s+\S')) 'W18 [kill] new-agent-task calls Add-WebHint with a GATE (never unconditional)'
+Assert-True (-not [regex]::IsMatch($natW, 'Add-WebHint\s+-Prompt\s+\$Prompt\s+-Web\s+\$true')) 'W18b [kill] the gate is not hard-wired true (a non-web task must stay byte-identical)'
 # [kill] the web hint is applied AFTER the staged hint (both mutate $Prompt above the resample loop).
 $iStagedW = $natW.IndexOf('Add-StagedHint -Prompt $Prompt')
 $iWebW    = $natW.IndexOf('Add-WebHint -Prompt $Prompt')

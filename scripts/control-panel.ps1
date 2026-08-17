@@ -56,6 +56,15 @@ while ($true) {
     $vmText = $vmState
     if ($vmState -eq 'Running' -and $inv.Vm.MemAssignedGb -gt 0) { $vmText = ('{0} (pins ~{1} GB)' -f $vmState, $inv.Vm.MemAssignedGb) }
     Write-Host (" RAM free:     {0} GB" -f $avail) -ForegroundColor $(if ($avail -is [double] -and $avail -lt 5) { 'Yellow' } else { 'Green' })
+    $__paused = Test-Path -LiteralPath 'C:\Users\mrbla\agentic-setup\state\BLARAI-PAUSED.txt'
+    if ($__paused) {
+        Write-Host " Scheduled:    PAUSED - nothing will start on its own (press [P] to resume)" -ForegroundColor Yellow
+    } else {
+        $__next = $null
+        try { $__next = (Get-ScheduledTask -TaskName 'BlarAI-M2-Battery-Nightly' -ErrorAction SilentlyContinue | Get-ScheduledTaskInfo).NextRunTime } catch { }
+        $__when = if ($__next) { "next overnight build $__next" } else { 'no overnight build scheduled' }
+        Write-Host (" Scheduled:    ON - {0}" -f $__when) -ForegroundColor Green
+    }
     Write-Host (" BlarAI VM:    {0}" -f $vmText) -ForegroundColor $vmColor
     $bk = Get-BackupStatus
     Write-Host (" Last backup:  {0}" -f $bk.Text) -ForegroundColor $bk.Color
@@ -67,6 +76,7 @@ while ($true) {
     Write-Host "  [5] Stop the model server   (OVMS - the coder/vision/everyday swap models)"
     Write-Host "  [S] Stop the assistant      (BlarAI's resident 14B on :5001 - frees ~12.6 GB)"
     Write-Host "  [K] STOP ALL AI MODELS      (assistant + model server together - asks once, then verifies)"
+    Write-Host "  [P] Pause / resume ALL scheduled work  (stops the machine starting jobs on its own)" -ForegroundColor Cyan
     Write-Host "  [6] Full status report"
     Write-Host "  [7] Live GPU monitor        (opens its own window)"
     Write-Host "  [8] Undo AI changes in a project"
@@ -92,6 +102,22 @@ while ($true) {
     elseif ($c -eq '5') { & "$S\stop-llm.ps1" }
     elseif ($c -match '^[Ss]$') { & "$S\stop-assistant.ps1" }
     elseif ($c -match '^[Kk]$') { & "$S\stop-all-models.ps1" }   # deliberately no -Yes: the human keeps the confirm
+    elseif ($c -match '^[Pp]$') {
+        # The kill switch, where he will actually find it. ONE key toggles both ways -- a
+        # novice should not have to remember which of two commands he needs. It disables
+        # SCHEDULED TASKS and never touches a running job: killing a run mid-task leaves a
+        # half-built site and a record nothing can score.
+        $__ctl = 'C:\Users\mrbla\blarai-ops\control\blarai-pause.ps1'
+        if (-not (Test-Path -LiteralPath $__ctl)) {
+            Write-Host "  The pause control is missing at $__ctl" -ForegroundColor Red
+        } elseif (Test-Path -LiteralPath 'C:\Users\mrbla\agentic-setup\state\BLARAI-PAUSED.txt') {
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $__ctl -Resume
+        } else {
+            & pwsh -NoProfile -ExecutionPolicy Bypass -File $__ctl
+        }
+        Write-Host ''
+        Read-Host 'Press Enter to return to the panel' | Out-Null
+    }
     elseif ($c -eq '6') { & "$S\ai-status.ps1" }
     elseif ($c -eq '7') {
         # own window so closing the monitor does not close the panel

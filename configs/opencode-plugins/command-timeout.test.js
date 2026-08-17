@@ -80,6 +80,70 @@ test("unset / oversized timeouts clamp to the 5-min cap; smaller stays", async (
   assert.equal((await run("npm test", 20000)).timeout, 20000);                // tighter stays
 });
 
+test("a trailing & (detached process) is refused outright (#1357)", async () => {
+  for (const c of [
+    // THE MEASURED COMMAND. battery-b9-pottery-site-create-piece-list-page-20260809-143821 ran this
+    // with args.timeout correctly clamped to 10000 and it still hung 602 s.
+    "cd C:/Users/mrbla/agentic-setup/state/worktrees/battery-b9-pottery-site-create-piece-list-page && node src/server.js &",
+    "node src/server.js &",
+    "npm start &",
+    "python -m http.server 8000 &",
+    "node app.js  &",          // trailing whitespace after the ampersand
+    "./run-me.sh &",           // not server-shaped at all -- detaching is the defect, not the program
+  ]) {
+    const args = await run(c, 10000);
+    assert.ok(
+      args.command.startsWith('echo "[headless build] backgrounding'),
+      `should be REFUSED (detached): ${c}`,
+    );
+  }
+});
+
+test("&& chains and redirects are NOT mistaken for backgrounding (#1357)", async () => {
+  for (const c of [
+    "cd app && npm test",                 // the overwhelmingly common shape -- must survive
+    "npm run build && npm test",
+    "node --test tests/ 2>&1",            // redirect, does not end on the ampersand
+    "node --test tests/ >out.txt 2>&1",
+    "grep -r 'R&D' src/",                 // an ampersand that is just data
+    "npm test",
+  ]) {
+    const args = await run(c, 10000);
+    assert.equal(args.command, c, `should NOT be refused: ${c}`);
+  }
+});
+
+test("TOGGLE PROOF: the probe cap alone would have let the measured command through", async () => {
+  // A green suite is worth nothing here unless the new check is what catches the real incident.
+  // Before this fix the ONLY branch that could fire for this command was the probe cap -- which is
+  // exactly what DID fire on 2026-08-09, and the command still ran 602 s.
+  const measured =
+    "cd C:/Users/mrbla/agentic-setup/state/worktrees/battery-b9-pottery-site-create-piece-list-page && node src/server.js &";
+  const args = await run(measured, 600000);
+  assert.notEqual(args.timeout, SERVER_PROBE_MS,
+    "the detach refusal must fire INSTEAD of the probe cap -- if this command is merely probe-capped, the fix is inert and the 602 s hang can recur");
+  assert.ok(args.command.startsWith('echo "[headless build] backgrounding'));
+});
+
+test("node app.js / index.js entry points get the probe cap -- the measured BLOCKING_RE gap (#1357)", async () => {
+  for (const c of ["node app.js", "node src/app.js", "node index.js", "node src/index.js"]) {
+    const args = await run(c, 600000);
+    assert.equal(args.timeout, SERVER_PROBE_MS, `should probe-cap: ${c}`);
+  }
+});
+
+test("ordinary node scripts are NOT probe-capped by the new entry-point pattern", async () => {
+  for (const c of [
+    "node --test tests/app.test.js",   // a TEST that mentions app.js
+    "node scripts/migrate.js",
+    "node cli.js --help",
+    "cat src/app.js",                  // not even node
+  ]) {
+    const args = await run(c, 60000);
+    assert.equal(args.timeout, 60000, `should keep its own timeout: ${c}`);
+  }
+});
+
 test("non-bash tools are never touched", async () => {
   const output = { args: { command: "npm start", timeout: 999999 } };
   await before({ tool: "edit" }, output);

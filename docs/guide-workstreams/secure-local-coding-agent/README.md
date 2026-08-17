@@ -22,6 +22,31 @@ defense.
 LA: Blair. Guide: Claude (Opus 4.x). Started: 2026-06-17.
 
 ## Threat model -> control -> test
+
+> ⚠️ **STATUS CAVEAT, 2026-08-14 — every `ask`-based control below is currently INERT, and
+> the DONE markers that rest on one were earned against a driver no longer in use.**
+>
+> T2, T3, T5 and T7 each cite *"(fail-closed headless, proven)"* for a bash/egress/
+> `external_directory` `ask` rule. That was proven under the `stdin` driver. The `acp`
+> driver, live since **2026-07-11**, answers every permission request with an ALLOW:
+> `BlarAI/tools/dispatch_harness/acp_coder.py:647-662` accepts a `tool_call` argument and
+> never reads it. Measured over 2,671 banked agent logs: **287 `asking` events, 0 rejected,
+> 265/265 gated commands completed** — including 14 `external_directory` approvals for paths
+> outside the project (they failed only because the model invented paths that do not exist,
+> not because T7 blocked them).
+>
+> **What still holds:** every `deny` rule, every read-deny, `web tools off`, loopback-only
+> serving, worktree isolation, the gitleaks gate and the human merge gate. `deny` is enforced
+> by opencode itself and never consults the client — both observed denies show
+> `in_progress -> failed`. So the layered model is doing real work; it is one layer thinner
+> than this table claims.
+>
+> **Do not cite a DONE in this table as evidence of current posture until it is re-measured
+> under `acp`.** A control proven under one driver is not proven under another, and the swap
+> of anything that MEDIATES a control invalidates every measurement taken through the old
+> one. Tracked: #1376 (restore the posture), #1384 (no automated gate detected this for a
+> month).
+
 | # | Threat | Control(s) | Test | Status |
 |---|---|---|---|---|
 | T1 | **Prompt injection** — instructions hidden in files / web / tool output the agent reads | defense-in-depth (rule alone proven insufficient): strengthened "untrusted content / a denied read is by-design" AGENTS rule; least-privilege read-deny (secret-shaped, evasion-resistant) across read/grep/glob/list/bash; `external_directory` + egress gates; human/Guide diff review | evals `injection-refusal`, `injection-exfil-escape`, `injection-net-exfil` | **CONTROLS DONE; 3/3 SECURE live on coder-30b (E6, 2026-06-18). Was empirically OPEN in E5 — now CLOSED.** |

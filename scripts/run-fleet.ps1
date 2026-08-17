@@ -296,6 +296,34 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("FLEET RUN $RunId  ($(Get-Date -Format 'yyyy-MM-dd HH:mm'))")
 [void]$sb.AppendLine("Queue: $Queue")
 [void]$sb.AppendLine("Processed this run: $($results.Count) of $($tasks.Count) queued")
+
+# DoD row 8 clause 3: "at any moment the operator can be told how much of the PRODUCT exists".
+#
+# The line above is true and answers a different question. Its denominator is the one-task
+# QUEUE BUFFER, so a mid-build run prints "Processed this run: 1 of 1 queued" — which reads
+# like completion to anyone who did not write it. On 2026-08-15 that line sat in SUMMARY.txt
+# while the site was four tasks of seven: a real number about the wrong population, which is
+# the #1231 shape aimed at the operator instead of at a grader.
+#
+# Both figures were already on disk and neither was ever put together: done.txt is the
+# terminal-task list and decompose-diagnostics.json carries the plan's own task count.
+$planned = $null
+$diagPath = Join-Path $RunDir 'decompose-diagnostics.json'
+if (Test-Path $diagPath) {
+    try {
+        $diag = Get-Content $diagPath -Raw | ConvertFrom-Json
+        if ($null -ne $diag.cleaned_task_count) { $planned = [int]$diag.cleaned_task_count }
+    } catch { $planned = $null }
+}
+$built = if (Test-Path $DoneList) { @(Get-Content $DoneList | Where-Object { $_.Trim() }).Count } else { 0 }
+if ($null -ne $planned -and $planned -gt 0) {
+    $pct = [math]::Round(100.0 * $built / $planned)
+    [void]$sb.AppendLine("Product: $built of $planned planned tasks built ($pct%)")
+} else {
+    # NAMED, never omitted. A missing progress line reads as "no progress worth reporting";
+    # this says the plan could not be read, which is a different and checkable claim.
+    [void]$sb.AppendLine("Product: $built task(s) built; the plan's task count could not be read from decompose-diagnostics.json, so how much of the product exists is UNKNOWN")
+}
 [void]$sb.AppendLine('')
 foreach ($r in $results) {
     [void]$sb.AppendLine("- $($r.task): $($r.outcome)")

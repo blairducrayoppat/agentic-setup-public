@@ -726,12 +726,51 @@ $vf4 = Invoke-VisualFixPass -RunCoder { @{ TimedOut = $false } } `
 Assert-False $vf4.Applied 'VF4 coder no-op (no commit) -> Applied=$false'
 Assert-False $script:vf4_verifyCalled 'VF4 [kill] no commit -> verify is NOT run (nothing to verify)'
 
-# VF5: coder TIMEOUT -> ABORT before commit/verify/merge.
-$script:vf5_commitCalled = $false
-$vf5 = Invoke-VisualFixPass -RunCoder { @{ TimedOut = $true } } `
-    -CommitFix { $script:vf5_commitCalled = $true; $true } -Verify { 'pass' } -ReMerge { $true }
-Assert-False $vf5.Applied 'VF5 coder timeout -> Applied=$false'
-Assert-False $script:vf5_commitCalled 'VF5 [kill] coder timeout -> commit is NOT attempted (no partial work)'
+# VF5*: coder TIMEOUT -> the work is JUDGED, not deleted (#1370).
+#
+# THIS ASSERTION WAS DELIBERATELY REVERSED on 2026-08-10. It previously read:
+#
+#     Assert-False $script:vf5_commitCalled 'VF5 [kill] coder timeout -> commit is NOT
+#                                            attempted (no partial work)'
+#
+# and its comment called that "no partial work" — an intentional-sounding name for
+# throwing away everything a bounded coder had written. MEASURED across two B9 runs:
+# 35 fix cycles, 11 applied, 24 discarded, and ALL 24 were this branch. Not one was
+# rejected on merit. `create-home-page` lost 3 of 3 on both runs, which is why the
+# operator's placeholder front door (#1367) survived a whole night of a loop explicitly
+# trying to fix it.
+#
+# A test pinned to a behaviour argues against fixing that behaviour, exactly as three
+# tests pinned to the old DOOM_STALL_GRACE_S value kept a wrong window for a month
+# (#1366). Rewritten rather than deleted, so the reversal is legible.
+#
+# The safety property is UNCHANGED and is asserted below: a bounded coder's rebuild that
+# fails verify is still never merged. What changed is the default for interrupted work —
+# from "assume it is worthless" to "ask the gate", which is what the base-candidate path
+# has always said: "work kept, the gate decides the merge".
+
+# VF5a: timeout + the coder DID write something + verify pass + clean merge -> APPLIED.
+$script:vf5a_commitCalled = $false
+$vf5a = Invoke-VisualFixPass -RunCoder { @{ TimedOut = $true } } `
+    -CommitFix { $script:vf5a_commitCalled = $true; $true } -Verify { 'pass' } -ReMerge { $true }
+Assert-True  $script:vf5a_commitCalled 'VF5a [kill] coder timeout -> the commit IS attempted (a bounded coder is not an empty one)'
+Assert-True  $vf5a.Applied 'VF5a timeout + real work + verify pass + clean merge -> Applied=$true (#1370)'
+Assert-Contains $vf5a.Reason 'time-bounded' 'VF5a the record says the coder was bounded rather than hiding it'
+
+# VF5b: timeout + the coder wrote NOTHING -> honest no-op, not a silent deletion.
+$vf5b = Invoke-VisualFixPass -RunCoder { @{ TimedOut = $true } } `
+    -CommitFix { $false } -Verify { 'pass' } -ReMerge { $true }
+Assert-False $vf5b.Applied 'VF5b timeout + nothing written -> Applied=$false'
+Assert-Contains $vf5b.Reason 'produced no changes' 'VF5b names the REAL reason (empty), not the timeout'
+Assert-Contains $vf5b.Reason 'time-bounded' 'VF5b still records that the coder was bounded'
+
+# VF5c: timeout + the rebuild FAILS verify -> STILL never merged. The safety property that
+# actually protects the operator is stage 3, not the old early return.
+$script:vf5c_mergeCalled = $false
+$vf5c = Invoke-VisualFixPass -RunCoder { @{ TimedOut = $true } } `
+    -CommitFix { $true } -Verify { 'fail' } -ReMerge { $script:vf5c_mergeCalled = $true; $true }
+Assert-False $vf5c.Applied 'VF5c [kill] timeout + verify FAIL -> Applied=$false (a broken rebuild is still never merged)'
+Assert-False $script:vf5c_mergeCalled 'VF5c [kill] timeout + verify FAIL -> the re-merge is NEVER attempted'
 
 # VF6: a thrown mechanism is CAUGHT (never a task failure) -> ABORT.
 $vf6 = Invoke-VisualFixPass -RunCoder { throw 'simulated coder crash' } `

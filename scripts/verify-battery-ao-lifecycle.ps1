@@ -117,18 +117,83 @@ $reclaimCalls = Get-Calls $ast 'Invoke-AoPreflightReclaim'
 $stopCalls    = Get-Calls $ast 'Stop-OwnedAo'
 $claimCalls   = Get-Calls $ast 'Set-AoOwner'
 Check "A1 LEG B: Invoke-AoPreflightReclaim called exactly once (got $($reclaimCalls.Count))" ($reclaimCalls.Count -eq 1)
-# #1334 added a THIRD teardown: the live-dispatch stand-down in the archive guard, which
-# must release an AO this night already claimed rather than throw past the end-of-night
-# teardown. The count moves 2 -> 3.
-#
-# THE COUNT IS A PROXY AND THIS IS ITS THIRD FALSE ALARM. The property is "every path that
-# exits after claiming an AO tears it down"; asserting an arity means every legitimate new
-# stand-down reports a defect. A7 below is red for the same reason (#1332), and A9 moved
-# for the same reason in the same change — three count-not-property assertions in one file,
-# tripped by one correct edit. #1332 owns the AST-walk fix; this is the evidence that it is
-# a class rather than a one-off, recorded rather than absorbed.
-Check "A1 LEG A: Stop-OwnedAo called 3x - end-of-night + skip path + live-dispatch stand-down (got $($stopCalls.Count))" ($stopCalls.Count -eq 3)
 Check "A1 the claim (Set-AoOwner) is made exactly once (got $($claimCalls.Count))" ($claimCalls.Count -eq 1)
+Check "A1 LEG A: at least one Stop-OwnedAo teardown exists (got $($stopCalls.Count))" ($stopCalls.Count -ge 1)
+
+# ---------------------------------------------------------------------------
+# A1p  THE PROPERTY, replacing the arity proxy (#1332, fixed 2026-08-14).
+#
+# This assertion used to read `$stopCalls.Count -eq 3`, and the note above it recorded
+# that the count was a PROXY on its THIRD false alarm. #1380's archive-guard stand-down
+# was the FOURTH: a correct edit that adds a legitimate exit path made three assertions
+# in this file report a defect, while A7's own arity had been silently WRONG on main for
+# some time (it asserted 2 against a real 8) -- the failure mode of a count is that it is
+# equally loud when it is right and when it is stale, so nobody can tell which.
+#
+# What those three assertions were all reaching for is ONE property:
+#
+#     every path that EXITS the script after the AO could have been claimed must
+#       (a) write a skip report   -- else the operator's morning read shows LAST night,
+#       (b) record admission      -- else the night leaves no provenance,
+#       (c) tear down an owned AO -- else the 14B stays resident (#1045, measured
+#           12.33 GB on 2026-08-11 and 11.66 GB on 2026-08-14).
+#
+# Asserted directly below by walking the AST, so a new stand-down path is checked for
+# being CORRECT instead of being counted. Adding a fourth, fifth or tenth exit is now
+# free; adding one that forgets its teardown is a failure.
+$claimAssign = $ast.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left.Extent.Text -eq '$AoOwnedByThisNight' -and $n.Right.Extent.Text -match '\$true'
+}, $true) | Select-Object -First 1
+Check "A1p the AO claim flag is raised somewhere (the anchor this property hangs on)" ($null -ne $claimAssign)
+
+function Get-PostClaimStandDowns([System.Management.Automation.Language.Ast]$Root, [int]$AfterOffset) {
+    # Every `exit 0` after $AfterOffset, paired with the statement block enclosing it.
+    $exits = $Root.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.ExitStatementAst]
+    }, $true) | Where-Object { $_.Extent.StartOffset -gt $AfterOffset }
+    $out = @()
+    foreach ($e in $exits) {
+        $blk = $e.Parent
+        while ($blk -and $blk -isnot [System.Management.Automation.Language.StatementBlockAst]) { $blk = $blk.Parent }
+        if ($blk) { $out += [pscustomobject]@{ Line = $e.Extent.StartLineNumber; Text = $blk.Extent.Text } }
+    }
+    return $out
+}
+
+if ($claimAssign) {
+    $standDowns = @(Get-PostClaimStandDowns $ast $claimAssign.Extent.EndOffset)
+    Check "A1p there is at least one post-claim exit to check (an empty set must never read as a pass)" ($standDowns.Count -ge 1)
+    foreach ($sd in $standDowns) {
+        $hasSkip  = $sd.Text -match 'Write-SkipReport'
+        $hasAdm   = $sd.Text -match 'Write-AdmissionRecord'
+        $hasStop  = $sd.Text -match 'Stop-OwnedAo'
+        $guarded  = $sd.Text -match '\$AoOwnedByThisNight'
+        Check "A1p exit at line $($sd.Line) writes a skip report"            $hasSkip
+        Check "A1p exit at line $($sd.Line) records admission provenance"    $hasAdm
+        Check "A1p exit at line $($sd.Line) tears down an owned AO"          $hasStop
+        Check "A1p exit at line $($sd.Line) guards the teardown on ownership" $guarded
+    }
+
+    # TOGGLE. The walker must FAIL a stand-down that forgets an obligation -- otherwise
+    # the checks above are a pass that cannot fail, which is the exact defect the coder's
+    # own definition-of-done (capability 4) forbids in a delivered exam.
+    $bad = [System.Management.Automation.Language.Parser]::ParseInput(@'
+$AoOwnedByThisNight = $true
+if ($whatever) {
+    Write-SkipReport "stood down"
+    Write-AdmissionRecord 'skipped-something'
+    Stop-Transcript | Out-Null; exit 0
+}
+'@, [ref]$null, [ref]$null)
+    $badClaim = $bad.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$AoOwnedByThisNight'
+    }, $true) | Select-Object -First 1
+    $badSd = @(Get-PostClaimStandDowns $bad $badClaim.Extent.EndOffset)
+    Check "A1p [toggle] the walker FINDS a stand-down that omits Stop-OwnedAo" `
+        ($badSd.Count -ge 1 -and ($badSd[0].Text -notmatch 'Stop-OwnedAo'))
+}
 
 Section 'A2  every ownership entry point is scoped to the scheduled night (-not $Now)'
 # The reclaim and the claim are guarded DIRECTLY. Re-wrap each: PowerShell unwraps a
@@ -267,9 +332,11 @@ Check "A8 the post-probe call site is context-tagged (an already-up AO is attrib
 
 Section 'A9  admission.json is written on every exit'
 $recCalls = Get-Calls $ast 'Write-AdmissionRecord'
-# #1334: a fourth exit — the live-dispatch stand-down — and it must leave provenance like
-# every other. Count 3 -> 4. Same count-not-property proxy as A1/A7 above; see A1's note.
-Check "A9 Write-AdmissionRecord called 4x - admitted + both skip paths + live-dispatch stand-down (got $($recCalls.Count))" ($recCalls.Count -eq 4)
+# Arity retired in favour of A1p's property walk (#1332). A count of admission records is
+# not the thing that matters; "every exit leaves provenance" is, and A1p asserts it per
+# exit. What survives here is the floor and the OUTCOME coverage below, which a count
+# cannot give: an admission record that never names the memory skip is wrong at any arity.
+Check "A9 Write-AdmissionRecord is called at all (got $($recCalls.Count))" ($recCalls.Count -ge 1)
 $outcomes = @(@($recCalls) | ForEach-Object { $_.Extent.Text })
 Check "A9 one call records the ADMITTED outcome" ([bool](@($outcomes) -match "'admitted'"))
 Check "A9 one call records the memory skip" ([bool](@($outcomes) -match "'skipped-memory'"))
@@ -294,7 +361,11 @@ Check "A9 the ordering check actually RAN (a skipped check must never read as a 
 
 Section 'A7  a skipped night is never silent'
 $skipCalls = Get-Calls $ast 'Write-SkipReport'
-Check "A7 Write-SkipReport is called from BOTH 04:00 skip paths (got $($skipCalls.Count))" ($skipCalls.Count -eq 2)
+# This asserted `-eq 2` and was RED ON MAIN against a real 8 -- stale for long enough that
+# nobody could say when it stopped being true, which is the case against arity assertions
+# stated better than any argument (#1332, retired 2026-08-14). Every stand-down's skip
+# report is now checked per-exit by A1p above; the floor is what remains useful here.
+Check "A7 every stand-down can write a skip report (got $($skipCalls.Count) call sites)" ($skipCalls.Count -ge 2)
 Check "A7 the skip report overwrites state\battery\MORNING-REPORT.md (no stale previous night)" `
     ($src -match 'MORNING-REPORT\.md')
 
