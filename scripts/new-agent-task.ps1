@@ -374,7 +374,7 @@ if ($__isWebStatic) { Write-Host "  Static web page: the coder extends the ONE s
 # stands). Computed ONCE (every candidate inherits it via $Prompt); preserves the prompt verbatim.
 $__assetPromptBefore = $Prompt
 $Prompt = Add-AssetHint -Prompt $Prompt -Worktree $wt -Surface $Surface
-if ($Prompt -ne $__assetPromptBefore) { Write-Host "  Generated image assets present: the coder is told to reference the local file(s) offline (no <svg> placeholder, no CDN)." -ForegroundColor DarkCyan }
+if ($Prompt -ne $__assetPromptBefore) { Write-Host "  Assets present in the worktree: the coder is told what each file is and what to do with it (local files only, no CDN)." -ForegroundColor DarkCyan }
 # The BEHAVIOR CONTRACT: if BlarAI's plan declared what the finished page must be able to DO, tell
 # the coder the two DOM markers the headless capture will look for -- so it is graded on a contract
 # it was actually given, not on a check it never heard of. Same file-presence gate and the same
