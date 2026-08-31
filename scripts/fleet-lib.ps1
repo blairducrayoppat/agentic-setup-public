@@ -2038,58 +2038,179 @@ STATIC + OFFLINE RULES (this box has NO network, and there is NO backend -- brea
 }
 
 function Add-AssetHint {
-    # ASSET-CONSUMPTION PROMPT (#714, UC-010 SEAM A): when BlarAI's on-device image generator
-    # PRE-GENERATED real raster image assets into the target repo BEFORE the coder ran, tell the
-    # coder to REFERENCE the local file offline instead of drawing an <svg> placeholder or (worse)
-    # reaching for a CDN. DYNAMIC + gated on ACTUAL FILE PRESENCE in the seeded worktree -- NOT on
-    # $scaffold, because a real pre-existing project resolves to an EMPTY scaffold, so a scaffold
-    # gate would MISS it (the exact seam-bug class the LESSONS warn about). No asset files present
-    # -> a NO-OP (the inline-SVG fallback in Add-WebHint / AGENTS.md stands). The "no external URL"
-    # rule is UNCHANGED -- a local relative path is not egress. ALWAYS preserves the original prompt
-    # verbatim (appended, never replaces). Pure-ish (reads the filesystem); a bad/missing worktree
-    # is a no-op. PS 5.1 + 7 compatible.
+    # ASSET-CONSUMPTION PROMPT (#714 UC-010 SEAM A; widened #1165/#1469, LA 2026-08-30).
+    # Files already in the target repo's asset folders when the coder starts are named to it
+    # here. They arrive from BlarAI's on-device image generator AND from the OPERATOR'S OWN
+    # assets/ folder (#1165 M5 intake), and this steer stays PROVENANCE-NEUTRAL about which
+    # (2026-08-06: describing an operator's own photograph as machine output was a false
+    # claim). The coder does not need to know who made a file -- it needs to know the file
+    # exists, WHERE it is relative to what the server actually serves, and what to DO with it.
+    #
+    # FOUR KINDS, FOUR INSTRUCTIONS, because the right action depends on the file:
+    #   image        -> REFERENCE it (<img> / packaged Image). Never redraw, never fetch.
+    #   video/audio  -> EMBED it (<video>/<audio>). Never fetch a stand-in.
+    #   font         -> WIRE it in CSS (@font-face). It is machine-graded, so it must be named.
+    #   document/data/code -> READ it and use the WORDS INSIDE. Its filename appearing in the
+    #                  markup is the WRONG outcome: a link to bio.md is not a bio.
+    #
+    # SERVED vs UNSERVED is the correction that matters (adversarial review, 2026-08-30).
+    # A web seed serves `public/` AND NOTHING ELSE, so a file at <project>/assets/hero.png is
+    # a 404 in the browser. The previous wording told the coder "the file is served from
+    # public/, so the assets/... path resolves" for EVERY directory -- flatly contradicting
+    # the seed's own served-root hint in the same prompt, and handing the operator's own
+    # photograph over as a path guaranteed to break. The machine floor only checks that the
+    # filename appears in markup, so the broken build passed the gate. Each entry now carries
+    # where it actually lives, and unserved files are told to be COPIED into public/assets/.
+    #
+    # HYGIENE MIRRORS THE MANIFEST. `enumerate_operator_assets` filters every path component
+    # through an ASCII allowlist and caps the relative path, so names that fail it are told to
+    # the operator as SKIPPED on the plan card. Without the same filter here, the card and this
+    # steer named different files -- the card said "5 skipped, rename them", this told the coder
+    # to use those exact 5, and dropped 4 the card said the build was graded on. It is also the
+    # second validator on untrusted directory text reaching an LLM prompt.
+    #
+    # DYNAMIC + gated on ACTUAL FILE PRESENCE in the seeded worktree -- NOT on $scaffold, since
+    # a real pre-existing project resolves to an EMPTY scaffold. Nothing qualifying -> a
+    # byte-identical NO-OP. ALWAYS preserves the original prompt verbatim. PS 5.1 + 7.
     param([string]$Prompt, [string]$Worktree, [string]$Surface)
     if (-not $Worktree -or -not (Test-Path -LiteralPath $Worktree)) { return $Prompt }
-    $exts = @('.png', '.jpg', '.jpeg', '.webp', '.gif')
-    # (asset dir under the worktree) -> (the offline reference PREFIX the coder writes). A web app
-    # serves public/ as its root, so a file at public/assets/x.png is referenced as assets/x.png.
+    $imgExts  = @('.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.bmp', '.ico')
+    $vidExts  = @('.mp4', '.webm', '.mov', '.m4v', '.mkv', '.avi')
+    $audExts  = @('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac')
+    $fontExts = @('.ttf', '.otf', '.woff', '.woff2')
+    $docExts  = @('.md', '.txt', '.pdf', '.rtf', '.docx', '.odt',
+                  '.csv', '.tsv', '.json', '.xlsx', '.xls', '.ods', '.yaml', '.yml', '.toml',
+                  '.py', '.js', '.mjs', '.ts', '.html', '.css', '.c', '.h', '.cpp', '.cs',
+                  '.java', '.rb', '.go', '.rs', '.sh', '.ps1', '.sql')
+    # Binary containers a text-reading coder cannot open. Named so the read instruction can
+    # carry an honest exception instead of ordering the impossible and forbidding the retreat.
+    $opaqueExts = @('.pdf', '.docx', '.odt', '.xlsx', '.xls', '.ods', '.rtf')
+    # The manifest's per-component allowlist and path cap, mirrored exactly.
+    $nameRe = [regex]'^(?![. ])[A-Za-z0-9 ._\-]{1,80}(?<![. ])$'
+    $relMax = 160
+
+    $isWeb = ($Surface -eq 'web') -or (Test-Path -LiteralPath (Join-Path $Worktree 'public'))
+    # Dir -> (reference prefix, is it under the served root). `public/assets` is served at
+    # `assets/...` because the server's root IS public/. Root `assets/` is served only when
+    # there is no public/ at all (a flat static site); with a public/ present it is outside.
     $mapping = @(
-        @{ Dir = 'public/assets'; Ref = 'assets' },
-        @{ Dir = 'assets';        Ref = 'assets' },
-        @{ Dir = 'Assets';        Ref = 'Assets' }
+        @{ Dir = 'public/assets'; Ref = 'assets'; Served = $true },
+        @{ Dir = 'assets';        Ref = 'assets'; Served = (-not $isWeb) -or (-not (Test-Path -LiteralPath (Join-Path $Worktree 'public'))) },
+        @{ Dir = 'Assets';        Ref = 'Assets'; Served = (-not $isWeb) -or (-not (Test-Path -LiteralPath (Join-Path $Worktree 'public'))) }
     )
-    $refs = New-Object System.Collections.Generic.List[string]
+    $imgRefs = New-Object System.Collections.Generic.List[object]
+    $medRefs = New-Object System.Collections.Generic.List[object]
+    $fntRefs = New-Object System.Collections.Generic.List[object]
+    $docRefs = New-Object System.Collections.Generic.List[object]
+    $bs = [string][char]92
+    # The mapping lists 'assets' AND 'Assets', which on a case-INSENSITIVE filesystem are the
+    # SAME directory -- without this every file was emitted twice. Keyed on the RESOLVED path,
+    # so genuinely different directories (public/assets vs assets) are BOTH still walked.
+    $seenDirs = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($m in $mapping) {
         $dir = Join-Path $Worktree $m.Dir
         if (-not (Test-Path -LiteralPath $dir)) { continue }
-        Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($exts -contains $_.Extension.ToLower()) { $refs.Add("$($m.Ref)/$($_.Name)") }
+        $base = (Resolve-Path -LiteralPath $dir).Path.TrimEnd([char]92, [char]47)
+        if (-not $seenDirs.Add($base)) { continue }
+        Get-ChildItem -LiteralPath $dir -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | ForEach-Object {
+            $rel = $_.FullName
+            if ($rel.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $rel = $rel.Substring($base.Length).TrimStart([char]92, [char]47)
+            } else { $rel = $_.Name }
+            $rel = $rel.Replace($bs, '/')
+            # OUR OWN scaffold README (root only, case-insensitive) and the reference/ subtree
+            # are both excluded from the intake manifest; naming them here would make this
+            # steer disagree with the plan card the operator approved.
+            if ($rel -ieq 'README.txt') { return }
+            if ($rel -imatch '^reference/') { return }
+            if ($rel.Length -gt $relMax) { return }
+            $bad = $false
+            foreach ($part in $rel.Split('/')) { if (-not $nameRe.IsMatch($part)) { $bad = $true } }
+            if ($bad) { return }
+            $entry = [PSCustomObject]@{ Ref = "$($m.Ref)/$rel"; Served = [bool]$m.Served; Name = $_.Name }
+            $ext = $_.Extension.ToLower()
+            if     ($imgExts  -contains $ext) { $imgRefs.Add($entry) }
+            elseif (($vidExts -contains $ext) -or ($audExts -contains $ext)) { $medRefs.Add($entry) }
+            elseif ($fontExts -contains $ext) { $fntRefs.Add($entry) }
+            elseif ($docExts  -contains $ext) { $docRefs.Add($entry) }
         }
     }
-    if ($refs.Count -eq 0) { return $Prompt }
-    $isWeb = ($Surface -eq 'web') -or (Test-Path -LiteralPath (Join-Path $Worktree 'public'))
-    $bullets = [string]::Join("`n", ($refs | ForEach-Object { "  - $_" }))
-    if ($isWeb) {
-        $howTo = 'For each, use a RELATIVE <img src="RELPATH"> tag (e.g. <img src="assets/elephant.png">). The file is served from public/, so the assets/... path resolves. Do NOT inline an <svg> in its place and do NOT use any http(s):// URL.'
-    } else {
-        $howTo = 'For each, reference the LOCAL file by its relative path (for a desktop app, point an Image/BitmapImage at the packaged asset). Do NOT redraw it and do NOT use any http(s):// URL.'
+    if (($imgRefs.Count -eq 0) -and ($medRefs.Count -eq 0) -and
+        ($fntRefs.Count -eq 0) -and ($docRefs.Count -eq 0)) { return $Prompt }
+    $out = $Prompt
+
+    # One shared sentence for anything living outside the served root, so the correction is
+    # stated once and cannot drift between blocks.
+    $copyRule = 'IMPORTANT -- the file(s) marked (NOT SERVED) live OUTSIDE the folder the server publishes, so referencing them where they sit is a 404 in the browser. COPY each one into public/assets/ keeping its filename, THEN reference it as assets/<filename>. Do not skip the copy and do not invent a different path.'
+    function _bul($items) {
+        $lines = $items | ForEach-Object {
+            if ($_.Served) { "  - $($_.Ref)" } else { "  - $($_.Ref)   (NOT SERVED - copy to public/assets/$($_.Name) first, then use assets/$($_.Name))" }
+        }
+        return [string]::Join("`n", $lines)
     }
-    # PROVENANCE-NEUTRAL BY DESIGN (2026-08-06). This block used to tell the coder "BlarAI
-    # already GENERATED the image asset(s) ... ON THIS BOX" -- but the scan above globs the
-    # assets folder, which holds BOTH machine-generated images AND files the OPERATOR
-    # supplied himself (the #1165 M5 intake pipeline, live since 2026-07-29). So an
-    # operator's own photograph was described to the coder as machine output: a false
-    # provenance claim, the #1172 class pointing the other way.
-    #
-    # The coder does not need to know WHO made them, and telling it wrongly is worse than
-    # not telling it at all. What it needs is: they exist, use them, do not redraw, do not
-    # fetch. That is all this says now.
-    $note = @"
+
+    if ($imgRefs.Count -gt 0) {
+        $bullets = _bul $imgRefs
+        if ($isWeb) {
+            $howTo = 'For each, use a RELATIVE <img src="RELPATH"> tag (e.g. <img src="assets/elephant.png">). An .ico or a file named like a favicon is the one exception -- wire that with <link rel="icon" href="RELPATH"> in <head>, not an <img>. Do NOT inline an <svg> in its place and do NOT use any http(s):// URL.'
+        } else {
+            $howTo = 'For each, reference the LOCAL file by its relative path (for a desktop app, point an Image/BitmapImage at the packaged asset). Do NOT redraw it and do NOT use any http(s):// URL.'
+        }
+        $note = @"
 The image asset(s) this app needs are ALREADY IN YOUR WORKING TREE and committed. USE the local file(s) -- do NOT draw a placeholder <svg> for them, and NEVER reference an external URL:
 $bullets
 $howTo These files already exist in your tree (open one to confirm). A local relative path is NOT a network request -- it is the offline-correct way to show a real picture.
 "@
-    return "$Prompt`n`n--- IMAGE ASSETS IN YOUR TREE (use the local files; do not redraw or fetch) ---`n$note"
+        if ($isWeb -and ($imgRefs | Where-Object { -not $_.Served })) { $note = "$note`n$copyRule" }
+        $out = "$out`n`n--- IMAGE ASSETS IN YOUR TREE (use the local files; do not redraw or fetch) ---`n$note"
+    }
+
+    if ($medRefs.Count -gt 0) {
+        $bullets = _bul $medRefs
+        if ($isWeb) {
+            $howTo = 'For each, embed the LOCAL file with a <video controls src="RELPATH"> or <audio controls src="RELPATH"> tag (e.g. <video controls src="assets/reel.mp4">). Do NOT link to any http(s):// URL and do NOT substitute a still image for a video the page is supposed to play.'
+        } else {
+            $howTo = 'For each, point the media element at the LOCAL packaged file by its relative path. Do NOT link to any http(s):// URL.'
+        }
+        $note = @"
+The video/audio file(s) this app needs are ALREADY IN YOUR WORKING TREE and committed. PLAY the local file(s) -- never fetch a stand-in:
+$bullets
+$howTo These files already exist in your tree. A local relative path is NOT a network request.
+"@
+        if ($isWeb -and ($medRefs | Where-Object { -not $_.Served })) { $note = "$note`n$copyRule" }
+        $out = "$out`n`n--- VIDEO / AUDIO IN YOUR TREE (embed the local files; do not fetch) ---`n$note"
+    }
+
+    if ($fntRefs.Count -gt 0) {
+        $bullets = _bul $fntRefs
+        $note = @"
+The font file(s) below are ALREADY IN YOUR WORKING TREE and committed, and the build is graded on the page actually referencing them:
+$bullets
+Declare each with an @font-face rule in your CSS pointing at the RELATIVE path, and apply it in your font stack. Do NOT load a web font from any http(s):// URL and do NOT silently fall back to a system font instead.
+"@
+        if ($isWeb -and ($fntRefs | Where-Object { -not $_.Served })) { $note = "$note`n$copyRule" }
+        $out = "$out`n`n--- FONTS IN YOUR TREE (wire them in CSS; do not fetch a web font) ---`n$note"
+    }
+
+    if ($docRefs.Count -gt 0) {
+        $bullets = [string]::Join("`n", ($docRefs | ForEach-Object { "  - $($_.Ref)" }))
+        $opaque = $docRefs | Where-Object { $opaqueExts -contains [System.IO.Path]::GetExtension($_.Name).ToLower() }
+        $note = @"
+The file(s) below are ALREADY IN YOUR WORKING TREE and hold the REAL CONTENT this product is supposed to present -- the operator's own words, names, dates and figures:
+$bullets
+OPEN AND READ EACH ONE BEFORE YOU WRITE ANY USER-FACING TEXT, then use what is inside. This is NOT exploratory reading and it is NOT optional -- any general instruction telling you not to spend turns reading the existing tree does not apply to these specific files.
+
+Use their CONTENT, not their filenames: a link to a document is not the document's content, so do NOT add a link, an <iframe> or a download button pointing at these files in place of writing the text out.
+
+Do NOT invent placeholder biographies, fake names, lorem ipsum, sample dates or made-up achievements for anything these files already answer. If one of them contains an unfilled marker (for example a line beginning TODO or a bracketed FILL IN), leave that item OUT of the page entirely rather than inventing a value for it or printing the marker.
+"@
+        if ($opaque) {
+            $note = "$note`nIf a file is a binary format you cannot read as text (PDF, Word, Excel, ODF), do NOT guess at its contents: leave the sections it would have answered OUT, and say plainly in your final summary which file you could not read. An invented value is worse than an absent section."
+        }
+        $out = "$out`n`n--- YOUR CONTENT SOURCE FILES (read them; use the words inside) ---`n$note"
+    }
+
+    return $out
 }
 
 function Format-SmokeResultQualifier {
