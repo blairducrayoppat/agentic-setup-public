@@ -127,14 +127,22 @@ class _Absent:
 _ABSENT = _Absent()
 
 
-def _write_manifest(tmp_path: Path, research_docs, *, name: str = "fleet-driver.json") -> Path:
+def _write_manifest(
+    tmp_path: Path, research_docs, *, name: str = "fleet-driver.json", bom: bool = False
+) -> Path:
     """Write a fleet-driver manifest and return its path. ``research_docs`` is written
-    verbatim, so a test can plant a string/int/absent value and watch it be refused."""
+    verbatim, so a test can plant a string/int/absent value and watch it be refused.
+    ``bom=True`` prepends a UTF-8 byte-order mark — the encoding accident Windows tooling
+    makes easily and which used to split this reader from the PowerShell one (#1206)."""
     body: dict = {"driver": "stdin", "containment": "off", "acp": {}}
     if research_docs is not _ABSENT:
         body["research_docs"] = research_docs
     path = tmp_path / name
-    path.write_text(json.dumps(body), encoding="utf-8")
+    text = json.dumps(body)
+    if bom:
+        path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    else:
+        path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -538,3 +546,87 @@ def test_search_docs_imports_no_network_machinery():
                 f"search_docs.py imports {name!r} — the local research tool is "
                 f"zero-egress (#746)"
             )
+
+
+# ---------------------------------------------------------------------------------------
+# #1206 — a UTF-8 BOM must not split the two readers of the SAME manifest.
+#
+# scripts/fleet-lib.ps1 Get-FleetDriverConfig reads configs/fleet-driver.json with
+# Get-Content -Raw | ConvertFrom-Json, which accepts a byte-order mark silently. This
+# module used to read the same file with encoding="utf-8", which raises on a BOM. Measured
+# on 2026-09-01 against one BOM'd file: PowerShell parsed it and reported research_docs
+# True, while resolve_arming() returned UNRESOLVED. The launcher would bank armed=true every
+# night while every lookup the coder made was refused — a capability the ledger calls live
+# and the tool calls off. A BOM is easy to introduce by accident on Windows, so the split is
+# what gets closed here, not the BOM.
+# ---------------------------------------------------------------------------------------
+
+def test_bom_manifest_still_arms(monkeypatch, tmp_path):
+    """An armed manifest saved with a BOM arms the tool. Before the fix this was UNRESOLVED."""
+    _point_at_manifest(monkeypatch, _write_manifest(tmp_path, True, bom=True))
+    state, reason = search_docs.resolve_arming()
+    assert state == search_docs.ARMED, f"a BOM must not disarm a true manifest ({reason})"
+
+
+def test_bom_manifest_false_is_dormant_not_unresolved(monkeypatch, tmp_path):
+    """And a BOM'd dormant manifest reads as a DELIBERATE off, not an unreadable file.
+    The distinction is load-bearing: `unresolved` means 'could not tell', and conflating it
+    with a decision is how a refusal gets reported as a choice."""
+    _point_at_manifest(monkeypatch, _write_manifest(tmp_path, False, bom=True))
+    state, _ = search_docs.resolve_arming()
+    assert state == search_docs.DORMANT
+
+
+def test_the_shipped_reader_tolerates_a_bom_by_construction():
+    """Read the SHIPPED source rather than only the behaviour, so the property survives on a
+    box where the PowerShell half of the cross-check below cannot run."""
+    source = (_TOOLS_DIR / "search_docs.py").read_text(encoding="utf-8")
+    assert 'read_text(encoding="utf-8-sig")' in source, (
+        "resolve_arming must read the manifest with utf-8-sig; plain utf-8 raises on a BOM "
+        "that the PowerShell reader of the same file accepts (#1206)"
+    )
+
+
+def test_bom_does_not_split_the_python_and_powershell_readers(monkeypatch, tmp_path):
+    """The cross-implementation lock: drive BOTH readers over the SAME bytes and require
+    them to agree. This is the check that was missing — the existing PowerShell verifier
+    writes its fixtures with Set-Content -Encoding UTF8, which emits NO BOM under pwsh 7, so
+    it could never have observed this divergence."""
+    import shutil
+    import subprocess
+
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("pwsh not on PATH — the PowerShell half of the cross-check cannot run")
+
+    manifest = _write_manifest(tmp_path, True, bom=True)
+    _point_at_manifest(monkeypatch, manifest)
+    py_state, py_reason = search_docs.resolve_arming()
+
+    fleet_lib = _TOOLS_DIR.parent / "scripts" / "fleet-lib.ps1"
+    assert fleet_lib.is_file(), f"fleet-lib.ps1 not found at {fleet_lib}"
+
+    script = (
+        f". '{fleet_lib}'; "
+        f"$env:BLARAI_FLEET_DRIVER_CONFIG = '{manifest}'; "
+        "$c = Get-FleetDriverConfig -Fresh; "
+        "if ($c.research_docs) { 'ARMED' } else { 'NOT-ARMED' }"
+    )
+    proc = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=120,
+    )
+    ps_answer = (proc.stdout or "").strip().splitlines()[-1].strip() if proc.stdout else ""
+    assert ps_answer in {"ARMED", "NOT-ARMED"}, (
+        f"could not read the PowerShell answer (rc={proc.returncode}): "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+    py_armed = py_state == search_docs.ARMED
+    ps_armed = ps_answer == "ARMED"
+    assert py_armed == ps_armed, (
+        "the two readers of the SAME manifest bytes disagree: "
+        f"python={py_state} ({py_reason}), powershell={ps_answer}. "
+        "That is the #1206 defect: the launcher banks armed while the coder is refused."
+    )
+    assert py_armed, "both readers should see this BOM'd manifest as armed"

@@ -185,11 +185,33 @@ def resolve_arming() -> "tuple[str, str]":
 
     path = manifest_path()
     try:
-        raw = path.read_text(encoding="utf-8")
+        # utf-8-SIG, not utf-8: a UTF-8 byte-order mark must not change the answer. The
+        # PowerShell reader of this same file (Get-FleetDriverConfig in scripts/fleet-lib.ps1,
+        # via ConvertFrom-Json) accepts a BOM silently, so with plain utf-8 here the two
+        # implementations DISAGREE about the same bytes -- measured: the launcher reports
+        # armed and banks armed=true while this resolver returns UNRESOLVED and every lookup
+        # the coder makes is refused. The ledger would read armed every night against a
+        # capability that is off. A BOM is easy to introduce by accident on Windows
+        # (Set-Content -Encoding UTF8BOM, Notepad, several editors), so tolerate it here
+        # rather than leave the two readers able to differ. utf-8-sig is identical to utf-8
+        # on a file without a BOM, so this is not a loosening of anything else. (#1206)
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return UNRESOLVED, f"arming manifest not found at {path}"
     except OSError as exc:  # unreadable / permissions / device error
         return UNRESOLVED, f"arming manifest at {path} could not be read: {exc}"
+    except UnicodeDecodeError as exc:
+        # A UnicodeDecodeError is a ValueError, not an OSError, so it used to escape this function
+        # entirely: the CLI died with a traceback, exit 1 and zero stdout, and the opencode shim
+        # rendered "[research: tool_error]". This module's own header promises THREE states and
+        # that a refusal is REPORTED, never a crash -- so crashing here broke its own contract.
+        # It also splits the two readers the same way the BOM did, one encoding over: PowerShell's
+        # Get-Content -Raw auto-detects a UTF-16 BOM and parses the file, reporting ARMED and
+        # banking armed=true, while this side died. Refuse fail-closed AND say so. (#1206)
+        return UNRESOLVED, (
+            f"arming manifest at {path} is not readable as UTF-8 ({exc.encoding}: {exc.reason} "
+            f"at byte {exc.start}) -- if it was saved as UTF-16, re-save it as UTF-8"
+        )
     try:
         data = json.loads(raw)
     except ValueError as exc:

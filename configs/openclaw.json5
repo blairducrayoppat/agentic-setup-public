@@ -30,8 +30,13 @@
           {
             id: "coder-30b",                   // only when the 30B is the resident model
             name: "Qwen3-Coder-30B-A3B INT4 (local)",
-            contextWindow: 32768,
-            maxTokens: 16384,
+            // 65536+8192 = 73,728 against the 87,381-token pool a 4 GB cache_size holds
+            // (#1477, 2026-08-31). maxTokens was 16384 and is REDUCED, not overlooked: at
+            // the measured ~12 tok/s a 16,384-token reply needs ~23 minutes of unbroken
+            // generation against a 600 s idle breaker that cannot see a long file write as
+            // progress -- that is how attempt #2's candidates were killed mid-write.
+            contextWindow: 65536,
+            maxTokens: 8192,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           },
         ],

@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Verify #1206 -- the arming of the coder's LOCAL offline docset lookup (tools/search_docs.py).
@@ -328,15 +328,28 @@ Write-Output ("ARMED=" + $st.Armed + " PINNED=" + ($null -ne $env:BLARAI_REPO))
             -NoNewWindow -PassThru -Wait -RedirectStandardOutput $childOut
         Restore-CoderResearchEnv -State $st
         $txt = (Get-Content $childOut -Raw -ErrorAction SilentlyContinue)
+        # A CRASHED CHILD MUST NOT LOOK LIKE AN ANSWER. It writes nothing; ConvertFrom-Json of
+        # $null yields $null; $null.reason is $null; and the scoring below asked only "is it NOT
+        # dormant and NOT unresolved", so "produced no answer at all" scored as ARMED. Every
+        # armed-expecting row was therefore unfalsifiable by a broken tool -- demonstrated by
+        # making resolve_arming raise on every call and watching those rows still pass. Return a
+        # distinguishable marker instead, and let each caller assert on it.
+        if ([string]::IsNullOrWhiteSpace($txt)) {
+            return [pscustomobject]@{ reason = '__NO_OUTPUT__'; available = $false; exit = $proc.ExitCode }
+        }
         try { return ($txt | ConvertFrom-Json) } catch { return [pscustomobject]@{ reason = "UNPARSEABLE: $txt"; exit = $proc.ExitCode } }
     }
     $dormantChild = & $runChild $dormantCfg
     Assert ($dormantChild.reason -eq 'dormant') `
         "H1 dormant manifest => the spawned CLI reports 'dormant' (got '$($dormantChild.reason)')"
     $armedChild = & $runChild $armedCfg
-    Assert ($armedChild.reason -ne 'dormant') `
+    Assert (($armedChild.reason -ne 'dormant') -and ($armedChild.reason -ne '__NO_OUTPUT__')) `
         "H2 armed manifest => the SAME spawned CLI is armed (got '$($armedChild.reason)') -- resolved from the manifest by the child itself, not handed to it"
-    Assert ($null -ne $armedChild.available) `
+    # `$null -ne .available` was enough while a crashed child came back as $null. runChild now
+    # returns an explicit marker with available=$false, and `$null -ne $false` is TRUE -- so that
+    # assertion started PASSING on a child that never answered, stating a falsehood. Section H's
+    # whole job is that the decision crosses a real process boundary; require a real answer.
+    Assert (($armedChild.available -is [bool]) -and ($armedChild.reason -ne '__NO_OUTPUT__')) `
         'H2 the child emitted a parseable JSON result over the redirected (cp1252) pipe'
 
     Write-Host ''
@@ -360,10 +373,99 @@ Write-Output ("ARMED=" + $st.Armed + " PINNED=" + ($null -ne $env:BLARAI_REPO))
         Remove-Item Env:\BLARAI_RESEARCH_DOCS -ErrorAction SilentlyContinue
         $psArmed = (Get-ResearchArmingVerdict -Config (Get-FleetDriverConfig -Fresh)).Armed
         $child = & $runChild $cfgPath
-        $cliArmed = ($child.reason -ne 'dormant') -and ($child.reason -ne 'unresolved')
+        Assert ($child.reason -ne '__NO_OUTPUT__') `
+            ("J the tool ANSWERED for {0} (a crash must never be scored as armed)" -f $case.Label)
+        $cliArmed = ($child.reason -ne 'dormant') -and ($child.reason -ne 'unresolved') -and ($child.reason -ne '__NO_OUTPUT__')
         Assert (($psArmed -eq $case.Armed) -and ($cliArmed -eq $case.Armed)) `
             ("J research_docs = {0}: launcher={1} tool={2} (expected {3})" -f $case.Label, $psArmed, $cliArmed, $case.Armed)
     }
+    # A UTF-8 BOM is the encoding accident this section could not previously see. Write-Manifest
+    # uses Set-Content -Encoding UTF8, which under pwsh 7 emits NO BOM -- so every case above is
+    # BOM-less and the truth table could never have caught the divergence. Measured 2026-09-01:
+    # ConvertFrom-Json accepts a BOM silently while the tool's read_text(encoding="utf-8") raised
+    # on it, so the launcher banked armed=true while every lookup the coder made was refused.
+    # The fixture is asserted to actually CARRY a BOM first -- a fixture that quietly lost the
+    # property it exists to test is precisely the failure this case is repairing.
+    $bomPath = Join-Path $sandbox 'agree-bom.json'
+    Write-Manifest -Path $bomPath -Research $true -BlarRoot $sandboxJsonPath
+    $bomBytes = [IO.File]::ReadAllBytes($bomPath)
+    if (-not ($bomBytes.Length -ge 3 -and $bomBytes[0] -eq 0xEF -and $bomBytes[1] -eq 0xBB -and $bomBytes[2] -eq 0xBF)) {
+        [IO.File]::WriteAllBytes($bomPath, ([byte[]](0xEF, 0xBB, 0xBF)) + $bomBytes)
+    }
+    $bomCheck = [IO.File]::ReadAllBytes($bomPath)
+    Assert (($bomCheck.Length -ge 3) -and ($bomCheck[0] -eq 0xEF) -and ($bomCheck[1] -eq 0xBB) -and ($bomCheck[2] -eq 0xBF)) `
+        'J the BOM fixture actually carries a BOM (else this case proves nothing)'
+    $env:BLARAI_FLEET_DRIVER_CONFIG = $bomPath
+    Remove-Item Env:\BLARAI_RESEARCH_DOCS -ErrorAction SilentlyContinue
+    $psBom  = (Get-ResearchArmingVerdict -Config (Get-FleetDriverConfig -Fresh)).Armed
+    $bomKid = & $runChild $bomPath
+    Assert ($bomKid.reason -ne '__NO_OUTPUT__') `
+        'J the tool ANSWERED for the BOM case (a crash must never be scored as armed)'
+    $cliBom = ($bomKid.reason -ne 'dormant') -and ($bomKid.reason -ne 'unresolved') -and ($bomKid.reason -ne '__NO_OUTPUT__')
+    Assert (($psBom -eq $true) -and ($cliBom -eq $true)) `
+        ("J a BOM must not split the readers: launcher={0} tool={1} (reason '{2}'), both expected armed" -f $psBom, $cliBom, $bomKid.reason)
+
+    # UTF-16 is the same divergence one encoding over, and it split the readers WORSE than a BOM:
+    # Get-Content -Raw auto-detects a UTF-16 BOM and parses the file, so the launcher reported
+    # ARMED and banked armed=true, while the tool raised an UNCAUGHT UnicodeDecodeError -- exit 1,
+    # zero stdout, and the opencode shim rendering '[research: tool_error]'. Ledger armed, every
+    # lookup refused. Both sides now REFUSE it, and refuse it audibly.
+    $u16Path = Join-Path $sandbox 'agree-utf16.json'
+    [IO.File]::WriteAllBytes($u16Path, ([byte[]](0xFF,0xFE)) + [Text.Encoding]::Unicode.GetBytes('{ "driver": "acp", "research_docs": true }'))
+    $u16Bytes = [IO.File]::ReadAllBytes($u16Path)
+    Assert (($u16Bytes[0] -eq 0xFF) -and ($u16Bytes[1] -eq 0xFE)) `
+        'J the UTF-16 fixture actually carries a UTF-16 BOM (else this case proves nothing)'
+    $env:BLARAI_FLEET_DRIVER_CONFIG = $u16Path
+    Remove-Item Env:\BLARAI_RESEARCH_DOCS -ErrorAction SilentlyContinue
+    $psU16  = (Get-ResearchArmingVerdict -Config (Get-FleetDriverConfig -Fresh)).Armed
+    $u16Kid = & $runChild $u16Path
+    Assert ($u16Kid.reason -ne '__NO_OUTPUT__') `
+        'J the tool ANSWERED for the UTF-16 case rather than crashing (it used to die with a traceback)'
+    Assert (($psU16 -eq $false) -and ($u16Kid.reason -eq 'unresolved')) `
+        ("J UTF-16 is refused by BOTH readers: launcher={0} tool='{1}' (both must deny)" -f $psU16, $u16Kid.reason)
+
+    # ONE FIXTURE IS NOT A LOCK. The clause above was UTF-16LE only, and review deleted the
+    # big-endian half of the production check while this suite stayed 65/0 green -- the
+    # divergence genuinely returned and nothing here noticed. Each encoding the predicate claims
+    # to refuse gets driven, including the UTF-32BE case that a two-byte BOM comparison missed
+    # entirely because its mark begins with two NULs.
+    # Each fixture is a REAL encoding of the same JSON, not a BOM glued to ASCII. The glued
+    # version was refused for being invalid JSON rather than by the predicate under test, so it
+    # passed for the wrong reason and left the second clause unexercised -- the same 'green but
+    # proves nothing' shape this suite keeps having to remove.
+    $json = '{ "driver": "acp", "research_docs": true }'
+    $encCases = @(
+        @{ Label = 'UTF-16LE (BOM)';    Bytes = [byte[]](0xFF,0xFE) + [Text.Encoding]::Unicode.GetBytes($json) },
+        @{ Label = 'UTF-16BE (BOM)';    Bytes = [byte[]](0xFE,0xFF) + [Text.Encoding]::BigEndianUnicode.GetBytes($json) },
+        @{ Label = 'UTF-32BE (BOM)';    Bytes = [byte[]](0x00,0x00,0xFE,0xFF) + [Text.Encoding]::ASCII.GetBytes($json) },
+        @{ Label = 'UTF-32LE (BOM)';    Bytes = [byte[]](0xFF,0xFE,0x00,0x00) + [Text.Encoding]::ASCII.GetBytes($json) },
+        @{ Label = 'UTF-16LE (no BOM)'; Bytes = [Text.Encoding]::Unicode.GetBytes($json) }
+    )
+    foreach ($ec in $encCases) {
+        $ep = Join-Path $sandbox ("enc-" + ($ec.Label -replace '[^A-Za-z0-9]','') + '.json')
+        [IO.File]::WriteAllBytes($ep, $ec.Bytes + [Text.Encoding]::ASCII.GetBytes('{ "driver": "acp", "research_docs": true }'))
+        $env:BLARAI_FLEET_DRIVER_CONFIG = $ep
+        Remove-Item Env:\BLARAI_RESEARCH_DOCS -ErrorAction SilentlyContinue
+        $epsArmed = (Get-ResearchArmingVerdict -Config (Get-FleetDriverConfig -Fresh)).Armed
+        Assert ($epsArmed -eq $false) `
+            ("J the launcher REFUSES a {0} manifest (an encoding the two readers cannot agree on)" -f $ec.Label)
+    }
+
+    # WHY THE SECOND CLAUSE EARNS ITS PLACE, since removing it leaves every case above green.
+    # A BOM-less UTF-16 manifest is already rejected without it -- Get-Content reads the bytes as
+    # UTF-8, ConvertFrom-Json throws, and the catch fails safe to the dormant defaults. So the
+    # clause changes no VERDICT. What it changes is whether the operator is TOLD: with it, the
+    # refusal names the encoding and the offending bytes; without it, an unreadable manifest is
+    # indistinguishable from an absent one and the box quietly runs dormant. Fail-loud is the
+    # property, so the property under test is the MESSAGE, not the verdict.
+    $noBomPath = Join-Path $sandbox 'enc-utf16le-nobom-msg.json'
+    [IO.File]::WriteAllBytes($noBomPath, [Text.Encoding]::Unicode.GetBytes($json))
+    $env:BLARAI_FLEET_DRIVER_CONFIG = $noBomPath
+    $script:_FleetDriverCfg = $null
+    $noBomOut = (Get-FleetDriverConfig -Fresh 6>&1 | Out-String)
+    Assert ($noBomOut -match 'is not UTF-8') `
+        'J a non-UTF-8 manifest is refused AUDIBLY, not silently defaulted (fail-loud, the only thing the second clause buys)'
+
     # And the state neither side may collapse: an unreadable manifest is UNRESOLVED to the
     # tool, and merely not-armed to the launcher -- but never a confident "switched off".
     $gonePath = Join-Path $sandbox 'never-written.json'
