@@ -15,7 +15,18 @@ if (Test-Path "$OvmsDir\ovms.exe" -PathType Leaf) {
     $rel = Invoke-RestMethod 'https://api.github.com/repos/openvinotoolkit/model_server/releases/latest'
     Write-Host "Latest release: $($rel.tag_name)"
     # Prefer the python-off windows zip (smaller, no python needed for LLM serving)
-    $asset = $rel.assets | Where-Object name -like 'ovms_windows*python_off*' | Select-Object -First 1
+    # #1497: PREFER THE PYTHON-ON BUILD. The python_off package was chosen for size ("smaller,
+    # no python needed for LLM serving") before the tool-calling requirements were understood, and
+    # it is the wrong package for this deployment: python_off forces the MINJA chat-template engine
+    # (llm_calculator.proto: MINJA is "the only option for builds without Python"), OVMS 2026.3's
+    # release notes name Qwen3-Coder as one of three templates MINJA CANNOT RENDER, and the docs
+    # state plainly that "using tools is not supported in configuration without Python."
+    # The cost is ~22 MB of download and a python\ folder that start-llm.ps1 must put on PATH.
+    $asset = $rel.assets | Where-Object name -like 'ovms_windows*python_on*' | Select-Object -First 1
+    if (-not $asset) {
+        Write-Host "WARNING: no python_on asset in release $($rel.tag_name); falling back to python_off. Tool calling is UNSUPPORTED on that build and multi-turn tool-call history will be corrupted (#1497)." -ForegroundColor Yellow
+        $asset = $rel.assets | Where-Object name -like 'ovms_windows*python_off*' | Select-Object -First 1
+    }
     if (-not $asset) { $asset = $rel.assets | Where-Object name -like 'ovms_windows*' | Select-Object -First 1 }
     if (-not $asset) { throw "No ovms_windows asset found in release $($rel.tag_name) — check https://github.com/openvinotoolkit/model_server/releases" }
     $zip = Join-Path $env:TEMP $asset.name

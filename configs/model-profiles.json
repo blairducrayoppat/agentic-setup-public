@@ -15,7 +15,10 @@
     "max_output_tokens": 8192,
     "resident_gb": 10,
     "reasoning_strip": {
-      "hidden_block_tags": ["think", "tool_call"]
+      "hidden_block_tags": [
+        "think",
+        "tool_call"
+      ]
     },
     "sampling": {
       "deterministic_mode": "low_temp_fixed_seed",
@@ -24,8 +27,14 @@
       "top_p": 0.95,
       "top_k": 20
     },
-    "best_of_n": { "width": 2, "diversity_axis": "sampling_only" },
-    "retry": { "n": 3, "canonicalize_before_vote": false }
+    "best_of_n": {
+      "width": 2,
+      "diversity_axis": "sampling_only"
+    },
+    "retry": {
+      "n": 3,
+      "canonicalize_before_vote": false
+    }
   },
   "models": {
     "coder-30b": {
@@ -45,11 +54,11 @@
       "grammar_support": "tool_guided",
       "context_window": 262144,
       "effective_context": 65536,
-      "max_output_tokens": 16384,
+      "max_output_tokens": 8192,
       "cost_profile": {
         "decode": "cheap",
         "prefill": "expensive",
-        "decode_tok_s": 38,
+        "decode_tok_s": 12,
         "prefill_pp_tok_s": 480
       },
       "resident_gb": 18,
@@ -61,11 +70,20 @@
         "top_k": 20,
         "repetition_penalty": 1.05
       },
-      "best_of_n": { "width": 8, "diversity_axis": "sampling_only_via_ovms", "measured_curve": null },
-      "retry": { "n": 5, "canonicalize_before_vote": true },
+      "best_of_n": {
+        "width": 8,
+        "diversity_axis": "sampling_only_via_ovms",
+        "measured_curve": null
+      },
+      "retry": {
+        "n": 5,
+        "canonicalize_before_vote": true
+      },
       "quant_scheme_note": "MoE -- if ever re-quantized, protect router + shared-experts + down-proj at >=int8 and add a post-quant routing sanity check; a standing quant-quality gate is required. INT4 uniform is NOT safe for an MoE (dossier sec 3).",
       "moe_prefill_workaround": "start-llm.ps1 sets env MOE_USE_MICRO_GEMM_PREFILL=0 for this model (OpenVINO 2026.2 INT4-on-GPU long-prompt accuracy workaround).",
-      "roles": ["coder"]
+      "roles": [
+        "coder"
+      ]
     },
     "qwen3-14b": {
       "name": "Qwen3-14B INT4 (everyday/fleet tier -- the AO brain, planner, grader, oracle-author, critic)",
@@ -92,7 +110,10 @@
       },
       "resident_gb": 10,
       "reasoning_strip": {
-        "hidden_block_tags": ["think", "tool_call"],
+        "hidden_block_tags": [
+          "think",
+          "tool_call"
+        ],
         "note": "Family-conditioned hidden-block strip for the hybrid-thinking Qwen3 dense model. Consumed by the AO: entrypoint._strip_hidden_blocks and gpu_inference._visible_text build the DOTALL alternation <think>...</think>|<tool_call>...</tool_call> from these tags. This is the ONLY field any consumer reads as of #834; a non-Qwen swap that does not <think> would clear this list."
       },
       "sampling": {
@@ -103,9 +124,21 @@
         "top_k": 20,
         "sampling_note": "CARD-RECOMMENDED reference values (HF Qwen3-14B card, non-greedy). NOT what the in-proc planner/oracle_author/decompose call-sites run today -- those are GREEDY (see call_sites.*.sampling_today). The greedy->low-temp adoption is #835-A1."
       },
-      "best_of_n": { "width": 3, "diversity_axis": "sampling" },
-      "retry": { "n": 3, "canonicalize_before_vote": false },
-      "roles": ["planner", "decompose", "oracle_author", "critic", "assistant"]
+      "best_of_n": {
+        "width": 3,
+        "diversity_axis": "sampling"
+      },
+      "retry": {
+        "n": 3,
+        "canonicalize_before_vote": false
+      },
+      "roles": [
+        "planner",
+        "decompose",
+        "oracle_author",
+        "critic",
+        "assistant"
+      ]
     },
     "qwen3-vl-8b": {
       "name": "Qwen3-VL-8B INT4 (vision/screenshots -- the AO eyes)",
@@ -118,12 +151,17 @@
       "tool_call_format": "none",
       "thinking_mode": "none",
       "grammar_support": "none",
-      "modalities": ["text", "image"],
+      "modalities": [
+        "text",
+        "image"
+      ],
       "context_window": 16384,
       "effective_context": 16384,
       "max_output_tokens": 4096,
       "resident_gb": 6,
-      "roles": ["vision"]
+      "roles": [
+        "vision"
+      ]
     }
   },
   "call_sites": {

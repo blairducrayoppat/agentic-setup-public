@@ -1,4 +1,4 @@
-# fleet-lib.ps1 - shared helpers for the agent fleet (verify gate, secret-scan,
+﻿# fleet-lib.ps1 - shared helpers for the agent fleet (verify gate, secret-scan,
 # circuit breakers, session supervisor). Dot-source it:
 #     . "$PSScriptRoot\fleet-lib.ps1"
 # Pure function definitions only - NO side effects on load (safe to dot-source).
@@ -319,6 +319,8 @@ function Invoke-AgentRun {
     #              ceiling rather than being guillotined at a short fixed deadline
     #              ("killing it too soon"). Both map to TimedOut (never resampled; see
     #              Test-ShouldResample). The decision is the PURE Resolve-RunStopDecision.
+
+
     # Returns: @{ TimedOut=[bool]; TimeoutReason=[string]; Capped=[bool]; CappedReason;
     #            ExitCode=[int]|$null; LogPath; Seconds; Error }
     param(
@@ -510,7 +512,9 @@ function Invoke-AgentRun {
     # A step-cap means the agent DID the work then looped; treat it as completed (exit 0), not a
     # failure, so the gate runs + the auto-merge can fire (#670 run-3).
     $exit = if ($timedOut) { $null } elseif ($capped) { 0 } else { $p.ExitCode }
-    return @{ TimedOut = $timedOut; TimeoutReason = $timeoutReason; Capped = $capped; CappedReason = $cappedReason; ExitCode = $exit; LogPath = $LogPath; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Error = '' }
+    # #1494: the message must print the bound that ACTUALLY fired, so the enforced value rides
+    # back with the result instead of being re-derived from a sibling default at print time.
+    return @{ TimedOut = $timedOut; TimeoutReason = $timeoutReason; Capped = $capped; CappedReason = $cappedReason; ExitCode = $exit; LogPath = $LogPath; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Error = ''; IdleBoundSec = $IdleTimeoutSec; IdleSignal = 'no new step/edit' }
 }
 
 function Get-FleetDriverConfig {
@@ -532,6 +536,31 @@ function Get-FleetDriverConfig {
         # live path is always <agentic-setup>\configs\fleet-driver.json.
         $path = if ($env:BLARAI_FLEET_DRIVER_CONFIG) { $env:BLARAI_FLEET_DRIVER_CONFIG } else { Join-Path (Split-Path $ScriptRoot -Parent) 'configs\fleet-driver.json' }
         if (-not (Test-Path $path)) { $script:_FleetDriverCfg = $default; return $default }
+        # #1206: THE MANIFEST MUST BE UTF-8. Get-Content -Raw auto-detects a UTF-16 BOM and parses
+        # the file happily, so this side reported ARMED and banked armed=true on bytes the tool's
+        # own reader cannot decode at all -- the two implementations of one predicate disagreeing,
+        # which is the whole defect class #1206 exists to close. A BOM-less UTF-8 file and a
+        # UTF-8-BOM file are both fine and both sides now agree on them; UTF-16 is refused HERE so
+        # that the launcher cannot arm a capability the tool will refuse on every call. Deny-by-
+        # default: an encoding this pair does not agree on is a manifest we do not act on.
+        $sig = [byte[]]::new(2)
+        try {
+            $fs = [IO.File]::OpenRead($path)
+            try { $null = $fs.Read($sig, 0, 2) } finally { $fs.Dispose() }
+        } catch { $sig = [byte[]]::new(2) }
+        # ACCEPT-LIST, not a BOM blacklist. Enumerating BOMs is whack-a-mole and I had already
+        # missed one: UTF-32BE begins 00 00 FE FF, so its first two bytes slipped past a check
+        # for the UTF-16 marks and the launcher armed on it. A valid UTF-8 JSON manifest starts
+        # with `{`, ASCII whitespace, or the UTF-8 BOM, and its SECOND byte is never NUL. That one
+        # predicate refuses UTF-16LE/BE, UTF-32LE/BE and BOM-less UTF-16 together, cannot reject a
+        # legitimate UTF-8 manifest (0x00 and 0xFF are not valid UTF-8 leading bytes), and needs no
+        # new clause the next time someone invents an encoding. Deny-by-default, like the rest of
+        # this gate.
+        $okFirst = @(0x7B, 0x20, 0x09, 0x0D, 0x0A, 0xEF)   # {  space  tab  CR  LF  UTF-8 BOM
+        if (($sig[0] -notin $okFirst) -or ($sig[1] -eq 0x00)) {
+            Write-Host ("  fleet-driver manifest at {0} is not UTF-8 (first bytes {1:X2} {2:X2}); it must be UTF-8. Treating as unreadable (deny-by-default, #1206)." -f $path, $sig[0], $sig[1]) -ForegroundColor Yellow
+            $script:_FleetDriverCfg = $default; return $default
+        }
         $raw = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         $driver = if ($raw.driver -in @('stdin','acp')) { $raw.driver } else { 'stdin' }
         $cont   = if ($raw.containment -in @('off','restricted_account')) { $raw.containment } else { 'off' }
@@ -838,6 +867,12 @@ function Invoke-CoderDriver {
                 -Acp $cfg.acp -TimeoutSec $TimeoutSec -IdleTimeoutSec $acpIdle `
                 -MaxSteps ([int]$cfg.acp.max_steps) -SpinSteps ([int]$cfg.acp.spin_steps)
             if ($acp.Ok) {
+                # #1494: stamp the bound THIS path enforces. Before this, the breaker message was
+                # formatted from $IdleTimeoutSec (the stdin default, 240) on every ACP run, while
+                # acp.idle_sec (600) was what actually fired -- the two are documented as different
+                # numbers by design just above, and the message was reading the wrong one.
+                $acp.Result.IdleBoundSec = $acpIdle
+                $acp.Result.IdleSignal   = 'no session/update'
                 Write-Host "  [driver=acp] $($acp.Reason)" -ForegroundColor DarkCyan
                 return $acp.Result
             }
@@ -3631,6 +3666,283 @@ function Invoke-ScratchTestSignal {
     return @{ Result = $result; Green = @($green); Red = @($red); Detail = $detail }
 }
 
+function Get-CoderBaseUrl {
+    # #1495 THE PROBE MUST AIM WHERE THE CODER AIMS. A liveness check against a hardcoded URL
+    # certifies whatever is listening there, which need not be what opencode talks to -- one
+    # predicate with two readers that can silently disagree, the class #1206 closed for the
+    # fleet-driver manifest. So the endpoint is DERIVED from configs/opencode.json, keyed by the
+    # provider prefix of $Model ('local/coder-30b' -> the 'local' provider).
+    #
+    # PARSE COMPATIBLY OR NOT AT ALL. opencode.json's permission block deliberately carries
+    # case-variant keys ('**/secrets/**' and '**/SECRETS/**'). PowerShell 7's ConvertFrom-Json
+    # REFUSES the whole document over that unless -AsHashtable; 5.1 tolerates it. The first
+    # version of this function used a bare ConvertFrom-Json inside a try, so under pwsh 7 -- which
+    # is what the fleet's Start-Job children run -- every call threw and fell into the fallback.
+    # It was the second hardcoded copy it claimed to retire, and its two tests could not see that
+    # because the derived value and the fallback are the same string on this box. The repo already
+    # owned this lesson in verify-model-profiles.ps1; this is that helper's rule applied here.
+    #
+    # Returns the base INCLUDING the version segment, exactly as configured, so that no caller
+    # re-appends a version of its own -- a config saying /v1 must not be probed at /v3.
+    param([string]$Model = 'local/coder-30b', [string]$ScriptRoot = $PSScriptRoot,
+          [scriptblock]$Log = { param($m) Write-Host $m -ForegroundColor Yellow })
+    $fallback = 'http://127.0.0.1:8099/v3'
+    $why = ''
+    try {
+        $p = Join-Path (Split-Path $ScriptRoot -Parent) 'configs\opencode.json'
+        if (-not (Test-Path $p)) { $why = "no config at $p"; throw 'missing' }
+        $raw = Get-Content $p -Raw -ErrorAction Stop
+        $j = if ($PSVersionTable.PSVersion.Major -ge 6) { $raw | ConvertFrom-Json -AsHashtable -ErrorAction Stop }
+             else                                      { $raw | ConvertFrom-Json -ErrorAction Stop }
+        $prefix = if ($Model -like '*/*') { ($Model -split '/')[0] } else { 'local' }
+        # -AsHashtable yields IDictionary; 5.1 yields PSCustomObject. Read both shapes.
+        $get = {
+            param($obj, $key)
+            if ($null -eq $obj) { return $null }
+            if ($obj -is [System.Collections.IDictionary]) { return $obj[$key] }
+            return $obj.$key
+        }
+        $prov = & $get (& $get $j 'provider') $prefix
+        $url  = & $get (& $get $prov 'options') 'baseURL'
+        if (-not $url) { $why = "provider '$prefix' has no options.baseURL"; throw 'nokey' }
+        # VALIDATE WHAT WE DERIVED. A truthy-but-malformed value -- review's case was the JSON
+        # number 8099 -- passes the emptiness check and was returned verbatim and silently, so a
+        # config fault surfaced later as "An invalid request URI was provided" from the probe
+        # instead of as a named configuration problem here. Deriving a value is not the same as
+        # deriving a usable one.
+        $urlStr = ([string]$url).TrimEnd('/')
+        if ($urlStr -notmatch '^https?://[^/\s]+') {
+            $why = "provider '$prefix' baseURL is not an http(s) URL: '$urlStr'"; throw 'badurl'
+        }
+        return $urlStr
+    } catch {
+        if (-not $why) { $why = $_.Exception.Message }
+        # FAIL LOUD. A silent fallback in a control path is how the first version hid for a day.
+        & $Log ("  could not derive the coder endpoint from opencode.json ({0}); using {1}." -f $why, $fallback)
+        return $fallback
+    }
+}
+
+function Get-ModelServerProgress {
+    # #1495 THE DISCRIMINATOR. From the client side a WEDGED server and a merely BUSY one are
+    # identical: both leave a completion hanging, both answer GET /v3/models instantly. That is
+    # not a theoretical confusion -- on 2026-09-02 a live coder generation held the servable from
+    # 12:31 to 12:40 while a B9 battery run was dispatching, and every probe sent during it timed
+    # out. Restarting on a client-side timeout alone therefore destroys live candidate work; it
+    # was done by hand several times that afternoon before the cause was understood.
+    #
+    # So the decision is taken from the SERVER's own account of itself. OVMS logs a line per
+    # executor tick, `All requests: N; Scheduled requests: M; ... cache usage: X%`, and the two
+    # states differ there even though they look the same over HTTP:
+    #
+    #   BUSY    the counters and/or the cache figure MOVE (measured climbing 10.3 -> 23.7%)
+    #   WEDGED  a request is scheduled and the identical figures repeat tick after tick
+    #           (measured flat at 25.2% across every sample), or no tick is emitted at all
+    #
+    # Returns @{ Found; Signature; Requests; Scheduled; Cache; Log; AgeSec }. Signature
+    # excludes the timestamp because a stuck server keeps emitting ticks and a whole-line comparison
+    # would read its heartbeat as progress. AgeSec carries the timestamp SEPARATELY, because a
+    # caller asking 'is work in flight?' needs exactly what the signature must ignore.
+    # Never throws; an unreadable log yields Found=$false, which the caller treats as NO evidence
+    # of progress rather than as evidence of a wedge.
+    param(
+        [string]$LogDir = '',
+        [string]$ScriptRoot = $PSScriptRoot
+    )
+    $out = @{ Found = $false; Signature = ''; Requests = -1; Scheduled = -1; Cache = -1.0; Log = ''; AgeSec = -1.0 }
+    try {
+        $dir = if ($LogDir) { $LogDir } else { Join-Path (Split-Path $ScriptRoot -Parent) 'state\logs' }
+        if (-not (Test-Path $dir)) { return $out }
+        $log = Get-ChildItem (Join-Path $dir 'ovms-*.log') -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $log) { return $out }
+        $out.Log = $log.FullName
+        # Read the tail only; these logs reach tens of thousands of lines on a long night.
+        $tail = Get-Content $log.FullName -Tail 40 -ErrorAction Stop
+        $line = $tail | Where-Object { $_ -match 'All requests:\s*(\d+);\s*Scheduled requests:\s*(\d+)' } | Select-Object -Last 1
+        if (-not $line) { return $out }
+        if ($line -match 'All requests:\s*(\d+);\s*Scheduled requests:\s*(\d+)') {
+            $out.Requests  = [int]$Matches[1]
+            $out.Scheduled = [int]$Matches[2]
+        }
+        # The real idle tick ('All requests: 0; Scheduled requests: 0;') carries NO cache
+        # field. Rendering that absence as -1 put a sentinel into the signature where a
+        # measurement belongs; 'none' says which it is.
+        $cacheTxt = 'none'
+        if ($line -match 'cache usage:\s*([0-9.]+)%') { $out.Cache = [double]$Matches[1]; $cacheTxt = $Matches[1] }
+        # The log NAME is part of the signature: a restart opens a new file, and that is a change
+        # of state we must not mistake for the same server standing still.
+        # HOW OLD IS THIS READING? Without it, 'All requests: 1' is indistinguishable from
+        # 'All requests: 1, written once, forty minutes ago and never again' -- which is exactly
+        # what a stuck server leaves behind: the 12:30-12:40 incident's last line was
+        # 'All requests: 1; Scheduled requests: 1' at 12:40:35 and it would have said that
+        # forever. A caller asking whether work is IN FLIGHT needs the age; only the
+        # signature-comparison design could ignore the timestamp, and that design is gone.
+        if ($line -match '^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)') {
+            try {
+                $when = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+                $out.AgeSec = [math]::Round(((Get-Date) - $when).TotalSeconds, 1)
+            } catch { }
+        }
+        $out.Signature = '{0}|{1}|{2}|{3}' -f $log.Name, $out.Requests, $out.Scheduled, $cacheTxt
+        $out.Found = $true
+    } catch { }
+    return $out
+}
+
+function Test-ModelServerLive {
+    # #1495 LIVENESS, IN THE SHAPE THE CODER ACTUALLY USES. Two probes already existed and
+    # neither could see the fault: start-llm's READY poll (start-llm.ps1:399) and watchdog.ps1 (line 17)
+    # both GET /v3/models. That asks whether the server can LIST its models, not whether it can
+    # GENERATE one, and a server that has stopped serving completions keeps answering the list
+    # instantly -- measured on the live server, 0.0016s for the GET while a 4-token completion
+    # got nothing in 70s. So watchdog.ps1 is not merely INERT (nothing schedules it); arming it
+    # would have detected none of this. This probe POSTs a minimal completion through the SAME
+    # base URL the coder is configured against.
+    #
+    # WHY NOT Invoke-WebRequest. It reads with HttpCompletionOption.ResponseHeadersRead, so
+    # -TimeoutSec bounds the exchange only up to the RESPONSE HEADERS; the body read afterwards
+    # is unbounded. Review demonstrated two shapes -- a truncated Content-Length and a one-byte-
+    # per-500ms trickle -- running past 180s against a 12s timeout, with no outer wall-clock kill
+    # anywhere downstream (new-agent-task.ps1's Wait-Job carries no -Timeout), so a hung pre-flight
+    # would hang the whole dispatch. HttpClient's default ResponseContentRead makes Timeout cover
+    # the WHOLE operation, body included. "Never throws" was true of the old version and
+    # misleading in the same breath: never returning is the worse failure.
+    #
+    # Returns @{ Live=[bool]; Reason=[string]; ElapsedSec=[double] } and never throws.
+    param(
+        [string]$BaseUrl    = 'http://127.0.0.1:8099/v3',
+        [string]$Model      = 'coder-30b',
+        [int]   $TimeoutSec = 60
+    )
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $body = @{
+        model      = $Model
+        messages   = @(@{ role = 'user'; content = 'ping' })
+        max_tokens = 8
+        stream     = $false
+    } | ConvertTo-Json -Depth 5 -Compress
+
+    $client = $null
+    try {
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+        $sc = [System.Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, 'application/json')
+        # PostAsync completes only once the body has been read (ResponseContentRead), and
+        # HttpClient.Timeout cancels the whole thing -- headers AND body.
+        $resp = $client.PostAsync("$BaseUrl/chat/completions", $sc).GetAwaiter().GetResult()
+        $raw  = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $sw.Stop()
+        if (-not $resp.IsSuccessStatusCode) {
+            return @{ Live = $false
+                      Reason = ("HTTP {0}" -f [int]$resp.StatusCode)
+                      ElapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2) }
+        }
+        $content = $null
+        try { $content = ($raw | ConvertFrom-Json).choices[0].message.content } catch { }
+        # A 200 carrying no completion is NOT health: an error object can arrive under a 200, and
+        # the models endpoint answers happily in exactly the state this exists to catch.
+        # An EMPTY string is not a completion either: '' is not $null, so a
+        # {"choices":[{"message":{"content":""}}]} answered Live=True/'generated' while the
+        # docstring and the test name both said a 200 carrying no completion is not live.
+        if ($null -eq $content -or ([string]$content).Trim() -eq '') {
+            return @{ Live = $false
+                      Reason = ("answered HTTP {0} but no completion content" -f [int]$resp.StatusCode)
+                      ElapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2) }
+        }
+        return @{ Live = $true; Reason = 'generated'; ElapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2) }
+    } catch {
+        $sw.Stop()
+        # A cancelled task IS the timeout; name it plainly rather than leaking the .NET wording.
+        # PowerShell wraps a failing .GetResult() in a MethodInvocationException, so the useful
+        # text is in the message, not the exception TYPE. Match the text and say what happened
+        # in the caller's terms; a reason nobody can read is a fail-loud that fails quietly.
+        $msg = $_.Exception.Message
+        if ($_.Exception.InnerException) { $msg = $_.Exception.InnerException.Message }
+        if ($msg -match 'HttpClient\.Timeout|task was canceled|A task was canceled') {
+            $msg = "no answer within ${TimeoutSec}s (timeout covers the body, not just the headers)"
+        } elseif ($msg -match 'Error while copying content|end of stream|unexpected end') {
+            $msg = 'the server sent headers then stopped mid-body (truncated response)'
+        }
+        return @{ Live = $false; Reason = $msg; ElapsedSec = [math]::Round($sw.Elapsed.TotalSeconds, 2) }
+    } finally {
+        if ($client) { try { $client.Dispose() } catch { } }
+    }
+}
+
+function Test-ModelServerHealth {
+    # #1495 REPORT, DO NOT ACT. This deliberately has no power to restart anything.
+    #
+    # WHY NOTHING IS RESTARTED. From the client side a server that cannot serve and one that is
+    # merely BUSY are identical -- both leave the completion hanging, both answer GET /v3/models
+    # instantly. An earlier version tried to separate them by sampling OVMS's executor counters
+    # across a 90s window; review defeated it, and measuring the banked logs showed there is no
+    # threshold to retreat to (gaps before a CHANGED tick reach 289s, while the longest identical-
+    # value stretch in a healthy log is 15s -- longer than the 8s seen during the suspected fault).
+    #
+    # And the fault turned out not to need a restart at all. tools/qwen-proxy.py waits
+    # UPSTREAM_TIMEOUT=1800s while the ACP idle breaker kills a candidate at 600s, so a killed
+    # candidate's generation keeps running for a client that no longer exists, holding the
+    # scheduler slot and starving everything behind it (#1519). Restarting the server would have
+    # been treating our own orphaned request as the server's illness.
+    #
+    # COST. This runs before EVERY candidate, so its worst case is a throughput tax and is kept
+    # small deliberately: healthy costs one fast completion (~0.01s); a busy server costs one
+    # timeout; only a server that is neither costs two. There is no sleep and no lock. An earlier
+    # shape charged 60+90+60 = 210s per candidate, and up to ~1170s, on the path that ships
+    # enabled -- paid most often exactly when the fleet was busiest.
+    #
+    # Returns @{ Live; Reason; Confirmed; Busy; Progress }.
+    param(
+        [string]$BaseUrl    = 'http://127.0.0.1:8099/v3',
+        [string]$Model      = 'coder-30b',
+        [string]$ScriptRoot = $PSScriptRoot,
+        [int]   $TimeoutSec = 20,
+        # Measured: the longest gap before a CHANGED executor tick across 10 banked logs was
+        # 289s. A reading older than this is not evidence of work in flight.
+        [int]   $StaleAfterSec = 300,
+        [string]$LogDir     = '',
+        [scriptblock]$Log = { param($m) Write-Host $m -ForegroundColor Yellow }
+    )
+    $first = Test-ModelServerLive -BaseUrl $BaseUrl -Model $Model -TimeoutSec $TimeoutSec
+    if ($first.Live) {
+        return @{ Live = $true; Reason = 'healthy'; Confirmed = $false; Busy = $false; Progress = $null }
+    }
+
+    # Is the executor holding work? Then we are queued behind it, which during a battery run is
+    # the ORDINARY state and must not read as a fault -- a warning printed on every candidate is
+    # how a real signal gets buried, which is exactly what happened to 38 upstream timeouts in a
+    # day. Reported quietly, and without a second probe, so a busy server costs one timeout.
+    $p = Get-ModelServerProgress -LogDir $LogDir -ScriptRoot $ScriptRoot
+    # THE READING MUST BE RECENT. 'All requests: 1' from forty minutes ago is not work in
+    # flight, it is the epitaph of a request that stopped -- and a stuck request IS one
+    # request in flight, so without this the check reports the reassuring BUSY verdict on
+    # precisely the incident it exists to catch, telling the operator not to worry.
+    # StaleAfterSec is measured, not chosen: across 10 banked logs the longest gap before a
+    # tick that CHANGED anything was 289s, so a reading older than 300s is off-distribution
+    # for a server that is genuinely working.
+    $fresh = ($p.AgeSec -ge 0 -and $p.AgeSec -le $StaleAfterSec)
+    if ($p.Found -and $p.Requests -ge 1 -and $fresh) {
+        $why = "the model server is working on {0} request(s) already ({1} scheduled, reported {2}s ago); this candidate is queued behind them" -f $p.Requests, $p.Scheduled, $p.AgeSec
+        & $Log "  $why."
+        return @{ Live = $false; Reason = $why; Confirmed = $false; Busy = $true; Progress = $p }
+    }
+
+    # Nothing in flight and still no answer: check once more before saying so out loud.
+    $second = Test-ModelServerLive -BaseUrl $BaseUrl -Model $Model -TimeoutSec $TimeoutSec
+    if ($second.Live) {
+        return @{ Live = $true; Reason = 'answered on the second check'; Confirmed = $false; Busy = $false; Progress = $p }
+    }
+    $p2 = Get-ModelServerProgress -LogDir $LogDir -ScriptRoot $ScriptRoot
+    $ctx = if (-not $p2.Found) { 'the executor log could not be read' }
+           elseif ($p2.AgeSec -lt 0 -or $p2.AgeSec -gt $StaleAfterSec) { "the executor last said anything {0}s ago ({1} request(s), {2} scheduled) - that reading is STALE, so nothing is demonstrably in flight" -f $p2.AgeSec, $p2.Requests, $p2.Scheduled }
+           else { "the executor reports {0} request(s), {1} scheduled, {2}s ago" -f $p2.Requests, $p2.Scheduled, $p2.AgeSec }
+    $reason = "two completion checks went unanswered and $ctx; the server is not serving this candidate"
+    & $Log ("  {0}." -f $reason)
+    return @{ Live = $false; Reason = $reason; Confirmed = $true; Busy = $false; Progress = $p2 }
+}
+
 function Invoke-CandidateBuild {
     # BEST-OF-N candidate pipeline (#695; UNIFIED by #700). The SINGLE per-candidate build->gate function for
     # BOTH the sequential (C=1) and concurrent (C>1) paths. It takes EVERY input as a PARAMETER (no
@@ -3668,7 +3980,12 @@ function Invoke-CandidateBuild {
         # under its own circuit breaker (bounded), but a stopped candidate then SKIPS its gate and parks its
         # committed work rather than auto-merging a validation we cut short.
         [scriptblock]$ShouldCancel = { $false },
-        [bool]$ResetToBase = $false
+        [bool]$ResetToBase = $false,
+        # #1495 the operator off switch for the pre-flight model-server check below. DETECTION
+        # defaults on -- it costs one fast completion on a healthy server and turns a silent
+        # 10-minute empty candidate into a named warning. Nothing here restarts anything: see
+        # Test-ModelServerHealth for why no automatic recovery ships.
+        [bool]$ModelServerRecovery = $true
     )
     $wt = $Worktree
     $cancelled = $false
@@ -3693,6 +4010,23 @@ function Invoke-CandidateBuild {
     # prefix hash, Get-TranscriptAnchor) distinguishes grew-vs-rewritten, so the stdin driver's
     # per-attempt truncate resolves to whole-file scope even when the new transcript is longer.
     $escape = @{ active = $false; anchor = $null; enabled = (Test-NoChangeEscapeEnabled -EnvValue $env:BLARAI_NO_CHANGE_ESCAPE) }
+    # #1495 PRE-FLIGHT: can the model server actually GENERATE? Four wedges between 2026-08-31
+    # and 2026-09-02 left ovms alive and port 8000 listening while every completion hung, and
+    # the failure repeats for every later candidate: on 2026-09-02 candidates 2 and 3 each ran a
+    # full generation budget against a server that could never answer, writing nothing. This is
+    # the one per-candidate entry point BOTH the sequential and concurrent paths share, so a
+    # check here covers every candidate the fleet builds. It costs one fast completion when the
+    # server is healthy, and REPORTS rather than acting when it is not.
+    # Skipped for the offline verifiers' fake models, which must never reach for a real server.
+    if ($ModelServerRecovery -and $Model -notmatch '(?i)/fake') {
+        $__msUrl = Get-CoderBaseUrl -Model $Model -ScriptRoot $ScriptRoot
+        $__ms = Test-ModelServerHealth -BaseUrl $__msUrl -Model (($Model -split '/')[-1]) -ScriptRoot $ScriptRoot
+        if (-not $__ms.Live) {
+            # Fail LOUD but do not abort: the driver's own timeouts still bound the attempt, and
+            # an early return here would invent a result shape best-of-N selection has never seen.
+            Write-Host "  WARNING: the model server is not answering completions. $($__ms.Reason)" -ForegroundColor Red
+        }
+    }
     $build = Invoke-BuildWithRetry -MaxBuildAttempts $MaxBuildAttempts `
         -OnRetry { param($n) if ($escape.enabled) { $escape.active = $true }; Write-Host "  Attempt $($n - 1) produced no changes; retrying ($n/$MaxBuildAttempts) from a clean worktree$(if ($escape.active) { ' (no-change escape offered)' })..." -ForegroundColor Yellow } `
         -ResetWorktree { git -C $wt reset --hard HEAD 2>&1 | Out-Null; git -C $wt clean -fd 2>&1 | Out-Null } `
@@ -3710,11 +4044,7 @@ function Invoke-CandidateBuild {
     }
     if ($run.Error) { Write-Host "  $($run.Error)" -ForegroundColor Red }
     if ($run.TimedOut) {
-        $why = switch ($run.TimeoutReason) {
-            'idle'    { "went idle (no new step/edit for ${IdleTimeoutSec}s) -- genuinely stuck" }
-            'ceiling' { "hit the ${MaxRunMinutes}-min ceiling while still working" }
-            default   { "exceeded its time budget" }
-        }
+        $why = Get-BreakerReason -Run $run -IdleTimeoutSec $IdleTimeoutSec -MaxRunMinutes $MaxRunMinutes
         Write-Host "  CIRCUIT BREAKER: agent $why and was stopped." -ForegroundColor Red
     }
     if ($run.Capped) { Write-Host "  TURN CAP: agent bounded ($($run.CappedReason)); work kept, the gate decides the merge." -ForegroundColor Yellow }
@@ -4014,6 +4344,16 @@ function ConvertTo-CandidateResult {
             CappedReason  = "$(if ($null -ne $run) { $run.CappedReason })"
             Seconds       = $(if ($null -ne $run) { $run.Seconds } else { 0 })
             Error         = "$(if ($null -ne $run) { $run.Error })"
+            # #1494: the enforced bound and the signal name must survive this boundary for the same
+            # reason the capture fault above must -- the breaker sentence reads them OFF THE RUN, so
+            # dropping them here silently re-opens the defect on the concurrent path only: every
+            # parallel candidate would go back to printing the stdin default. Null when absent, not
+            # 0, so a pre-#1494 result still falls back to the caller's parameter rather than to a
+            # number that looks measured. Found by independent review, not by a failing run:
+            # concurrency has been RAM-gated to sequential since 2026-08, so this was latent, and
+            # Resolve-DispatchConcurrency's own default is 3.
+            IdleBoundSec  = $(if ($null -ne $run -and $run.IdleBoundSec) { [int]$run.IdleBoundSec } else { $null })
+            IdleSignal    = "$(if ($null -ne $run) { $run.IdleSignal })"
         }
         Secret = @{
             status = "$(if ($null -ne $secret) { $secret.status } else { 'clean' })"
@@ -4035,13 +4375,32 @@ function Get-TimeoutStopText {
     # so a ~4-min idle stall read as a 60-min wall-clock kill -- the exact mis-label that sent the M2 no-op
     # diagnosis chasing a phantom retry-budget bug. Pure + unit-tested (verify-runtimeout.ps1). An
     # unknown/empty reason falls back to the ceiling phrasing (back-compat with pre-#740 Run objects).
+    # #1494 (second half): this is the sentence that PERSISTS. The console sentence
+    # (Get-BreakerReason) was corrected to print the enforced bound; this one was not, and it is
+    # the one written to the report and read the next morning. Measured 2026-09-01 across state/:
+    # 70 banked reports carry this line and EVERY one says 240s, while the enforcer's own
+    # transcripts show 42 idle kills at 600s and 26 at 120s -- the printed 240 has never matched
+    # any enforced value, ever. It is the caller's own default (new-agent-task.ps1:18), which is
+    # the STDIN transcript-idle bound and is still correct there; under driver=acp the enforced
+    # value is cfg.acp.idle_sec. So this reads the bound off the RUN when the run carries one,
+    # rather than being told a number by a caller that cannot know which driver ran.
+    # The explicit parameters remain the fallback: pre-#1494 run objects have no stamp, and the
+    # unit suite drives this function directly with a value to prove the interpolation is real.
     param(
         [string]$Reason = '',
         [int]$MaxRunMinutes = 60,
-        [int]$IdleTimeoutSec = 240
+        [int]$IdleTimeoutSec = 240,
+        $Run = $null
     )
+    if ($Run) {
+        if (-not $Reason -and $Run.TimeoutReason) { $Reason = [string]$Run.TimeoutReason }
+        if ($Run.IdleBoundSec) { $IdleTimeoutSec = [int]$Run.IdleBoundSec }
+    }
     if ($Reason -eq 'idle') {
-        return "STOPPED early: the coder went idle for ${IdleTimeoutSec}s (no new step or edit -- genuinely stuck), so it was stopped"
+        # The SIGNAL is stamped too: 'no new step/edit' is the stdin observable, 'no session/update'
+        # is ACP's. Naming the wrong one sends a reader looking for the wrong thing in the transcript.
+        $signal = if ($Run -and $Run.IdleSignal) { [string]$Run.IdleSignal } else { 'no new step/edit' }
+        return "STOPPED early: the coder went idle for ${IdleTimeoutSec}s ($signal -- genuinely stuck), so it was stopped"
     }
     return "STOPPED at the ${MaxRunMinutes}-min hard ceiling (a generous absolute backstop)"
 }
@@ -4284,4 +4643,42 @@ function Get-MutationSignalNote {
         return "mutation: all $Total tested mutants killed$cap -- strong test signal"
     }
     return "mutation: $Survived of $Total tested mutants survived$cap -- weak tests; add property-based or edge-case tests (soft signal, NOT a merge block)"
+}
+
+# #1494: the circuit-breaker sentence, as a pure function so its NUMBER can be toggled.
+#
+# THE DEFECT THIS RETIRES. This sentence was formatted inline from $IdleTimeoutSec -- the
+# enclosing function's parameter, default 240, which is the STDIN transcript-idle bound. Under
+# driver=acp the value actually enforced is cfg.acp.idle_sec (600), threaded to acp_coder.py by
+# Invoke-CoderDriver and never seen here. The two are documented as different numbers by design.
+# So every ACP idle kill printed "240s" for a 600s bound -- measured on run 20260831-230448-bd,
+# where the same record reported Seconds: 609.4.
+#
+# It is the one number a human reads to decide whether a park was the idle breaker and at what
+# throughput: at 600s an 8192-token burst needs 13.65 tok/s to survive, at 240s it needs 34.13 --
+# a rate this hardware never reaches, which points the fix at the wrong knob entirely.
+#
+# Pure: takes a run result, returns a sentence.
+#
+# SCOPE, stated precisely because the first version of this comment overclaimed and independent
+# review caught it: this is true of the IDLE arm only. The idle bound and the signal name come
+# FROM THE RUN, which is the same place the enforcement came from, and the parameters are
+# fallbacks for older result shapes. The CEILING arm has no equivalent -- $MaxRunMinutes is its
+# only source, and it is correct today purely because Invoke-CandidateBuild passes
+# -TimeoutSec ($MaxRunMinutes * 60) at the one call site, so the printed number and the enforced
+# one agree by coincidence of that caller rather than by construction. That is structurally the
+# same shape as the defect this function retires, and it is NOT fixed here; #1494 carries it.
+function Get-BreakerReason {
+    param(
+        $Run,
+        [int]$IdleTimeoutSec = 240,
+        [int]$MaxRunMinutes = 0
+    )
+    $idleBound  = if ($Run.IdleBoundSec) { [int]$Run.IdleBoundSec } else { $IdleTimeoutSec }
+    $idleSignal = if ($Run.IdleSignal) { [string]$Run.IdleSignal } else { 'no new step/edit' }
+    switch ("$($Run.TimeoutReason)".Trim().ToLower()) {
+        'idle'    { return "went idle ($idleSignal for ${idleBound}s) -- genuinely stuck" }
+        'ceiling' { return "hit the ${MaxRunMinutes}-min ceiling while still working" }
+        default   { return "exceeded its time budget" }
+    }
 }
