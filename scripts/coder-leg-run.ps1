@@ -1,17 +1,20 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   The de-elevated coder leg (#775 ACP-01 Stage 4) — the scheduled-task action that runs AS blarai-coder,
   claims one coder-leg job off the file-queue, runs it (an ACP dispatch or a containment probe), and
-  writes the result. DORMANT: only ever runs when the orchestrator Start-ScheduledTask's it, which it
-  only does when [fleet_dispatch].containment = restricted_account.
+  writes the result. It only runs when something Start-ScheduledTask's it: the orchestrator does so
+  only when configs/fleet-driver.json says containment = restricted_account (Invoke-FusedCoderRun in
+  fleet-lib.ps1), and verify-coder-containment.ps1 does so for its probe job.
 
 .DESCRIPTION
   This is the "whole coder leg as the restricted account" resolution to the stdio collision (ACP-01 §3.3):
   the elevated orchestrator cannot hand a scheduled task opencode's stdio, so it talks to this leg over
   FILES. Registered as blarai-coder / RunLevel Limited (register-coder-leg-task.ps1), so the ACP driver,
   the opencode process it spawns, and every build child all live inside the ONE coder-SID process tree the
-  per-SID firewall block + the ACL-deny cover — even though the orchestrator that triggered it is elevated.
+  ACL-deny covers -- even though the orchestrator that triggered it is elevated. The per-SID outbound
+  firewall rule is not an enforced lock on this machine (accepted gap, #775 c.1653; see
+  Assert-CoderEgressContained in fleet-lib.ps1).
 
   One invocation drains AT MOST one job (the battery pattern: trigger per job, poll the result). It never
   loops or self-schedules. Any failure is written to the result file, never thrown into the void.

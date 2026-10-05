@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   The ACP-01 Decision-1(b) LIVE PROOF, as a standing check (#775 / PHASE1 §5.3, ACP-01 §4/§7.4). Runs the
@@ -124,31 +124,15 @@ try {
             kind = 'probe'
             probe = @{ secret_paths = $SecretPaths; loopback_url = $LoopbackUrl; expected_sid = $expectedSid }
         }
-        # Baseline the task's LastRunTime BEFORE triggering, so we can tell "it ran" from "it never ran".
-        $preRun = [datetime]'1999-11-30'
-        try { $pr = (Get-ScheduledTaskInfo -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue).LastRunTime; if ($pr) { $preRun = $pr } } catch {}
-        Start-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName
-        # PROVE the task actually STARTED before blocking on its result. A password-principal task whose
-        # account lacks 'Log on as a batch job' is left Ready and NEVER runs (0x41303 SCHED_S_TASK_HAS_NOT_RUN)
-        # -- which the old code experienced as a blind ${TimeoutSec}s result-timeout (the 2026-07-10 live
-        # proof). Poll ~20s for a start signal (LastRunTime advanced, or caught State=Running); fail LOUDLY
-        # and diagnostically if it never starts, instead of waiting out the full window.
-        $started = $false; $lastResult = $null; $state = ''
-        foreach ($i in 1..27) {
-            Start-Sleep -Milliseconds 750
-            $info = Get-ScheduledTaskInfo -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
-            $state = [string](Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue).State
-            if ($info) { $lastResult = $info.LastTaskResult }
-            if (($info -and $info.LastRunTime -gt $preRun) -or $state -eq 'Running') { $started = $true; break }
-        }
-        if (-not $started) {
-            $hex = if ($null -ne $lastResult) { ('0x{0:X}' -f ([uint32]$lastResult)) } else { 'unknown' }
-            Write-Host "  [FAIL] check0-task-started — $TaskPath$TaskName did NOT start within 20s (State=$state, LastTaskResult=$hex)" -ForegroundColor Red
-            if ($hex -eq '0x41303') {
-                Write-Host "         0x41303 = SCHED_S_TASK_HAS_NOT_RUN: the coder account almost certainly lacks the 'Log on as a batch job' right (SeBatchLogonRight)." -ForegroundColor Red
-                Write-Host "         Fix: re-run provision-coder-account.ps1 (it grants SeBatchLogonRight in step 1), then re-run this proof." -ForegroundColor Red
-            }
-            throw "coder-leg task never started (State=$state, LastTaskResult=$hex) — a diagnosable non-start, NOT a blind ${TimeoutSec}s timeout. Likely missing SeBatchLogonRight; re-run provisioning."
+        # Trigger + PROVE the task actually STARTED (shared Start-CoderLegTask, coder-leg-queue.ps1: the same
+        # proof the fused dispatch leg uses). A password-principal task whose account lacks 'Log on as a batch
+        # job' is left Ready and NEVER runs (0x41303 SCHED_S_TASK_HAS_NOT_RUN) -- which used to be a blind
+        # ${TimeoutSec}s result-timeout (the 2026-07-10 live proof). It throws with the diagnosis within ~20s.
+        try {
+            $null = Start-CoderLegTask -TaskPath $TaskPath -TaskName $TaskName
+        } catch {
+            Write-Host "  [FAIL] check0-task-started - $($_.Exception.Message)" -ForegroundColor Red
+            throw "coder-leg task never started - a diagnosable non-start, NOT a blind ${TimeoutSec}s timeout. $($_.Exception.Message)"
         }
         $res = Wait-CoderLegResult -JobId $jobId -TimeoutSec $TimeoutSec
         if ($null -eq $res) { throw "the coder-leg task STARTED but produced no result within ${TimeoutSec}s (probe wrote nothing) — inspect the task's last run + $($paths.Results)" }

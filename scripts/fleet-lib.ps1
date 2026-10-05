@@ -4,6 +4,12 @@
 # Pure function definitions only - NO side effects on load (safe to dot-source).
 # ASCII-only; PowerShell 5.1 + 7 compatible.
 
+# The file-queue + task-trigger contract of the de-elevated coder leg (#775): the fused dispatch seam
+# (Invoke-FusedCoderRun) enqueues through it. Defines functions + path variables only. Loaded only when the
+# sibling file exists (a copy of this lib elsewhere stays loadable); Invoke-FusedCoderRun REFUSES to run
+# when the contract is not loaded, so a missing sibling can never degrade into an uncontained run.
+if (Test-Path -LiteralPath "$PSScriptRoot\coder-leg-queue.ps1") { . "$PSScriptRoot\coder-leg-queue.ps1" }
+
 function Invoke-WithTimeout {
     # Run a shell command line (via cmd /c) in $WorkDir under a hard wall-clock
     # timeout. On timeout the WHOLE process tree is killed (taskkill /T /F) so a
@@ -523,11 +529,15 @@ function Get-FleetDriverConfig {
     # and .acp settings. FAIL-SAFE to the DORMANT defaults on ANY problem (file absent, bad JSON,
     # missing keys) so the production stdin/operator-account path runs unless the manifest
     # DELIBERATELY says otherwise -- flag-dormant by construction (the 23:00 battery boots on this).
+    # .containment_invalid is $true when a containment value is present but unrecognised.
+    # .containment_unresolved is $true when the manifest could not be read at all (missing, garbled, not
+    # UTF-8): the dormant defaults above were SUBSTITUTED, so 'off' is a fallback and not a decision.
+    # A readable manifest without a containment key is a decision ('off'), not unresolved.
     # Memoised per process (the manifest does not change mid-dispatch); pass -Fresh to re-read.
     param([string]$ScriptRoot = $PSScriptRoot, [switch]$Fresh)
     if (-not $Fresh -and $script:_FleetDriverCfg) { return $script:_FleetDriverCfg }
     $default = [pscustomobject]@{
-        driver = 'stdin'; containment = 'off'; research_docs = $false
+        driver = 'stdin'; containment = 'off'; containment_invalid = $false; containment_unresolved = $true; research_docs = $false
         acp = [pscustomobject]@{ python = ''; blarai_root = 'C:/Users/mrbla/blarai'; idle_sec = 600; max_steps = 45; spin_steps = 10 }
     }
     try {
@@ -562,8 +572,15 @@ function Get-FleetDriverConfig {
             $script:_FleetDriverCfg = $default; return $default
         }
         $raw = Get-Content $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        # An empty file or a bare JSON scalar/null is not a manifest: treat it as unreadable.
+        if ($null -eq $raw -or $raw -isnot [pscustomobject]) { $script:_FleetDriverCfg = $default; return $default }
         $driver = if ($raw.driver -in @('stdin','acp')) { $raw.driver } else { 'stdin' }
         $cont   = if ($raw.containment -in @('off','restricted_account')) { $raw.containment } else { 'off' }
+        # A containment value that is PRESENT but unrecognised (a typo such as 'restricted-account') is
+        # still coerced to 'off' here -- this reader stays fail-safe for every dormant consumer -- but it is
+        # FLAGGED, so the one consumer where 'off' means "run the coder as the operator" (Invoke-CoderDriver)
+        # can refuse instead of silently running uncontained on a mistyped intent.
+        $contInvalid = ($null -ne $raw.containment) -and -not ($raw.containment -in @('off','restricted_account'))
         # #1206 research_docs -- DENY-BY-DEFAULT and strictly typed: ONLY a literal JSON boolean
         # true arms the coder's local docset lookup. A string "true", a 1, a typo or a missing key
         # all mean OFF. An ambiguous manifest must never arm a build-time capability by accident.
@@ -575,7 +592,7 @@ function Get-FleetDriverConfig {
             max_steps   = if ($raw.acp.max_steps)   { [int]$raw.acp.max_steps }   else { 45 }
             spin_steps  = if ($raw.acp.spin_steps)  { [int]$raw.acp.spin_steps }  else { 10 }
         }
-        $cfg = [pscustomobject]@{ driver = $driver; containment = $cont; research_docs = $research; acp = $acp }
+        $cfg = [pscustomobject]@{ driver = $driver; containment = $cont; containment_invalid = [bool]$contInvalid; containment_unresolved = $false; research_docs = $research; acp = $acp }
         $script:_FleetDriverCfg = $cfg
         return $cfg
     } catch {
@@ -834,14 +851,296 @@ function Invoke-AcpCoderRun {
     return @{ Ok = $true; Result = $result; Reason = "acp phase=$($envelope.phase)" }
 }
 
+function Assert-CoderEgressContained {
+    # EGRESS SEAM for the fused coder leg: called before the coder starts, in restricted mode only.
+    # It RECORDS the accepted gap and returns; the persistent egress filter set (#1682) makes it
+    # hard-fail (throw) when the filters are absent. A caller that cannot get past this does not run.
+    param([string]$Context = 'coder-leg')
+    Write-Host "  [containment] egress: accepted gap ($Context) -- no egress filter enforced for the coder account" -ForegroundColor Yellow
+    return [pscustomobject]@{ Enforced = $false; Status = 'accepted-gap' }
+}
+
+function ConvertTo-SafeConsoleText {
+    # Text that came out of a result file is attacker-shaped: strip control characters (console escape
+    # sequences) and cap the length before it reaches a console, a log or an exception message.
+    param($Text, [int]$MaxLength = 200)
+    $t = [regex]::Replace([string]$Text, '[\x00-\x1F\x7F-\x9F]', ' ')
+    if ($t.Length -gt $MaxLength) { $t = $t.Substring(0, $MaxLength) + '...' }
+    return $t
+}
+
+function Get-FusedLegBudgets {
+    # The fused leg's wait budgets, derived from the caller's per-run timeout in ONE place. Nesting:
+    #   ResultWaitSec  > TimeoutSec + 300   (Invoke-AcpCoderRun's own outer ceiling is TimeoutSec + 300)
+    #   QueueWaitSec  >= 2 x (StartWaitSec + ResultWaitSec + StopWaitSec)   (two earlier candidates' turns)
+    # One candidate's worst case is StartWaitSec + ResultWaitSec + StopWaitSec. Pure.
+    # agentic-setup keeps no timeout registry of its own: watchdog windows that nest inside BlarAI's budgets
+    # are registered in BlarAI's shared/timeout_registry.py and checked by its nesting test. The nesting
+    # above is asserted in verify-coder-fused-seam.ps1; registering these budgets BlarAI-side is a change
+    # in that repository.
+    param([int]$TimeoutSec = 1800)
+    $start = 20; $stop = 30
+    $result = $TimeoutSec + 300 + 60
+    [pscustomobject]@{
+        StartWaitSec = $start; PollMs = 750; StopWaitSec = $stop; CancelSliceSec = 5
+        ResultWaitSec = $result
+        QueueWaitSec = 2 * ($start + $result + $stop)
+    }
+}
+
+function Resolve-CoderFinalPath {
+    # Resolve a path to its FINAL on-disk form and refuse links: every component must exist, must match an
+    # entry in its parent by its long name (an 8.3 short name or a missing component does not resolve),
+    # and must not be a reparse point (junction or symlink). Returns the canonical path. Throws otherwise.
+    # A string compare on GetFullPath text never follows links; this does the walk.
+    param([Parameter(Mandatory)][string]$Path, [string]$What = 'path')
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full.StartsWith('\\')) { throw "fused leg: $What '$Path' is a UNC or device path." }
+    $cur = [IO.Path]::GetPathRoot($full)
+    $rest = @($full.Substring($cur.Length).Split('\') | Where-Object { $_ -ne '' })
+    foreach ($seg in $rest) {
+        $match = @(Get-ChildItem -LiteralPath $cur -Force -ErrorAction Stop | Where-Object { $_.Name -ieq $seg })
+        if ($match.Count -ne 1) { throw "fused leg: $What '$Path': component '$seg' does not resolve to an existing entry under '$cur' (missing, or a short name)." }
+        if ($match[0].Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "fused leg: $What '$Path' passes through a link (reparse point) at '$($match[0].FullName)'." }
+        $cur = $match[0].FullName
+    }
+    return $cur
+}
+
+function Resolve-AclSid {
+    param($Reference)
+    if ($Reference -is [Security.Principal.SecurityIdentifier]) { return $Reference.Value }
+    $s = [string]$Reference
+    if ($s -match '^S-1-\d') { return $s }
+    try { return (New-Object Security.Principal.NTAccount($s)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { return $null }
+}
+
+function Assert-CoderQueueAclTight {
+    # The fused leg's trust in the shared tree rests on its ACLs: refuse to run when any of -Path is
+    # writable (any write, delete, permission or owner right) by someone other than the operator, the
+    # coder account, SYSTEM, Administrators or CREATOR OWNER. A grant to Authenticated Users, Users,
+    # Everyone or an unresolvable identity throws. The ACL fix itself is provisioning (#1686, LA-run).
+    param([Parameter(Mandatory)][string[]]$Path, [string]$CoderUser = 'blarai-coder', [string[]]$ExtraAllowedSids = @())
+    $writeMask = 2 + 4 + 16 + 64 + 256 + 65536 + 262144 + 524288
+    $acls = foreach ($p in $Path) {
+        try { [pscustomobject]@{ Path = $p; Acl = (Get-Acl -LiteralPath $p -ErrorAction Stop) } }
+        catch { throw "fused leg: cannot read the ACL of '$p' ($(ConvertTo-SafeConsoleText $_.Exception.Message)); the shared tree must be provisioned first (#1686). Not running the coder." }
+    }
+    $allowed = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0') + $ExtraAllowedSids
+    try { $allowed += [string](Get-LocalUser -Name $CoderUser -ErrorAction Stop).SID.Value } catch { }
+    $bad = @()
+    foreach ($a in $acls) {
+        foreach ($rule in $a.Acl.Access) {
+            if ([string]$rule.AccessControlType -ne 'Allow') { continue }
+            if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
+            $sid = Resolve-AclSid $rule.IdentityReference
+            if (-not $sid -or $allowed -notcontains $sid) { $bad += "$($rule.IdentityReference) ($($rule.FileSystemRights)) on $($a.Path)" }
+        }
+    }
+    if ($bad.Count -gt 0) {
+        throw "fused leg: the shared coder-leg tree is writable by accounts other than the operator, $CoderUser, SYSTEM and Administrators: $($bad -join '; '). Tighten the ACLs first (#1686, LA-run provisioning). Not running the coder."
+    }
+}
+
+function Test-CoderContainmentExpected {
+    # Is containment expected on this machine? Yes when the coder-leg task is registered, or the provisioning
+    # marker file exists. A task lookup that itself errors counts as expected (fail closed).
+    param([string]$TaskPath = '\BlarAI\', [string]$TaskName = 'BlarAI-Coder-Leg', [string]$MarkerPath = 'C:\blarai-fleet\coder-provisioned.marker')
+    if (Test-Path -LiteralPath $MarkerPath) { return $true }
+    try { return [bool](Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) } catch { return $true }
+}
+
+function Invoke-FusedCoderRun {
+    # #775 FUSED LEG: run ONE coder build as the restricted blarai-coder account through the file-queue +
+    # on-demand scheduled task, and return the SAME result hashtable Invoke-AcpCoderRun returns in .Result
+    # (TimedOut, TimeoutReason, Capped, CappedReason, ExitCode, LogPath, Seconds, Error, IdleBoundSec,
+    # IdleSignal), so the gate/selection/merge consume it unchanged.
+    # FAIL-CLOSED: every non-start throws -- egress hook refusal, a shared tree writable by other accounts,
+    # driver other than acp, workdir or queue paths that pass through links or leave the shared base, coder
+    # account missing, task not registered, serialize-wait timeout, task never started (0x41303 diagnosis),
+    # cancellation, no result in time, a result that is not bound to this job and the coder account, or a
+    # leg that could not run. There is no fallback to the operator account and none to stdin. On any failure
+    # after the trigger the coder-leg task is STOPPED and the claimed job cleared, so an abandoned coder does
+    # not keep editing a worktree nobody is watching.
+    # SERIALIZE: the task is single-instance (IgnoreNew), so concurrent best-of-N candidates take turns
+    # behind one named mutex held across enqueue -> start -> result, waiting at most QueueWaitSec for
+    # their turn (bounded: a wait that expires is an error, never a dropped or double-run candidate).
+    # RESULT BINDING: id, kind, boolean ok flags, ran_as_sid, and (via Wait-CoderLegResult) the result
+    # file's OWNER and creation time. A full fix needs the results dir writable only by the coder (#1686).
+    param(
+        [Parameter(Mandatory)][string]$WorkDir,
+        [Parameter(Mandatory)][string]$Model,
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][pscustomobject]$Cfg,
+        [int]$TimeoutSec = 1800,
+        [string]$ScriptRoot = $PSScriptRoot,
+        [hashtable]$Options = $null
+    )
+    $b = Get-FusedLegBudgets -TimeoutSec $TimeoutSec
+    $o = @{
+        CoderUser = 'blarai-coder'; TaskPath = '\BlarAI\'; TaskName = 'BlarAI-Coder-Leg'
+        StartWaitSec = $b.StartWaitSec; PollMs = $b.PollMs; StopWaitSec = $b.StopWaitSec; CancelSliceSec = $b.CancelSliceSec
+        QueueWaitSec = $b.QueueWaitSec; ResultWaitSec = $b.ResultWaitSec
+        MutexName = 'Global\BlarAI-Coder-Leg-Dispatch'
+        WorktreeBase = ''
+        ShouldCancel = { Test-DispatchCancelled }
+    }
+    if ($Options) { foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] } }
+    foreach ($need in 'Add-CoderLegJob', 'Wait-CoderLegResult', 'Start-CoderLegTask', 'Stop-CoderLegTask', 'Get-CoderLegPaths') {
+        if (-not (Get-Command $need -ErrorAction SilentlyContinue)) { throw "fused leg: the coder-leg queue contract is not loaded ($need missing; coder-leg-queue.ps1 must sit beside fleet-lib.ps1). Not running the coder." }
+    }
+
+    # 1. the egress seam, before anything else touches the coder
+    $null = Assert-CoderEgressContained -Context 'fused-dispatch'
+
+    # 2. the shared tree must not be writable by other accounts
+    $paths = Get-CoderLegPaths
+    $wtBaseRaw = if ($o.WorktreeBase) { [string]$o.WorktreeBase } else { Resolve-WorktreeBase -ScriptRoot $ScriptRoot -Containment 'restricted_account' }
+    if (-not (Test-Path -LiteralPath $paths.Root)) { throw "fused leg: the coder-leg root '$($paths.Root)' does not exist -- run provision-coder-account.ps1. Not running the coder." }
+    Initialize-CoderLegQueue
+    Assert-CoderQueueAclTight -Path @($paths.Root, $paths.Queue, $paths.Prompts, $paths.Results, $paths.Logs, $wtBaseRaw) -CoderUser $o.CoderUser
+
+    if ($Cfg.driver -ne 'acp') {
+        throw "containment=restricted_account needs driver=acp (the coder leg runs the ACP client only); driver is '$($Cfg.driver)'. Refusing to run the coder uncontained."
+    }
+    # 3. final paths: no links anywhere, and the workdir must sit under the shared worktree base
+    $queueDir   = Resolve-CoderFinalPath -Path $paths.Queue -What 'queue dir'
+    $promptsDir = Resolve-CoderFinalPath -Path $paths.Prompts -What 'prompts dir'
+    $logsDir    = Resolve-CoderFinalPath -Path $paths.Logs -What 'logs dir'
+    $null       = Resolve-CoderFinalPath -Path $paths.Results -What 'results dir'
+    $wtBase     = (Resolve-CoderFinalPath -Path $wtBaseRaw -What 'worktree base').TrimEnd('\') + '\'
+    $wdFull     = Resolve-CoderFinalPath -Path $WorkDir -What 'workdir'
+    if (-not ($wdFull + '\').StartsWith($wtBase, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "fused leg: workdir '$WorkDir' is outside the shared worktree base '$wtBase' the coder account can reach."
+    }
+    # 4. the account and the task must exist
+    $coderSid = $null
+    try { $coderSid = [string](Get-LocalUser -Name $o.CoderUser -ErrorAction Stop).SID.Value } catch { $coderSid = $null }
+    if (-not $coderSid) { throw "fused leg: coder account '$($o.CoderUser)' does not exist -- run provision-coder-account.ps1. Not running the coder as the operator." }
+    if (-not (Get-ScheduledTask -TaskPath $o.TaskPath -TaskName $o.TaskName -ErrorAction SilentlyContinue)) {
+        throw "fused leg: scheduled task $($o.TaskPath)$($o.TaskName) is not registered -- run provision-coder-account.ps1. Not running the coder as the operator."
+    }
+
+    $mdl = if ($Model -and $Model -notmatch '/') { "local/$Model" } else { $Model }
+    $acp = $Cfg.acp
+    $acpIdle = if ($acp.idle_sec) { [int]$acp.idle_sec } else { 600 }
+    $deadline = (Get-Date).AddSeconds([int]$o.QueueWaitSec)
+
+    # 5. take our turn (serialize behind the single-instance task)
+    $mutex = New-Object System.Threading.Mutex($false, [string]$o.MutexName)
+    $held = $false
+    $jobId = $null; $promptFile = $null; $sharedLog = $null
+    try {
+        try {
+            $held = $mutex.WaitOne([int][math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds))
+        } catch [System.Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw "fused leg: waited $($o.QueueWaitSec)s for the coder leg's turn (another candidate holds it) and gave up. Not running the coder." }
+
+        # the task must be idle (a still-running earlier job would swallow our trigger: IgnoreNew)
+        while ([string](Get-ScheduledTask -TaskPath $o.TaskPath -TaskName $o.TaskName -ErrorAction SilentlyContinue).State -eq 'Running') {
+            if ((Get-Date) -ge $deadline) { throw "fused leg: the coder-leg task stayed Running past the $($o.QueueWaitSec)s serialize wait. Not running the coder." }
+            Start-Sleep -Milliseconds ([int][math]::Max(1, $o.PollMs))
+        }
+        # an unclaimed job already in the queue belongs to someone else and would run before ours
+        $stale = @(Get-ChildItem -LiteralPath $queueDir -Filter 'job-*.json' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike '*.claimed*' })
+        if ($stale.Count -gt 0) { throw "fused leg: $($stale.Count) unclaimed job file(s) already in $queueDir (first: $($stale[0].Name)); they would run before this one. Inspect and clear them. Not running the coder." }
+        if (& $o.ShouldCancel) { throw 'fused leg: dispatch cancelled before the coder was triggered.' }
+
+        # 6. stage the prompt, enqueue, trigger, prove start, wait for the result
+        $jobId = New-CoderLegJobId
+        $promptFile = Join-Path $promptsDir "$jobId.prompt.txt"
+        $sharedLog  = Join-Path $logsDir "$jobId.log"
+        Set-Content -Path $promptFile -Value $Prompt -NoNewline -Encoding UTF8 -ErrorAction Stop
+        $enqueuedAt = Get-Date
+        $triggered = $false
+        try {
+            $null = Add-CoderLegJob -Job @{
+                id = $jobId; kind = 'dispatch'; workdir = $wdFull; model = $mdl
+                prompt_file = $promptFile; log_path = $sharedLog
+                timeout_sec = $TimeoutSec; idle_sec = $acpIdle
+                max_steps = [int]$acp.max_steps; spin_steps = [int]$acp.spin_steps
+            }
+            Write-Host "  [driver=acp] fused leg: job $jobId queued for $($o.CoderUser); triggering $($o.TaskPath)$($o.TaskName)" -ForegroundColor DarkCyan
+            $triggered = $true
+            $null = Start-CoderLegTask -TaskPath $o.TaskPath -TaskName $o.TaskName -StartWaitSec $o.StartWaitSec -PollMs $o.PollMs
+            $resDeadline = (Get-Date).AddSeconds([int]$o.ResultWaitSec)
+            $res = $null
+            while ($true) {
+                if (& $o.ShouldCancel) { throw 'fused leg: dispatch cancelled; stopping the coder-leg task.' }
+                $remaining = [int][math]::Ceiling(($resDeadline - (Get-Date)).TotalSeconds)
+                if ($remaining -le 0) { break }
+                $res = Wait-CoderLegResult -JobId $jobId -TimeoutSec ([int][math]::Min($o.CancelSliceSec, $remaining)) -ExpectedOwnerSid $coderSid -NotBefore $enqueuedAt
+                if ($null -ne $res) { break }
+            }
+            if ($null -eq $res) { throw "fused leg: the coder-leg task started but wrote no result for $jobId within $($o.ResultWaitSec)s. Not falling back." }
+
+            # 7. validate the result before trusting any of it: bound to THIS job and the coder account
+            if ([string]$res.id -cne $jobId) { throw "fused leg: the result is for job '$(ConvertTo-SafeConsoleText $res.id 80)', not '$jobId'. Discarding it." }
+            if ([string]$res.kind -cne 'dispatch') { throw "fused leg: the result has kind '$(ConvertTo-SafeConsoleText $res.kind 40)', not 'dispatch'. Discarding it." }
+            if ([string]$res.ran_as_sid -cne $coderSid) {
+                throw "fused leg: the job ran as SID '$(ConvertTo-SafeConsoleText $res.ran_as_sid 80)', not the coder account's '$coderSid'. Discarding the result."
+            }
+            if (($res.ok -isnot [bool]) -or ($res.ok -ne $true)) {
+                $why = if ($res.error) { ConvertTo-SafeConsoleText $res.error } else { 'no error text' }
+                throw "fused leg: the coder leg reported failure for $jobId (ok is not the boolean true: $why). Not falling back to the operator account or stdin."
+            }
+            $leg = $res.result
+            if ($null -eq $leg -or $null -eq $leg.Result) {
+                $why = if ($leg -and $leg.Reason) { ConvertTo-SafeConsoleText $leg.Reason } else { 'no result body' }
+                throw "fused leg: unusable result for $jobId ($why). Not falling back to the operator account or stdin."
+            }
+            if (($leg.Ok -isnot [bool]) -or ($leg.Ok -ne $true)) {
+                throw "fused leg: the coder leg could not run the build ($(ConvertTo-SafeConsoleText $leg.Reason)). Not falling back to the operator account or stdin."
+            }
+            # 8. the transcript the gate reads lives at the operator-side LogPath
+            if (Test-Path -LiteralPath $sharedLog) { Copy-Item -LiteralPath $sharedLog -Destination $LogPath -Force -ErrorAction Stop }
+            $r = $leg.Result
+            $result = @{
+                TimedOut = [bool]$r.TimedOut; TimeoutReason = [string]$r.TimeoutReason
+                Capped = [bool]$r.Capped; CappedReason = [string]$r.CappedReason
+                ExitCode = $r.ExitCode
+                LogPath = $LogPath; Seconds = [double]$r.Seconds; Error = [string]$r.Error
+                IdleBoundSec = $acpIdle; IdleSignal = 'no session/update'
+            }
+            Write-Host "  [driver=acp] $(ConvertTo-SafeConsoleText $leg.Reason) (fused leg, ran as $(ConvertTo-SafeConsoleText $res.ran_as_user 80))" -ForegroundColor DarkCyan
+            return $result
+        } catch {
+            # Any failure once the job exists: the coder must not keep running or keep a claimed job.
+            $failure = $_
+            $stopped = $true
+            if ($triggered) {
+                $stopped = Stop-CoderLegTask -TaskPath $o.TaskPath -TaskName $o.TaskName -WaitSec $o.StopWaitSec -PollMs $o.PollMs
+            }
+            Remove-Item -LiteralPath (Join-Path $queueDir "$jobId.json.claimed") -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $paths.Results "$jobId.result.json") -ErrorAction SilentlyContinue
+            if (-not $stopped) { throw "$($failure.Exception.Message) ALSO: the coder-leg task did not leave Running within $($o.StopWaitSec)s of the stop request; the coder may still be editing the worktree." }
+            throw
+        }
+    } finally {
+        if ($jobId) {
+            # an unclaimed job of ours must not outlive the call; a claimed one is already the leg's
+            Remove-Item -LiteralPath (Join-Path $queueDir "$jobId.json") -ErrorAction SilentlyContinue
+        }
+        if ($promptFile) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }
+        if ($sharedLog)  { Remove-Item -LiteralPath $sharedLog -ErrorAction SilentlyContinue }
+        # release the turn (Dispose alone also frees it; both are removed together by the harness mutant)
+        if ($held) { try { $mutex.ReleaseMutex() } catch {} }; $mutex.Dispose()
+    }
+}
+
 function Invoke-CoderDriver {
-    # #775 ACP-01 SEAM: the single point the candidate loop calls to DRIVE + WATCH the coder. It selects
-    # the driver from configs/fleet-driver.json and returns the SAME result contract Invoke-CandidateBuild
-    # already consumes. With driver='stdin' (the DEFAULT), this is BYTE-IDENTICAL to the historical call --
-    # it delegates to Invoke-AgentRun with the exact same arguments. With driver='acp' it drives the
-    # persistent opencode-acp session via the Python client, and FALLS BACK to the identical stdin call on
-    # any pre-prompt ACP failure (import/handshake/no-interpreter). ACP replaces only HOW the coder is
-    # driven; the gate/selection/merge are untouched.
+    # #775 ACP-01 SEAM: the single point the candidate loop calls to DRIVE + WATCH the coder. It reads
+    # configs/fleet-driver.json and returns the SAME result contract Invoke-CandidateBuild already consumes.
+    # CONTAINMENT is decided first: an unrecognised value throws; 'restricted_account' runs the coder as the
+    # blarai-coder account through Invoke-FusedCoderRun and has NO fallback (every failure throws); a
+    # manifest that could not be read (containment_unresolved) throws when containment is expected on this
+    # machine (Test-CoderContainmentExpected: the coder-leg task is registered or the provisioning marker
+    # exists), and otherwise falls through as 'off'. With a readable manifest and containment 'off' the
+    # driver then applies unchanged: driver='stdin' delegates to Invoke-AgentRun with the exact historical
+    # arguments; driver='acp' drives the persistent opencode-acp session via the Python client and FALLS BACK
+    # to the identical stdin call on any pre-prompt ACP failure (import/handshake/no-interpreter). ACP
+    # replaces only HOW the coder is driven; the gate/selection/merge are untouched.
     param(
         [Parameter(Mandatory)][string]$WorkDir,
         [Parameter(Mandatory)][string]$Model,
@@ -849,9 +1148,31 @@ function Invoke-CoderDriver {
         [Parameter(Mandatory)][string]$LogPath,
         [int]$TimeoutSec = 1800,
         [int]$IdleTimeoutSec = 240,
-        [string]$ScriptRoot = $PSScriptRoot
+        [string]$ScriptRoot = $PSScriptRoot,
+        [hashtable]$FusedOptions = $null   # tuning for the fused leg (waits, mutex name); $null = defaults
     )
     $cfg = Get-FleetDriverConfig -ScriptRoot $ScriptRoot
+    # Containment is decided BEFORE any driver work, and every value outside {off, restricted_account}
+    # is refused: 'off' means "the coder runs as the operator", so a mistyped flag must never reach it.
+    if ($cfg.containment_invalid) {
+        throw "fleet-driver.json carries an unrecognised containment value (only 'off' and 'restricted_account' are valid): refusing to run the coder."
+    }
+    if ($cfg.containment -eq 'restricted_account') {
+        # FUSED LEG: the coder step runs as blarai-coder through the queue + scheduled task. There is
+        # deliberately NO fallback out of this branch -- not to Invoke-AcpCoderRun, not to stdin: every
+        # failure inside throws, so a run that cannot be contained does not run.
+        return Invoke-FusedCoderRun -WorkDir $WorkDir -Model $Model -Prompt $Prompt -LogPath $LogPath `
+            -TimeoutSec $TimeoutSec -Cfg $cfg -ScriptRoot $ScriptRoot -Options $FusedOptions
+    }
+    # A manifest we could not read made 'off' a substitute, not a decision. Where containment is expected
+    # (task registered / marker present) running the coder as the operator would be a silent downgrade.
+    if ($cfg.containment_unresolved) {
+        $expectArgs = @{}
+        foreach ($k in 'TaskPath', 'TaskName', 'MarkerPath') { if ($FusedOptions -and $FusedOptions.ContainsKey($k)) { $expectArgs[$k] = $FusedOptions[$k] } }
+        if (Test-CoderContainmentExpected @expectArgs) {
+            throw "fleet-driver.json could not be read (missing, garbled or not UTF-8) and containment is expected on this machine (the coder-leg task is registered or the provisioning marker exists): refusing to run the coder as the operator."
+        }
+    }
     if ($cfg.driver -eq 'acp') {
         try {
             $mdl = if ($Model -and $Model -notmatch '/') { "local/$Model" } else { $Model }
