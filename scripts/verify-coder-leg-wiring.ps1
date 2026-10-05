@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Verify the #775 ACP-01 Stage 4 coder-leg wiring is sound and DORMANT-safe, fully OFFLINE — no coder
