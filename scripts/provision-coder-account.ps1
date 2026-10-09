@@ -3,7 +3,7 @@
 .SYNOPSIS
   Provision the #775 ACP-01 Decision-1(b) containment floor: a restricted `blarai-coder`
   standard account + a per-SID deny-by-default outbound firewall rule + the relocated shared
-  worktree base + a scoped Modify grant on the target-repos dir. IDEMPOTENT; -Rollback removes it.
+  worktree base + the ACL stage (READ, not Modify, on the target-repos dir). IDEMPOTENT; -Rollback removes it.
 
 .DESCRIPTION
   Decision-1(b) (Vikunja #787 / PHASE1_DISPATCH_THREAT_MODEL §5) is the universal floor for all
@@ -20,14 +20,17 @@
                    SecureString and NEVER written to disk in plaintext (D-C). New-LocalUser takes the
                    SecureString directly; the only place a plaintext form is ever materialized is the
                    Task Scheduler registration, which vaults it in LSA secrets (register-coder-leg-task.ps1).
-    2. WORKTREE  — create the shared throwaway worktree base C:\blarai-fleet\worktrees OUTSIDE the
-                   operator profile (D-B), with **dual-SID Modify** (operator + coder, inherited) so the
-                   coder can build there and the orchestrator-side merge can still read the files. This is
-                   what lets the operator-profile default-deny do the containment heavy-lifting instead of
-                   hand-punching read-holes into C:\Users\mrbla.
-    3. PROJECTS  — grant the coder SID **Modify** on C:\Users\mrbla\projects (the target repos it must
-                   read/build). This is the one deliberate, scoped read into the profile — paired with the
-                   §5.2 operator footgun: NEVER point the fleet at a repo holding live secrets.
+    2. WORKTREE  - create the shared throwaway worktree base C:\blarai-fleet\worktrees OUTSIDE the
+                   operator profile (D-B). The folder grants are NOT made here: step 3 runs the ACL stage
+                   (provision-coder-acls.ps1), which gives the coder Modify on the worktree base and the
+                   coder-leg job folders ONLY, and closes C:\blarai-fleet to every other account (#1686).
+    3. ACLS      - run the ONE ACL stage (provision-coder-acls.ps1 -Apply; run it with -DryRun first to read
+                   what it will do): the coder gets READ (not Modify) on C:\Users\mrbla\projects and every
+                   repo created there later (#1678: the operator funnel is the only committer), the fleet root
+                   is closed (#1686), the worktree-root deny is applied, and the model folders stop being
+                   writable by other accounts (#1692). This is the one deliberate, scoped read into the
+                   profile - paired with the 5.2 operator footgun: NEVER point the fleet at a repo holding
+                   live secrets.
     4. SECRETS   — the threat-model secret list (~/.ssh, ~/.git-credentials, %LOCALAPPDATA%\BlarAI,
                    ~/.aws, ~/.azure, ~/.config/gcloud, backup/secrets-staging) all live UNDER the operator
                    profile, which Windows ALREADY default-denies to a separate standard user — so we add
@@ -79,6 +82,7 @@
 param(
     [switch]$Rollback,
     [switch]$ForceNewPassword,
+    [string]$AclPlanDigest = '',
     [string[]]$ExtraSecretPaths = @(),
     [switch]$ExcludeLoopbackFromBlock,
     [string]$CoderUser = 'blarai-coder',
@@ -138,13 +142,16 @@ function Get-CoderSid([string]$user) {
 
 function Add-Ace([string]$path, [string]$sid, [string]$rights, [string]$type) {
     # Idempotent icacls grant/deny (inherited). $type = 'grant' | 'deny'. Uses the SID form (*S-...)
-    # so it is language-independent. Rights e.g. '(OI)(CI)M' (modify, inherited) or '(OI)(CI)(R)'.
+    # so it is language-independent. Rights e.g. '(OI)(CI)RX' (read and run, inherited) or '(OI)(CI)(R)'.
+    # One call on the root, no /T: an inheritable entry reaches every child by inheritance, and icacls /T follows
+    # directory symlinks inside the tree. Not used for the projects folder or the fleet root any more: those
+    # belong to the ACL stage (provision-coder-acls.ps1).
     if (-not (Test-Path $path)) { Write-Skip "path absent, no ACE: $path"; return }
     $spec = "*$sid`:$rights"
     if ($type -eq 'deny') {
-        & icacls $path /deny $spec /T /C | Out-Null
+        & icacls $path /deny $spec | Out-Null
     } else {
-        & icacls $path /grant $spec /T /C | Out-Null
+        & icacls $path /grant $spec | Out-Null
     }
     if ($LASTEXITCODE -ne 0) { throw "icacls $type failed on $path (exit $LASTEXITCODE)" }
     Write-Ok "$type $rights -> $path"
@@ -152,10 +159,14 @@ function Add-Ace([string]$path, [string]$sid, [string]$rights, [string]$type) {
 
 function Remove-Ace([string]$path, [string]$sid) {
     if (-not (Test-Path $path)) { return }
-    & icacls $path /remove:g "*$sid" /T /C | Out-Null
-    & icacls $path /remove:d "*$sid" /T /C | Out-Null
+    $safe = Test-AclTargetSafe -Path $path
+    if (-not $safe.Ok) { Write-Warning "not touching '$path': $($safe.Reason)"; return }
+    # the no-follow walk (a link inside the tree is listed, never entered), allow and deny entries of the coder SID
+    foreach ($t in 'Allow', 'Deny') { $null = Invoke-AclTreeRemoveGrants -Root $path -Sid $sid -Type $t }
     Write-Ok "removed coder ACEs from $path"
 }
+
+. "$PSScriptRoot\coder-acl-lib.ps1"   # the no-follow tree walk and the safe-target gate
 
 # Pure helpers (Resolve-PrivilegeLine + the code-read path SSOT), factored out so they are unit-testable
 # offline in verify-coder-provisioning.ps1 without executing any live change.
@@ -221,6 +232,11 @@ if ($Rollback) {
         # the profile-homed code-read grants (step 7) + the batch-logon right (step 1)
         $AgenticRoot = Split-Path $PSScriptRoot -Parent
         foreach ($cp in (Get-CoderCodeReadPaths -AgenticRoot $AgenticRoot -BlarRoot $BlarRoot)) { Remove-Ace $cp $sid }
+        # the tool-chain read grants + the coder-owned opencode config (step 7b): their own targeted undo
+        try {
+            & (Join-Path $PSScriptRoot 'provision-coder-setup.ps1') -Rollback -CoderUser $CoderUser -CoderSid $sid -AgenticRoot $AgenticRoot -BlarRoot $BlarRoot
+            if ($LASTEXITCODE -notin 0, 3) { Write-Warning "tool-chain setup rollback reported problems (exit $LASTEXITCODE)" }
+        } catch { Write-Warning "tool-chain setup rollback: $($_.Exception.Message)" }
         try { Set-BatchLogonRight -Sid $sid -Mode remove } catch { Write-Warning "batch-logon revoke: $($_.Exception.Message)" }
     } else { Write-Skip "coder account absent — no ACEs to remove" }
     # account
@@ -230,6 +246,7 @@ if ($Rollback) {
             Write-Ok "removed local user '$CoderUser'"
         } else { Write-Skip "local user not present" }
     } catch { Write-Warning "account removal: $($_.Exception.Message)" }
+    try { if (Remove-CoderProvisionMarker) { Write-Ok "removed the provisioning marker" } else { Write-Skip "provisioning marker not present" } } catch { Write-Warning "marker removal: $($_.Exception.Message)" }
     Write-Step "ROLLBACK complete."
     exit 0
 }
@@ -280,27 +297,34 @@ Write-Ok "coder SID = $sid"
 # NEVER RUNS (0x41303 SCHED_S_TASK_HAS_NOT_RUN, the 2026-07-10 live proof). Idempotent.
 Set-BatchLogonRight -Sid $sid -Mode add
 
-# 2. relocated shared worktree base (dual-SID Modify) -------------------------
-# Grant dual-SID Modify on the FLEET ROOT (parent of the worktree base) so the same inherited ACEs
-# cover BOTH the worktree base AND the coder-leg file-queue (C:\blarai-fleet\coder-leg, Stage 4) — one
-# shared tree, one grant, both SIDs can modify, the operator-profile default-deny stays intact.
+# 2. the shared fleet folders (created here; the ACCESS on them is the ACL stage's, step 3) -----------------------
 $FleetRoot = Split-Path $WorktreeBase -Parent    # C:\blarai-fleet
-Write-Step "2/7 shared fleet tree '$FleetRoot' (dual-SID Modify, outside the profile)"
+Write-Step "2/7 shared fleet tree '$FleetRoot' (folders only, outside the profile)"
 New-Item -ItemType Directory -Force $FleetRoot | Out-Null
 New-Item -ItemType Directory -Force $WorktreeBase | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $FleetRoot 'coder-leg\queue') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $FleetRoot 'coder-leg\results') | Out-Null
 $operatorSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-Add-Ace $FleetRoot $sid '(OI)(CI)M'           # coder: modify, inherited (covers worktrees + coder-leg)
-Add-Ace $FleetRoot $operatorSid '(OI)(CI)M'   # operator (merge/orchestrator side): modify, inherited
 
-# 3. target-repos Modify grant (the one deliberate scoped read into the profile) --
-Write-Step "3/7 coder Modify on '$ProjectsDir' (the target repos it builds)"
+# 3. the ACL stage (#1678 projects narrowed to READ, #1686 fleet root closed, #1692 model folders) -------------
+# ONE stage, also runnable alone (with -DryRun first): provision-coder-acls.ps1. It is applied here so a fresh
+# provisioning never leaves the coder with Modify on the projects folder, or the fleet root open to every account.
+Write-Step "3/7 ACL stage: coder READ on '$ProjectsDir', Modify only on the worktree base + coder-leg, fleet root closed, model folders protected"
 if (Test-Path $ProjectsDir) {
-    Add-Ace $ProjectsDir $sid '(OI)(CI)M'
-    Write-Host "  [footgun] NEVER point the fleet at a repo under $ProjectsDir that holds live secrets (§5.2)." -ForegroundColor Yellow
+    $aclStage = Join-Path $PSScriptRoot 'provision-coder-acls.ps1'
+    if (-not $AclPlanDigest) {
+        # no plan was shown yet: show it (read-only) and stop short of changing any access list
+        & $aclStage -DryRun -CoderUser $CoderUser -CoderSid $sid -OperatorSid $operatorSid -ProjectsDir $ProjectsDir -WorktreeBase $WorktreeBase
+        $script:AclPending = $true
+        Write-Warning "ACL stage NOT applied: read the plan above, then re-run with -AclPlanDigest <the PLAN DIGEST it printed> (or run provision-coder-acls.ps1 -Apply -ExpectPlan <digest>). The coder is NOT contained until it is applied."
+    } else {
+        & $aclStage -Apply -ExpectPlan $AclPlanDigest -CoderUser $CoderUser -CoderSid $sid -OperatorSid $operatorSid -ProjectsDir $ProjectsDir -WorktreeBase $WorktreeBase
+        if ($LASTEXITCODE -ne 0) { throw "the ACL stage (provision-coder-acls.ps1 -Apply) reported problems (exit $LASTEXITCODE); see its output. The coder is NOT contained until it passes." }
+    }
+    if (-not $script:AclPending) { Write-Ok "ACL stage applied (the previous access lists are saved under state\acl-backup)" }
+    Write-Host "  [footgun] NEVER point the fleet at a repo under $ProjectsDir that holds live secrets (5.2)." -ForegroundColor Yellow
 } else {
-    Write-Skip "$ProjectsDir absent — create it before first dispatch, then re-run to grant"
+    Write-Skip "$ProjectsDir absent - create it before first dispatch, then re-run to grant"
 }
 
 # 4. explicit Deny only for OUT-OF-PROFILE secrets ---------------------------
@@ -370,4 +394,25 @@ foreach ($cp in (Get-CoderCodeReadPaths -AgenticRoot $AgenticRoot -BlarRoot $Bla
 Write-Host "  [excluded, never granted] $($excluded -join '; ')" -ForegroundColor DarkGray
 Write-Host "  [verify-not-assume] the coder can actually READ this code is PROVEN by verify-coder-containment.ps1 (the leg runs coder-leg-run.ps1)." -ForegroundColor Yellow
 
+# 7b. the coder's own tool chain: read-and-run on the opencode package, the shim folder, the fleet tools and the
+# offline docset, and the coder-OWNED opencode config in the coder's profile (provision-coder-setup.ps1; run it
+# with no switch first to read what it does). The profile exists only after the coder's first logon: until then
+# the config step is PENDING (exit 3) and this script exits 3 at the end.
+Write-Step "7b/7 coder tool-chain grants + coder-owned opencode config"
+& (Join-Path $PSScriptRoot 'provision-coder-setup.ps1') -Apply -CoderUser $CoderUser -CoderSid $sid -AgenticRoot $AgenticRoot -BlarRoot $BlarRoot -WorktreeBase $WorktreeBase
+$setupRc = $LASTEXITCODE
+if ($setupRc -eq 3) { $script:SetupPending = $true; Write-Warning "coder tool-chain setup: the config step is PENDING (the coder profile does not exist yet). Run verify-coder-containment.ps1 once, then provision-coder-setup.ps1 -Apply." }
+elseif ($setupRc -ne 0) { throw "the coder tool-chain setup (provision-coder-setup.ps1 -Apply) reported problems (exit $setupRc); see its output. The coder cannot run its tool chain until it passes." }
+
+# 8. the provisioning marker: tells the orchestrator containment is expected here (see
+# Get-CoderProvisionMarkerPath), so an unreadable fleet-driver manifest refuses the coder instead of
+# falling back to the operator account.
+$markerPath = Write-CoderProvisionMarker -CoderUser $CoderUser -CoderSid $sid
+Write-Ok "provisioning marker written: $markerPath"
+
+# 9. the worktree-root deny (#1686: the coder must not be able to delete or rename a worktree root) is an action
+# of the ACL stage in step 3 ('worktree-root-deny'); nothing more to do here.
+
 Write-Step "PROVISION complete. Next: run verify-coder-containment.ps1 (the live proof — the build-time gate on flipping containment)."
+if ($script:AclPending) { Write-Warning "PROVISION finished WITHOUT the ACL stage (see above): exiting 3."; exit 3 }
+if ($script:SetupPending) { Write-Warning "PROVISION finished WITHOUT the coder opencode config (see 7b): exiting 3."; exit 3 }

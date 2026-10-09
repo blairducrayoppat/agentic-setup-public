@@ -751,6 +751,14 @@ function Invoke-CritiquePass {
         [string]$DeclaredSurface = ''
     )
 
+    # A worktree the coder ran in (a fused-leg dispatch) must still be the one it was, and not quarantined,
+    # before anything here reads it or hands it to a child script. Assert-OperatorWorktree is a no-op for
+    # every other path, and absent when fleet-lib.ps1 is not loaded (standalone use).
+    if (Get-Command Assert-OperatorWorktree -ErrorAction SilentlyContinue) {
+        try { $null = Assert-OperatorWorktree -Path $AppDir }
+        catch { return _FailResult "worktree not trusted for the critique: $($_.Exception.Message)" }
+    }
+
     # Resolve / create the scratch directory for the PNG.
     if (-not $WorkDir) { $WorkDir = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "critique-loop-$([guid]::NewGuid().ToString('N').Substring(0,8))") }
     try { if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Force $WorkDir | Out-Null } }

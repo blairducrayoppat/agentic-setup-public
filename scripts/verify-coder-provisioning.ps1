@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Verify the #775 ACP-01 provisioning PURE helpers (coder-provisioning-lib.ps1) — the secedit
@@ -98,6 +98,51 @@ Assert-True ($secretLeak.Failed -contains 'check2-secret-reads-denied') '  ...ch
 Assert-True (-not ($secretLeak.Failed -contains 'check1-outbound-blocked')) '  ...check1 is WARN-softened, not a fail'
 $sidLeak = Get-ContainmentVerdict -OutboundBlocked $true -SecretReadsDenied $true -LoopbackOk $true -SidIsCoder $false -AcceptedEgressGap
 Assert-True ((-not $sidLeak.Pass) -and ($sidLeak.Failed -contains 'check4-sid-is-coder')) 'a wrong-SID still FAILS under -AcceptedEgressGap'
+
+Section 'the provisioning marker (written by provision-coder-account.ps1, read by the orchestrator)'
+$mk = Join-Path ([IO.Path]::GetTempPath()) ("marker-" + [guid]::NewGuid().ToString('N') + '\sub\coder-provisioned.marker')
+$written = Write-CoderProvisionMarker -Path $mk -CoderUser 'blarai-coder' -CoderSid 'S-1-5-21-1-2-3-1001'
+Assert-Eq $mk $written 'Write-CoderProvisionMarker returns the path it wrote'
+Assert-True (Test-Path -LiteralPath $mk) 'the marker file exists (parent folder created)'
+$mkObj = Get-Content -LiteralPath $mk -Raw | ConvertFrom-Json
+Assert-Eq 'blarai-coder' $mkObj.coder_user 'marker records the coder user'
+Assert-Eq 'S-1-5-21-1-2-3-1001' $mkObj.coder_sid 'marker records the coder SID'
+Assert-True ([bool]$mkObj.provisioned_utc) 'marker records when it was written'
+Assert-True (-not (Test-Path -LiteralPath "$mk.tmp")) 'no temp file is left beside the marker'
+$again = Write-CoderProvisionMarker -Path $mk
+Assert-True (Test-Path -LiteralPath $mk) 'writing again (re-provisioning) is idempotent'
+Assert-True (Remove-CoderProvisionMarker -Path $mk) 'Remove-CoderProvisionMarker removes it and says so'
+Assert-True (-not (Remove-CoderProvisionMarker -Path $mk)) 'removing an absent marker is a no-op that says so'
+Remove-Item (Split-Path (Split-Path $mk -Parent) -Parent) -Recurse -Force -ErrorAction SilentlyContinue
+Assert-Eq 'C:\blarai-fleet\coder-provisioned.marker' (Get-CoderProvisionMarkerPath) 'the marker lives beside the fleet root'
+$provSrc = Get-Content "$PSScriptRoot\provision-coder-account.ps1" -Raw
+Assert-True ($provSrc -match 'Write-CoderProvisionMarker') 'provision-coder-account.ps1 writes the marker'
+Assert-True ($provSrc -match 'Remove-CoderProvisionMarker') 'provision-coder-account.ps1 -Rollback removes the marker'
+
+Section 'the worktree-root deny is an action of the ACL stage (#1686): built from the plan, applied by the stage, never printed-and-forgotten'
+. "$PSScriptRoot\coder-acl-lib.ps1"
+$fakeRead = { param($p) [pscustomobject]@{ Path = $p; Owner = $null; Protected = $true; Aces = @() } }
+$planP = @(Get-CoderAclPlan -CoderSid 'S-1-5-21-1-2-3-1001' -OperatorSid 'S-1-5-21-1-2-3-1000' -ProjectsDir 'C:\P\projects' -WorktreeBase 'C:\blarai-fleet\worktrees' -ModelRoots @() -ProfileCleanupPaths @() -ReadAcl $fakeRead)
+$denyAct = @($planP | Where-Object { $_.Id -eq 'worktree-root-deny' })[0]
+Assert-True ($null -ne $denyAct) 'the plan carries the worktree-root deny action'
+$denyCmds = @($denyAct.Steps | Where-Object { $_.Op -eq 'Deny' } | ForEach-Object { Format-IcaclsText -IcaclsArgs (ConvertTo-IcaclsCommand -Path $denyAct.Path -Op $_) })
+Assert-Eq 2 $denyCmds.Count 'two deny ACEs: delete-child on the base, delete on the roots'
+Assert-Eq 'icacls C:\blarai-fleet\worktrees /deny *S-1-5-21-1-2-3-1001:(DC)' $denyCmds[0] 'ACE 1: deny FILE_DELETE_CHILD (DC) to the coder on the worktree base'
+Assert-Eq 'icacls C:\blarai-fleet\worktrees /deny *S-1-5-21-1-2-3-1001:(CI)(IO)(NP)(DE)' $denyCmds[1] 'ACE 2: deny DELETE (DE) on the worktree roots only (inherit-only, container, no-propagate)'
+Assert-True ($denyCmds[1] -match '\(NP\)' -and $denyCmds[1] -match '\(IO\)') 'ACE 2 does not propagate below the roots (the coder keeps Modify inside a worktree)'
+$provSrc2 = Get-Content "$PSScriptRoot\provision-coder-account.ps1" -Raw
+Assert-True ($provSrc2 -match 'provision-coder-acls\.ps1' -and $provSrc2 -match '& \$aclStage -Apply') 'provision-coder-account.ps1 applies the ACL stage (which carries the deny)'
+Assert-True ($provSrc2 -notmatch 'Get-CoderWorktreeRootDenyCommands') 'the old print-only function is gone from the provisioning script'
+Assert-True (-not (Get-Command Get-CoderWorktreeRootDenyCommands -ErrorAction SilentlyContinue)) 'and from the lib'
+
+Section 'the projects folder is READ-only for the coder after provisioning (#1678), and the fleet root is closed (#1686)'
+$pn = @($planP | Where-Object { $_.Id -eq 'projects-narrow' })[0]
+Assert-True (@($pn.Steps | Where-Object { $_.Op -in 'SetGrant', 'AddGrant' -and $_.Rights -in 'M', 'F' }).Count -eq 0) 'no step of the projects action grants the coder Modify or Full control'
+Assert-True (@($pn.Steps | Where-Object { $_.Op -eq 'SetGrant' -and $_.Rights -eq 'RX' -and $_.Flags -eq '(OI)(CI)' }).Count -eq 1) 'the one grant on projects is inheritable read-and-run'
+Assert-True (@($pn.Steps | Where-Object { $_.Op -eq 'RemoveGrants' -and $_.Tree }).Count -eq 1) 'the old grant is undone first (a targeted tree removal for the coder SID)'
+Assert-True ($provSrc2 -notmatch 'Add-Ace \$ProjectsDir' -and $provSrc2 -notmatch 'Add-Ace \$FleetRoot') 'provision-coder-account.ps1 no longer grants on the projects folder or the fleet root'
+Assert-True ($provSrc2 -notmatch '\(OI\)\(CI\)M') 'provision-coder-account.ps1 contains no inheritable Modify grant'
+Assert-True ($provSrc2 -notmatch '/T /C' -and $provSrc2 -match 'Invoke-AclTreeRemoveGrants') 'provision-coder-account.ps1 never uses icacls /T (it follows directory symlinks); the -Rollback removal is the no-follow walk'
 
 Write-Host ''
 if ($script:Fail -eq 0) {

@@ -229,3 +229,174 @@ PowerShell 5.1:
 
 ## Could not break
 Result binding (id, kind, booleans, owner, creation time); link refusal at check time for junctions, symlinks, base and queue dirs; `\\?\`, UNC and missing components; the `off` path matching main; no operator-account or stdin fallback on any restricted-mode failure; the stop-on-failure path; and the mutation harness's own classification.
+
+
+---
+
+# Round 3: fix/1691-fused-leg-flip-blockers at 6905e03 (9 commits off d026f5c)
+
+Tested HEAD **6905e03** in worktree `C:/Users/mrbla/agentic-wt-1691-m1`. Constraints were unchanged: no real task, account, ACL, firewall or provisioning changes, pwsh 7, temp roots only. Probe scripts are in the scratchpad: `offdiff2.ps1`, `r3acl.ps1`, `r3race.ps1`, `r3det.ps1`, `r3mut.ps1`; the random mutant pick is in `r3-pick.txt`.
+
+## Verdict
+
+- **Merge to agentic-setup main with containment `off`: MERGE-READY.**
+  - The off path matches main: offdiff2 shows 0 differing lines between d026f5c and 6905e03, across 15 manifest shapes, with the ACP interpreter both available and unavailable.
+  - With no fused record, the funnels give the historical argv: `Get-WtGit` returns `-C <path>`, `Get-OperatorWorktreePath` is a plain Join-Path, `Remove-WorktreeSafe` runs the same `git -C $Repo worktree remove --force`.
+  - No `state\fused-worktrees` folder exists in the live tree.
+  - The 12 dispatch-path verifies are green.
+  - The one change in off mode is a fix: a scratch-test delete now uses `-LiteralPath`.
+- **Ready for the flip: NO.** N1 (below) plus the LA-run and provisioning items.
+
+## M-findings re-verified
+
+- **M1: FIXED for every check-time and pre-call swap, with one residual (N1).**
+  - The swap-before-the-call control is REFUSED (`r3race.ps1`).
+  - The builder's suite covers hooks and config planted while the coder runs, `.git` repointed, a cloned-pointer swap and a swapped root. Its hook/fsmonitor control proves plain `git -C` really executes the plant.
+  - Hardened argv: `core.hooksPath=NUL`, fsmonitor off, sshCommand, ext, pager.
+- **M2: FIXED.**
+  - The transcript and the result are read from one held handle; a link or a multi-link file is refused.
+  - The prompt is created exclusively; deletes sit behind `Test-FusedDirIntact`.
+  - My mutation `R-transcript-links-off` was KILLED.
+- **M3: FIXED** (`r3acl.ps1`). Inherit-only GENERIC_ALL and GENERIC_WRITE are now REFUSED, owners are checked, and the parent `C:\blarai-fleet` is in the checked set. The remainder is in N3.
+- **M4: FIXED.**
+  - `Stop-CoderLegTask` returns False when both the stop and the state query fail (reproduced).
+  - Cancellation is polled in the mutex wait and in the Running wait (suite lines 896-897; mutants killed).
+  - Provisioning writes the marker at step 8 and rollback removes it (code read; the offline test passes 35/0 against a temp path).
+- **L8: DOCUMENTED** (`docs/fused-leg-budgets.md`). It is still not registered in BlarAI; the doc names the registration path.
+
+## New findings
+
+### N1 — BLOCKS THE FLIP: check-then-use on a path string; a coder process that outlives the leg can still swap the worktree
+- `Get-WtGit` verifies the worktree, then returns a path string, and git opens that path later. `Assert-CoderLegTaskIdle` proves only that the scheduled task is not Running. It does not prove that no process owned by the coder account is alive.
+- A process the coder started in the background and that outlives the task's action process is not covered. Whether such a process survives the task's exit or stop is a hypothesis: I could not run the real task.
+- Reproduced (`r3det.ps1`, temp sandbox): verify, then swap the worktree for a junction, then run `git <hardened args> add -A`. The victim's file lands in the agent worktree's INDEX (`victim-file.txt = True`). The victim repo itself is untouched.
+- Consequence: files from any folder the operator can read get staged and committed into the agent branch, which the fleet can then merge.
+- A random 35 s flip race produced 31 passed calls and 391 refused, with no leak. The window is small but real.
+- Fix:
+  - after the leg, terminate and confirm the absence of every process owned by the coder SID, or run the leg in a job object with kill-on-close
+  - and/or give the coder no DELETE on the worktree root or FILE_DELETE_CHILD on the base, so the swap itself is impossible
+  - optionally, verify the work-tree identity again from inside git's own handle.
+
+### N2 — should-fix: the lint certifies more than it tests
+I applied these mutants in a temp copy, with a control that passed:
+- `git -C "$wt"` (quoted): **SURVIVED**
+- `git -C $Repo` inside `Restore-WorktreeToHead` / `Get-WorktreeDigest`, whose parameter is named `$Repo` but holds a worktree: **SURVIVED**
+- `Remove-Item -LiteralPath $wtOrig -Recurse -Force` in place of `Remove-WorktreeSafe`: **SURVIVED**
+- the plain raw `git -C $wt`: KILLED
+- an unguarded delete inside the fused function: KILLED
+
+The suite's claim "fails on a new unguarded use" holds only for the exact spellings `$wt`, `$wt_k`, `$Worktree`, `$wtOrig`, `$cand.Worktree`, `$__stale` written without quotes.
+
+### N3 — should-fix: fingerprint coverage is not locked
+- Removing `config.worktree` or `info\attributes` from `Get-GitDirFingerprint`: both **SURVIVED**.
+- Impact is low: `config.worktree` is read only when `extensions.worktreeConfig` is set in a fingerprinted config, and attributes can only select drivers that already exist. The global config does define `filter.lfs` (required), so attributes the coder controls can make operator-side `git add` run git-lfs on coder content. That is the trusted git-lfs binary, not arbitrary code, and it applies equally in off mode.
+- Separately, loose ACLs on FILES already inside the checked dirs are not examined (`child-file-loose` PASSED). Operator files are created exclusively, so this is a note.
+
+### N4 — note: `core.hooksPath=NUL` disables a control nobody uses today
+- No target repo under `C:\Users\mrbla\projects`, and agentic-setup itself, has a non-sample hook. BlarAI has a `post-commit` hook, but BlarAI is not a fleet target.
+- No `init.templateDir` is set, and gitleaks runs explicitly through `secret-scan.ps1` before the commit. So nothing live is lost.
+- But `install-gitleaks.ps1` recommends a gitleaks hook through `core.hooksPath`. If that is ever adopted, fused worktrees would skip it silently. Keep the explicit scan as the control of record.
+
+### N5 — note: unaudited consumers
+The doc says it plainly: critic, website review and battery helpers that open a worktree after a dispatch were not audited and do not call the funnels.
+
+## Mutation harness
+- Random 25 of the 110 non-probe mutants, picked with `System.Random(775)` (list in `r3-pick.txt`): **25/25 KILLED**, control passed, exit 0.
+- My own mutants of controls: transcript-links KILLED; fingerprint `config.worktree` and `info\attributes` SURVIVED (N3).
+- The builder's complete 117-mutant run was not repeated in full.
+
+## Suites at 6905e03 (pwsh 7, run by me)
+- verify-coder-fused-seam 614/0
+- verify-coder-provisioning 35/0
+- verify-git-capture-honesty 181 passed
+- verify-bestofn-concurrent 133/0
+- verify-bestofn 91/0
+- verify-breaker-reason 36/0
+- verify-stop-contract 29/0
+- verify-nochange-outcome 73
+- verify-coder-leg-quiesce 21/0
+- verify-coder-leg-wiring 12/0
+- verify-fleet-driver 37/0
+- verify-retry 52
+- verify-worktree-add-fail-loud passed
+
+## What still blocks the flip
+1. N1: no coder-SID process may survive the leg (kill and confirm, or a job object), and/or no DELETE on the worktree root for the coder.
+2. #1686: provisioning tightens `C:\blarai-fleet` (today Authenticated Users have Modify and the owner is Administrators). With the current ACL the leg refuses to run, which fails closed.
+3. #1678: the coder holds Modify on all of `C:\Users\mrbla\projects`, which includes the main repos' `.git` (refs, objects, config). Fingerprinting catches config and hooks but not refs or objects.
+4. Plan step 4: the coder's own opencode config, read grants, and the `:8099` probe.
+5. Egress: the #1682 persistent filter set, so `Assert-CoderEgressContained` throws instead of logging the accepted gap.
+6. LA-run provisioning, a real-mode `verify-coder-containment.ps1 -AcceptedEgressGap` green, one watched fused dispatch, then the LA-present flip.
+7. N2 and N3 lock gaps (should-fix), and N5 consumers audited before any of them runs against a fused worktree.
+
+
+---
+
+# Round 4: fix/1691-n1-n3-n5 at HEAD (off agentic-setup main 39dc7e9)
+
+Tested the branch worktree `C:/Users/mrbla/agentic-wt-1691-n1`, HEAD = commit "the audit-log test reports a missing log as a failure". Constraints unchanged: no real task/account/ACL/firewall/provisioning changes; temp roots; pwsh 7 and 5.1; I spawned only my own harmless child processes (powershell, ping) for the job-object test, and created NO scheduled tasks. Probes in the scratchpad: `r4job.ps1`, `r4parser.ps1`, `r4race.ps1`, `r4det.ps1`, `r4-pick.txt`.
+
+## Verdict
+
+- **Merge into agentic-setup main with containment `off`: MERGE-READY.**
+- **Ready for the flip: NO** (list at the end; item 0 decides what N1 still needs).
+  - Off matches main: offdiff2 shows 0 differing lines between 39dc7e9 and HEAD across 15 manifest shapes, both ACP states.
+  - The job object, the pin, the quarantine and the strict parser are all reached only under `restricted_account`; `off` runs the historical path and no `state\fused-worktrees` folder exists in the live tree.
+  - 12 dispatch-path verifies green under pwsh 7; wiring green under 5.1.
+
+## The elevation story (NOT verified; the premise is probably wrong)
+- `shared/fleet/dispatch.py:394/440` launches run-fleet as `pwsh -NoProfile -NonInteractive -File` with no RunAs. That proves only that dispatch does not ADD elevation: run-fleet inherits whatever token the Assistant Orchestrator has.
+- The launcher requests elevation at start (`launcher/__main__.py:6`, `launcher/vm_manager.py:60 request_elevation`), and the only child it de-elevates is the WinUI surface (`launcher/orphan_guard.py:5`, `launcher/process_launch.py`). If the AO is a launcher child in host mode, it, and so run-fleet, probably runs ELEVATED.
+- I could not measure it: no launcher or AO process was running during this review. My own shell is elevated, so I could not test the non-elevated view directly either.
+- Consequence: the builder's stated premise "the AO launches run-fleet non-elevated" is unverified, and the code points the other way. That is not a fail-open: if run-fleet is elevated, the elevated defence-in-depth (`Stop-CoderProcessesConfirmed`, which enumerates every coder-SID process) runs, and that catches the WMI escape below. But the design doc and the suite's "non-elevated" framing describe a configuration that may not be the real one. Settle it with one live read of the AO process's token elevation before the flip.
+- Reasoned, not run: a non-elevated operator token cannot open another account's processes, so `GetOwnerSid` and termination fail. The code handles this by returning `$null` and leaning on the job object.
+
+## Job object (my own harness, `r4job.ps1`)
+- KILL_ON_JOB_CLOSE (0x2000) is set; no BREAKAWAY bit (0x800/0x1000) is set.
+- A process started in the job with a child and a grandchild (`ping -n 60`): the grandchild is IN the job; closing the handle kills the whole tree (survivors = none).
+- `Start-Process`/ShellExecute child: joined the job, killed with it.
+- **WMI `Win32_Process.Create` ESCAPES the job** — the spawned process is a child of WmiPrvSE, outside the job, and survived `Close-CoderJob`. Reproduced. A standard user (the coder) can call it.
+- `schtasks` vector: SKIPPED per instruction (no scheduled tasks created); by the same mechanism (spawned by the Schedule service) it would also escape.
+- The "children did not join when the runner assigns ITSELF" finding is real and correctly avoided: the code starts the coder process suspended, assigns it, then resumes, so descendants are born inside the job. Nested jobs (the task's own job on Win8+) are allowed and did not block assignment here.
+
+## What the WMI/schtasks escape means
+The runner's `Stop-CoderJobProcesses` queries only the job's own pids, so **`job_zero_confirmed=true` can be reported honestly while a coder process spawned via WMI/schtasks is still alive.** The design does not rest correctness on that field (the builder demoted it to diagnostic). The real N1 lock is the **held directory pin** (`Lock-FusedWorktree`/`Open-PinnedDirectory`): an open handle on the worktree's `.git` with no delete-sharing, kept in `$script:FusedLocks` across every operator-side use. With it held, no process — job-contained or not — can rename, delete or swap the worktree or an ancestor.
+
+## N1 race, re-run against HEAD
+- `r4race.ps1` (35 s random flip): 173 git calls passed the check, 0 refused, nothing staged in the victim repo.
+- `r4det.ps1` (deterministic swap right after the funnel check): the swap itself is now **Access denied** — the pin blocks it. In round 3 this exact sequence leaked `victim-file.txt` into the agent index; at HEAD it cannot.
+
+## Quarantine (code + suite)
+- The marker lives in the operator-only `state\fused-worktrees`, not in coder-writable `C:\blarai-fleet`, so the coder cannot forge or clear it; a write that cannot persist still quarantines in-process and throws (never fails open).
+- `Clear-FusedQuarantine` requires a non-blank `-ClearedBy` and appends to `quarantine-cleared.log`; clearing without a name throws.
+- The suite proves a quarantined worktree is refused by every sibling route (git, run-command, file write, worktree-remove, re-register, best-of-N sibling), and that re-registering or removing does NOT clear it.
+
+## job_zero_confirmed demotion (suite)
+A dispatch result without the fact is refused even for an elevated operator; a result claiming zero while the task is Running, or from the wrong SID, or a survivor the elevated enumeration finds, still quarantines. The field cannot override a live task or a survivor.
+
+## Strict parser (my 20 inputs, `r4parser.ps1`, plus the builder's 36)
+18 of my 20 decidable inputs matched the intended verdict; the 2 lone-surrogate cases are a note (N6). Confirmed rejected: nested and case-insensitive duplicate keys, UTF-16 (LE/BE) and UTF-32 BOMs, 1e400 overflow, nesting 40, NUL and literal control chars in strings, leading zero, `+1`, NaN, trailing comma, bare word, overlong/invalid UTF-8. Confirmed accepted: UTF-8 BOM, a 30-digit integer, nesting 30. The builder's 36-input table re-ran clean inside the suite.
+
+## Future-dated result + clock skew
+Covered in the suite (a result created after the read-back window / future-dated is refused). I did not find a separate wall-clock-skew knob; the check is creation-time vs the enqueue instant on the same clock, so a machine-wide skew moves both together and does not open a window. Note N7.
+
+## New findings
+- **N6 — note:** `\ud800` / `\udc00` lone surrogates in a JSON string are accepted (appended as-is). Bounded text, no code path; worth rejecting unpaired surrogates for completeness.
+- **N7 — note:** the result `NotBefore` check compares the file's creation time to the enqueue time on one clock. A coder that pre-creates the result file a moment after its job is enqueued (same second) is caught by the owner+id+kind binding, not by time; time is a secondary signal, which the code acknowledges.
+
+## Residual risk (for the flip, not the merge)
+With containment ON, a coder process that escapes the job via WMI/schtasks and outlives the leg can still (a) modify file CONTENTS inside the pinned worktree and in `C:\blarai-fleet`, and (b) use network egress (the accepted Bitdefender gap). The pin stops the dangerous directory/ancestor SWAP (the confused-deputy git redirect), and the quarantine fires whenever the operator cannot positively confirm the tree is drained — but on the non-elevated path "drained" is the job's own count, which a WMI escape evades. So the honest statement is: the swap-to-another-repo escalation is closed; an in-place content edit by a surviving escaped process between the gate and the merge is not provably excluded on the non-elevated path.
+
+## Suites at HEAD (pwsh 7, run by me)
+verify-coder-fused-seam 985/0; provisioning 42/0; git-capture-honesty 181; bestofn-concurrent 133/0; bestofn 91/0; breaker-reason 36/0; stop-contract 29/0; nochange-outcome 73; coder-leg-quiesce 21/0; coder-leg-wiring 14/0 (and 14/0 under PS 5.1); fleet-driver 37/0; retry 52; worktree-add-fail-loud passed.
+Random 30 mutants, seed `System.Random(1691)` (pool 180; list in `r4-pick.txt`): **30/30 KILLED**, control passed, SURVIVED/ERROR = 0, exit 0.
+
+## Flip-blocker list
+0. **Measure the AO's real token elevation** (one live read). It decides which half of N1 applies: elevated means the coder-SID enumeration catches WMI-escaped processes; non-elevated means item 1 is open.
+1. **Residual N1 on the non-elevated path:** a WMI/schtasks-escaped coder process is not counted by `job_zero_confirmed` and cannot be enumerated non-elevated. Options: run the coder-leg task with an elevated confirmer that enumerates the coder SID, deny the coder WMI/Task-Scheduler process-create (per-user WMI namespace ACL / `Deny` on schtasks), or keep the pin held through merge and re-verify the tree digest immediately before merge.
+2. #1686: provisioning tightens `C:\blarai-fleet` (today Authenticated Users Modify) — until then the leg refuses to run (fail-closed).
+3. #1678: the coder holds Modify on all of `C:\Users\mrbla\projects`, including each repo's `.git` refs/objects (fingerprint catches config + hooks, not refs/objects).
+4. Plan step 4: coder's own opencode config, read grants, `:8099` probe.
+5. #1682 persistent egress filters, so `Assert-CoderEgressContained` throws instead of logging the accepted gap.
+6. LA-run provisioning, real-mode `verify-coder-containment.ps1 -AcceptedEgressGap` green, one watched fused dispatch, then the LA-present flip.
+7. N6/N7 notes (optional hardening).

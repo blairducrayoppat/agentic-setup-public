@@ -49,7 +49,7 @@ try {
     Assert-Eq 'probe' $claim.Job.kind 'claimed job carries its kind'
     $again = Get-NextCoderLegJob
     Assert-True ($null -eq $again) 'a claimed job is NOT re-claimable (atomic claim)'
-    [void](Write-CoderLegResult -Result @{ id = $claim.Job.id; kind = 'probe'; ok = $true } -ClaimPath $claim.ClaimPath)
+    [void](Write-CoderLegResult -Result @{ id = $claim.Job.id; kind = 'probe'; ok = $true; ran_as_sid = 'S-1-5-21-1'; ran_as_user = 'u'; error = '' } -ClaimPath $claim.ClaimPath)
     $r = Wait-CoderLegResult -JobId $claim.Job.id -TimeoutSec 5
     Assert-True ($r -and $r.ok) 'result polls back'
     $r2 = Wait-CoderLegResult -JobId $claim.Job.id -TimeoutSec 2
@@ -70,11 +70,16 @@ try {
     New-Item -ItemType Directory -Force $tmpRoot | Out-Null
     Set-Content -Path $tmpCfg -Encoding UTF8 -Value '{ "driver": "acp", "containment": "off", "acp": { "python": "", "idle_sec": 120, "max_steps": 45, "spin_steps": 10 } }'
     $env:BLARAI_FLEET_DRIVER_CONFIG = $tmpCfg
-    $promptFile = Join-Path $tmpRoot 'p.txt'
+    # the paths a job names are the ones the operator generates, in the places it generates them
+    $djidWant = New-CoderLegJobId
+    Initialize-CoderLegQueue
+    $wtBase = Join-Path $tmpRoot 'worktrees'; New-Item -ItemType Directory -Force (Join-Path $wtBase 'w') | Out-Null
+    $env:BLARAI_CODER_LEG_WORKTREE_BASE = $wtBase
+    $promptFile = Join-Path (Get-CoderLegPaths).Prompts "$djidWant.prompt.txt"
     Set-Content -Path $promptFile -Value 'implement rpn.py' -Encoding UTF8
     $djid = Add-CoderLegJob -Job @{
-        kind = 'dispatch'; workdir = $tmpRoot; model = 'local/coder-30b'; prompt_file = $promptFile
-        log_path = (Join-Path $tmpRoot 'run.log'); timeout_sec = 60; idle_sec = 120; max_steps = 45; spin_steps = 10
+        id = $djidWant; kind = 'dispatch'; workdir = (Join-Path $wtBase 'w'); model = 'local/coder-30b'; prompt_file = $promptFile
+        log_path = (Join-Path (Get-CoderLegPaths).Logs "$djidWant.log"); timeout_sec = 60; idle_sec = 120; max_steps = 45; spin_steps = 10
     }
     & "$PSScriptRoot\coder-leg-run.ps1" | Out-Null
     $dres = Wait-CoderLegResult -JobId $djid -TimeoutSec 30
@@ -82,10 +87,13 @@ try {
     Assert-Eq 'dispatch' ([string]$dres.kind) 'result carries kind=dispatch'
     Assert-False ([bool]$dres.ok) 'dispatch fell back (ok=$false) under the forced-dormant config (no opencode spawned)'
     Assert-True ([bool]$dres.ran_as_sid) 'result records the SID it ran as (the containment audit field)'
+    Assert-True ($dres.job_zero_confirmed -is [bool] -and $dres.job_zero_confirmed) 'the dispatch result carries job_zero_confirmed=true (the runner drained its kill-on-close job)'
+    Assert-Eq 0 $dres.job_active 'and no process remained in the job'
 }
 finally {
     Remove-Item Env:\BLARAI_CODER_LEG_ROOT -ErrorAction SilentlyContinue
     Remove-Item Env:\BLARAI_FLEET_DRIVER_CONFIG -ErrorAction SilentlyContinue
+    Remove-Item Env:\BLARAI_CODER_LEG_WORKTREE_BASE -ErrorAction SilentlyContinue
     if ($tmpRoot -like '*\Temp\acp01-leg-*') { Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 

@@ -148,11 +148,11 @@ $Report = Join-Path $ReportDir "$repoName-$Task-$(Get-Date -Format 'yyyyMMdd-HHm
 
 # Idempotent: clear any worktree/branch left by a PRIOR run of THIS exact task so
 # re-runs do not collide. (Parked work from OTHER task names is untouched.)
-if (Test-Path $wt) { git -C $Repo worktree remove $wt --force 2>&1 | Out-Null }
+if (Test-Path $wt) { Remove-WorktreeSafe -Repo $Repo -Path $wt }
 # #695: also reap stale CONCURRENT-candidate worktrees/branches ("<repo>-<task>-cK") left by a CRASHED prior
 # run of THIS exact task, so a re-run starts clean. (Parked work from OTHER task names is untouched.)
 foreach ($__stale in @(git -C $Repo worktree list --porcelain 2>$null | Where-Object { $_ -like 'worktree *' } | ForEach-Object { ($_ -replace '^worktree\s+', '').Trim() })) {
-    if ((Split-Path $__stale -Leaf) -like "$repoName-$Task-c*") { git -C $Repo worktree remove $__stale --force 2>&1 | Out-Null }
+    if ((Split-Path $__stale -Leaf) -like "$repoName-$Task-c*") { Remove-WorktreeSafe -Repo $Repo -Path $__stale }
 }
 git -C $Repo worktree prune 2>&1 | Out-Null
 # PRESERVE THE PARKED BRANCH INSTEAD OF DESTROYING IT (#1277).
@@ -205,6 +205,7 @@ if ($LASTEXITCODE -ne 0) {
     if (-not $__wtWhy) { $__wtWhy = "git exited $LASTEXITCODE with no output" }
     throw "Could not create the isolated workspace at $wt (branch '$branch'). git said: $__wtWhy"
 }
+Unregister-FusedWorktree $wt   # a fresh worktree has no pre-run record from an earlier run of the same name
 # C1 SCAFFOLD SEEDING (#670): seed a known-good skeleton into a FRESH target so the coder EXTENDS a
 # compiling project instead of hand-authoring boilerplate (where a small model trips on e.g. the
 # WinUI `using Microsoft.UI.Xaml;` -> CS0246). Only when the worktree has NO project yet (never
@@ -434,7 +435,7 @@ if ($Concurrency -gt 1) {
                 $meta = @{}
                 foreach ($k in $idxs) {
                     $wt_k = "$wtOrig-c$k"; $br_k = "agent/$Task-c$k"
-                    if (Test-Path $wt_k) { git -C $Repo worktree remove $wt_k --force 2>&1 | Out-Null }
+                    if (Test-Path $wt_k) { Remove-WorktreeSafe -Repo $Repo -Path $wt_k }
                     git -C $Repo branch -D $br_k 2>&1 | Out-Null
                     # #1076: this creation was TOTALLY silent -- output to Out-Null and no exit-code check
                     # at all -- so a candidate whose worktree never appeared went on to "build" in a
@@ -450,6 +451,7 @@ if ($Concurrency -gt 1) {
                         if (-not $__cWhy) { $__cWhy = "git exited $LASTEXITCODE with no output" }
                         Write-Host "  [warn] candidate $k's workspace was NOT created at $wt_k. git said: $__cWhy" -ForegroundColor Yellow
                     }
+                    Unregister-FusedWorktree $wt_k
                     $meta[$k] = @{ wt = $wt_k; branch = $br_k; prompt = (Add-CandidateDiversity -Prompt $Prompt -Index $k -Total $n); log = ($Report -replace '\.txt$', ".c$k.agent.log") }
                 }
                 # 2) Launch C concurrent Start-Job CHILD PROCESSES (separate processes -> isolated
@@ -490,7 +492,7 @@ if ($Concurrency -gt 1) {
         # reap any candidate worktrees this run created, restore the baseline holder as the working tree.
         foreach ($k in 1..$MaxVerifyAttempts) {
             $wt_k = "$wtOrig-c$k"
-            if (Test-Path $wt_k) { git -C $Repo worktree remove $wt_k --force 2>&1 | Out-Null }
+            if (Test-Path $wt_k) { Remove-WorktreeSafe -Repo $Repo -Path $wt_k }
             git -C $Repo branch -D "agent/$Task-c$k" 2>&1 | Out-Null
         }
         git -C $Repo worktree prune 2>&1 | Out-Null
@@ -549,12 +551,12 @@ if ($usedConcurrent -and $sel -and $sel.Worktree) {
     }
     foreach ($cand in $bon.Candidates) {
         if ($cand.Worktree -and ($cand.Worktree -ne $wt)) {
-            git -C $Repo worktree remove $cand.Worktree --force 2>&1 | Out-Null
+            Remove-WorktreeSafe -Repo $Repo -Path $cand.Worktree
             if ($cand.Branch) { git -C $Repo branch -D $cand.Branch 2>&1 | Out-Null }
         }
     }
     if ((Test-Path $wtOrig) -and ($wtOrig -ne $wt)) {
-        git -C $Repo worktree remove $wtOrig --force 2>&1 | Out-Null
+        Remove-WorktreeSafe -Repo $Repo -Path $wtOrig
         git -C $Repo branch -D $brOrig 2>&1 | Out-Null   # the seed-only holder branch (an ancestor of the winner)
     }
     git -C $Repo worktree prune 2>&1 | Out-Null
@@ -567,10 +569,10 @@ if (-not $sel) {
               Anomaly=@{ Anomalies=@(); LoopSuspected=$false }; BuildAttempts=0; TestError=''; VerifyDetail=''; VerifyError=''; AgentLog=($Report -replace '\.txt$', '.agent.log') }
 }
 if (-not $secretStop -and $sel.SHA) {
-    $__head = "$(git -C $wt rev-parse HEAD 2>$null)".Trim()
+    $__head = "$(git @(Get-WtGit $wt) rev-parse HEAD 2>$null)".Trim()
     if ($__head -ne $sel.SHA) {
-        git -C $wt reset --hard $sel.SHA 2>&1 | Out-Null   # restore the selected candidate (reflog-reachable)
-        git -C $wt clean -fd 2>&1 | Out-Null
+        git @(Get-WtGit $wt) reset --hard $sel.SHA 2>&1 | Out-Null   # restore the selected candidate (reflog-reachable)
+        Clear-WorktreeUntracked -Worktree $wt
     }
 }
 if ($bon.Count -gt 1) {
@@ -699,8 +701,8 @@ while ($hasChanges -and -not $dispatchCancelled -and -not $gitFailed -and (Test-
     # an untracked Tests/ dir), leaving an un-buildable parked tree over a buildable commit.
     # Re-gathered EVERY pass: a review-FIX lap changes the tree, so the diff must be fresh.
     $revRange = Resolve-CriticRange -Repo $wt -Base $BaseBranch
-    $revStat  = if ($revRange) { (git -C $wt diff $revRange --stat 2>$null) -join "`n" } else { '' }
-    $revDiff  = if ($revRange) { (git -C $wt diff $revRange 2>$null) -join "`n" } else { '' }
+    $revStat  = if ($revRange) { (git @(Get-WtGit $wt) diff $revRange --stat 2>$null) -join "`n" } else { '' }
+    $revDiff  = if ($revRange) { (git @(Get-WtGit $wt) diff $revRange 2>$null) -join "`n" } else { '' }
     $MaxRevDiffChars = 8000
     if ($revDiff -and $revDiff.Length -gt $MaxRevDiffChars) {
         $revDiff = $revDiff.Substring(0, $MaxRevDiffChars) +
@@ -884,6 +886,7 @@ $_critiqueActive = $merged -and $_enableCritique -and `
 if ($_critiqueActive) {
     try {
         Write-Host "[6/6] VLM design critique (post-merge, non-blocking)..." -ForegroundColor Cyan
+        $null = Assert-OperatorWorktree -Path $wt   # the critique reads and runs the worktree: it must be the one the coder was given
         # Load the two functions. The throwaway args satisfy the script's Mandatory params; the
         # script's own dot-source guard ($MyInvocation.InvocationName -eq '.') skips the one-pass body.
         . "$PSScriptRoot\critique-loop.ps1" -AppDir 'x' -Goal 'x' -VisualCriteriaJson '[]' -BlarAiRepo 'x' 2>$null
@@ -913,20 +916,20 @@ if ($_critiqueActive) {
                     # Reuse the EXACT [1/5] machinery: Invoke-BuildWithRetry wrapping Invoke-AgentRun,
                     # with the same no-op retry + clean-reset-between-retries semantics.
                     $b = Invoke-BuildWithRetry -MaxBuildAttempts $MaxBuildAttempts `
-                        -ResetWorktree { git -C $wt reset --hard HEAD 2>&1 | Out-Null; git -C $wt clean -fd 2>&1 | Out-Null } `
+                        -ResetWorktree { git @(Get-WtGit $wt) reset --hard HEAD 2>&1 | Out-Null; Clear-WorktreeUntracked -Worktree $wt } `
                         -RunAgent { Invoke-AgentRun -WorkDir $wt -Model $Model -Prompt $fixPrompt -LogPath $fixLog -TimeoutSec ($MaxRunMinutes * 60) -JsonStepCap } `
-                        -ProducedChanges { (@(git -C $wt status --porcelain 2>$null).Count -gt 0) -or (([int](git -C $wt rev-list --count "$branch..HEAD" 2>$null)) -gt 0) }
+                        -ProducedChanges { (@(git @(Get-WtGit $wt) status --porcelain 2>$null).Count -gt 0) -or (([int](git @(Get-WtGit $wt) rev-list --count "$branch..HEAD" 2>$null)) -gt 0) }
                     $b.Run
                 } `
                 -CommitFix {
                     # Stage + secret-scan + commit on the agent branch (reuse the same secret-scan.ps1).
                     # A detected secret means NO commit (return $false -> the FIX aborts, prior kept).
-                    git -C $wt add -A 2>&1 | Out-Null
+                    git @(Get-WtGit $wt) add -A 2>&1 | Out-Null
                     $sec = & "$PSScriptRoot\secret-scan.ps1" -Repo $wt
-                    if ($sec -and $sec.status -eq 'blocked') { git -C $wt reset 2>&1 | Out-Null; return $false }
-                    $before = (git -C $wt rev-parse HEAD 2>$null)
-                    git -C $wt -c user.email='agent@local' -c user.name='coding-agent' commit -m "agent: $Task (visual fix $($script:fixCount + 1))" 2>&1 | Out-Null
-                    $after = (git -C $wt rev-parse HEAD 2>$null)
+                    if ($sec -and $sec.status -eq 'blocked') { git @(Get-WtGit $wt) reset 2>&1 | Out-Null; return $false }
+                    $before = (git @(Get-WtGit $wt) rev-parse HEAD 2>$null)
+                    git @(Get-WtGit $wt) -c user.email='agent@local' -c user.name='coding-agent' commit -m "agent: $Task (visual fix $($script:fixCount + 1))" 2>&1 | Out-Null
+                    $after = (git @(Get-WtGit $wt) rev-parse HEAD 2>$null)
                     return ("$before".Trim() -ne "$after".Trim())   # a NEW commit landed?
                 } `
                 -Verify {
@@ -1004,7 +1007,7 @@ if ($_critiqueActive) {
 # critique has finished capturing the built App.exe from it. Idempotent + best-effort —
 # identical to the pre-hook behavior for the common (no-critique) path.
 if ($merged) {
-    git -C $Repo worktree remove $wt --force 2>&1 | Out-Null
+    Remove-WorktreeSafe -Repo $Repo -Path $wt
     git -C $Repo branch -d $branch 2>&1 | Out-Null
 }
 
