@@ -110,3 +110,29 @@ function Get-ContainmentVerdict {
         EgressWarned = $egressWarned
     }
 }
+
+function Get-CoderProvisionMarkerPath {
+    # SSOT: the file provisioning leaves behind to say "containment is expected on this machine". The
+    # orchestrator (fleet-lib.ps1 Test-CoderContainmentExpected) reads it, so an unreadable fleet-driver
+    # manifest refuses the coder even when the scheduled task is gone. verify-coder-provisioning.ps1 holds
+    # this default and the reader's default together.
+    'C:\blarai-fleet\coder-provisioned.marker'
+}
+
+function Write-CoderProvisionMarker {
+    # Atomically write the provisioning marker (temp + move). Returns the path.
+    param([string]$Path = (Get-CoderProvisionMarkerPath), [string]$CoderUser = 'blarai-coder', [string]$CoderSid = '')
+    $dir = Split-Path $Path -Parent
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+    $body = [ordered]@{ provisioned_utc = (Get-Date).ToUniversalTime().ToString('o'); coder_user = $CoderUser; coder_sid = $CoderSid }
+    $tmp = "$Path.tmp"
+    ($body | ConvertTo-Json) | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop
+    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    return $Path
+}
+
+function Remove-CoderProvisionMarker {
+    param([string]$Path = (Get-CoderProvisionMarkerPath))
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction Stop; return $true }
+    return $false
+}

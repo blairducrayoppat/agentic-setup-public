@@ -1,0 +1,14 @@
+{
+  "opencode_package_dir": "C:/Users/mrbla/AppData/Roaming/npm/node_modules/opencode-ai",
+  "opencode_shim_dir": "C:/Users/mrbla/AppData/Roaming/npm",
+  "opencode_plugin_package": "@opencode-ai/plugin",
+  "opencode_plugin_version": "1.17.3",
+  "machine_exes": {
+    "node": "C:/Program Files/nodejs/node.exe",
+    "git": "C:/Program Files/Git/cmd/git.exe",
+    "git_bash": "C:/Program Files/Git/bin/bash.exe",
+    "python": "C:/Python314/python.exe"
+  },
+  "docset_dir_relative": "models/docsets",
+  "note": "The restricted coder account (containment = restricted_account) runs the coder tool chain without any access to the operator's profile beyond the folders listed here. READ by: scripts/coder-setup-lib.ps1 (the grant list, the coder-owned opencode config), scripts/provision-coder-setup.ps1 (applies it), scripts/coder-leg-run.ps1 (puts opencode_shim_dir on the coder's PATH for a dispatch job), scripts/verify-coder-containment.ps1 (the toolchain probe). Never read by the containment=off path. opencode_package_dir gets inheritable read-and-run (the compiled opencode.exe lives in it); opencode_shim_dir gets read-and-run on the FOLDER ONLY, so the coder can list the shim names and read nothing else in the operator's npm tree. machine_exes are machine-wide installs the coder must be able to RUN (the probe runs each with --version; a path here is never granted, only checked). docset_dir_relative is under the BlarAI root and holds the hash-pinned offline docset the research lookup reads. A path that moves is edited HERE, once; the grants, the PATH prefix and the probe all follow."
+}

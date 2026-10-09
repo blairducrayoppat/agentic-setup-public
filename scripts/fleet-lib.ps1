@@ -21,6 +21,7 @@ function Invoke-WithTimeout {
         [string]$WorkDir = (Get-Location).Path,
         [int]$TimeoutSec = 600
     )
+    $null = Assert-OperatorWorktree -Path $WorkDir   # a worktree the coder ran in must be the one it was
     $outFile = [System.IO.Path]::GetTempFileName()
     $errFile = [System.IO.Path]::GetTempFileName()
     # Empty stdin (#695): when this runs INSIDE a console-less Start-Job child (best-of-N CONCURRENCY), a
@@ -766,7 +767,10 @@ function Invoke-AcpCoderRun {
         [int]$TimeoutSec = 3600,
         [int]$IdleTimeoutSec = 600,
         [int]$MaxSteps = 45,
-        [int]$SpinSteps = 10
+        [int]$SpinSteps = 10,
+        # the coder-leg runner passes the kill-on-close job object the coder tree must live in; $null (every
+        # other caller) is the historical Start-Process
+        $Job = $null
     )
     $py = $Acp.python
     if (-not $py -or -not (Test-Path $py)) {
@@ -807,7 +811,8 @@ function Invoke-AcpCoderRun {
         # A generous outer ceiling: the client enforces its OWN idle/step/overall bounds and tree-kills;
         # this WaitForExit is only a backstop against a wedged interpreter that never writes the envelope.
         $outerSec = [int]($TimeoutSec + 300)
-        $p = Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $blarRoot -PassThru -NoNewWindow -ErrorAction Stop
+        if ($Job) { $p = Start-ProcessInJob -Job $Job -FilePath $py -ArgumentList $argList -WorkingDirectory $blarRoot }
+        else { $p = Start-Process -FilePath $py -ArgumentList $argList -WorkingDirectory $blarRoot -PassThru -NoNewWindow -ErrorAction Stop }
         $null = $p.Handle
         if (-not $p.WaitForExit($outerSec * 1000)) {
             try { & taskkill.exe /PID $p.Id /T /F *> $null } catch {}
@@ -907,6 +912,314 @@ function Resolve-CoderFinalPath {
     return $cur
 }
 
+function Assert-FusedPathIntact {
+    # Immediately before an operator-side use of a path the coder could touch: re-resolve it (no links,
+    # every component present) and require the SAME on-disk identity it had before the coder ran.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedKey, [string]$What = 'path')
+    $final = Resolve-CoderFinalPath -Path $Path -What $What
+    $id = Get-FileIdentity -Path $final
+    if ($id.Reparse) { throw "fused leg: $What '$Path' is now a link (reparse point)." }
+    if ($id.Key -cne $ExpectedKey) { throw "fused leg: $What '$Path' is not the object it was before the coder ran (identity $($id.Key), expected $ExpectedKey): it was replaced." }
+    return $final
+}
+
+function Get-FusedWorktreeGitDir {
+    # The worktree's OWN git directory, read from its .git pointer file. Refuses a worktree whose .git is
+    # not a pointer file (a directory under the worktree is coder-writable: hooks and config in it would run
+    # on the operator side) or whose pointer does not name an existing directory.
+    param([Parameter(Mandatory)][string]$WorkTree)
+    $dotGit = Join-Path $WorkTree '.git'
+    if (-not (Test-Path -LiteralPath $dotGit -PathType Leaf)) { throw "fused leg: '$WorkTree' is not a linked git worktree ('.git' is missing or is a directory)." }
+    $line = (Get-Content -LiteralPath $dotGit -TotalCount 1 -ErrorAction Stop)
+    if ("$line" -notmatch '^gitdir:\s*(.+?)\s*$') { throw "fused leg: '$dotGit' does not hold a gitdir pointer." }
+    $gd = $Matches[1]
+    if (-not [IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $WorkTree $gd }
+    $gd = [IO.Path]::GetFullPath($gd)
+    if (-not (Test-Path -LiteralPath $gd -PathType Container)) { throw "fused leg: the gitdir '$gd' named by '$dotGit' does not exist." }
+    return $gd
+}
+
+function Get-FusedWorktreeStateDir {
+    # Where the pre-run record of each fused worktree lives: the operator-side state dir of this
+    # checkout (the coder account cannot write there). BLARAI_FUSED_WT_STATE overrides it for offline tests.
+    if ($env:BLARAI_FUSED_WT_STATE) { return $env:BLARAI_FUSED_WT_STATE }
+    return (Join-Path (Split-Path $PSScriptRoot -Parent) 'state\fused-worktrees')
+}
+
+function Get-FusedWorktreeRecordPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $norm = [IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    $sha = [Security.Cryptography.SHA1]::Create()
+    try { $h = ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($norm)) | ForEach-Object { $_.ToString('x2') }) -join '' } finally { $sha.Dispose() }
+    return (Join-Path (Get-FusedWorktreeStateDir) "$h.json")
+}
+
+function Get-GitDirFingerprint {
+    # A hash of everything in a worktree's gitdir (and its common dir) that git EXECUTES or obeys on the
+    # operator side: config, config.worktree, the commondir and gitdir pointers, info/attributes, and the
+    # name and content of every file under hooks/. A coder with write access to any of them (a planted
+    # core.fsmonitor / filter / textconv / sshCommand setting, a hook) changes this value.
+    param([Parameter(Mandatory)][string]$GitDir)
+    $dirs = @($GitDir)
+    $cd = Join-Path $GitDir 'commondir'
+    if (Test-Path -LiteralPath $cd -PathType Leaf) {
+        $rel = (Get-Content -LiteralPath $cd -TotalCount 1).Trim()
+        $common = if ([IO.Path]::IsPathRooted($rel)) { $rel } else { Join-Path $GitDir $rel }
+        $dirs += [IO.Path]::GetFullPath($common)
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $ms = New-Object IO.MemoryStream
+    try {
+        foreach ($d in $dirs) {
+            $files = @()
+            foreach ($n in 'config', 'config.worktree', 'commondir', 'gitdir', 'info\attributes') {
+                $f = Join-Path $d $n; if (Test-Path -LiteralPath $f -PathType Leaf) { $files += $f }
+            }
+            $hk = Join-Path $d 'hooks'
+            if (Test-Path -LiteralPath $hk -PathType Container) { $files += @(Get-ChildItem -LiteralPath $hk -Recurse -File -Force | ForEach-Object { $_.FullName }) }
+            foreach ($f in ($files | Sort-Object)) {
+                $nb = [Text.Encoding]::UTF8.GetBytes($f.Substring($d.Length).ToLowerInvariant() + '|')
+                $ms.Write($nb, 0, $nb.Length)
+                $bytes = [IO.File]::ReadAllBytes($f); $ms.Write($bytes, 0, $bytes.Length)
+            }
+            $sep = [Text.Encoding]::UTF8.GetBytes('#dir#'); $ms.Write($sep, 0, $sep.Length)
+        }
+        $ms.Position = 0
+        return (($sha.ComputeHash($ms) | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally { $ms.Dispose(); $sha.Dispose() }
+}
+
+function Get-HardenedGitArgs {
+    # The pinned, hardened git argv prefix for an operator-side call in a directory the coder could write.
+    # GIT_DIR / work tree are named explicitly from the pre-resolved paths; hooks are switched off, the
+    # filesystem monitor, ssh command and ext transport are neutralised on the command line (which outranks
+    # every config file), no pager, no optional locks. System and global config are operator-owned and not
+    # writable by the coder account, so they are left alone; the repository-level files are covered by
+    # Get-GitDirFingerprint.
+    param([Parameter(Mandatory)][string]$GitDir, [Parameter(Mandatory)][string]$WorkTree)
+    return @("--git-dir=$GitDir", "--work-tree=$WorkTree", '--no-optional-locks', '--no-pager',
+             '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'core.sshCommand=false',
+             '-c', 'protocol.ext.allow=never', '-c', 'core.pager=cat')
+}
+
+function Get-FusedQuarantinePath {
+    param([Parameter(Mandatory)][string]$Path)
+    return ((Get-FusedWorktreeRecordPath $Path) -replace '\.json$', '.quarantine.json')
+}
+
+function Set-FusedWorktreeQuarantine {
+    # Mark a worktree as unusable by operator-side git and file operations: a process of the coder account may
+    # still be alive in it. The marker lives in the operator-only state dir and is cleared ONLY by a human
+    # (Clear-FusedQuarantine -ClearedBy <name>): removing the worktree, a retry or a re-recording never clears it.
+    # It is also remembered in this process, and the write is read back: a marker that could not be persisted
+    # still quarantines for the life of the process and makes the caller throw. Never fails open.
+    param([Parameter(Mandatory)][string]$Path, [string]$Reason = '')
+    if (-not $script:FusedQuarantineMem) { $script:FusedQuarantineMem = @{} }
+    $script:FusedQuarantineMem[[IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()] = $Reason
+    New-Item -ItemType Directory -Force (Get-FusedWorktreeStateDir) | Out-Null
+    $q = Get-FusedQuarantinePath $Path
+    (@{ Path = $Path; Reason = $Reason; RequiresHuman = $true; At = (Get-Date).ToString('o') } | ConvertTo-Json) | Set-Content -LiteralPath $q -Encoding UTF8
+    if (-not (Test-Path -LiteralPath $q)) { throw "fused leg: the quarantine marker for '$Path' could not be persisted; the worktree is quarantined for this process only." }
+}
+
+function Clear-FusedQuarantine {
+    # The ONLY way out of a quarantine. A human states who cleared it; the action is appended to an audit log in
+    # the same operator-only directory. Run it only after checking that no process of the coder account is alive.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ClearedBy)
+    if (-not "$ClearedBy".Trim()) { throw 'Clear-FusedQuarantine needs -ClearedBy (who verified the coder account has no live process).' }
+    $q = Get-FusedQuarantinePath $Path
+    if ($script:FusedQuarantineMem) { $script:FusedQuarantineMem.Remove([IO.Path]::GetFullPath($Path).TrimEnd('').ToLowerInvariant()) }
+    if (-not (Test-Path -LiteralPath $q)) { return $false }
+    Add-Content -LiteralPath (Join-Path (Get-FusedWorktreeStateDir) 'quarantine-cleared.log') -Value ("{0} | {1} | cleared by {2}" -f (Get-Date).ToString('o'), $Path, $ClearedBy)
+    Remove-Item -LiteralPath $q -Force
+    return $true
+}
+
+function Test-FusedWorktreeQuarantined {
+    param([Parameter(Mandatory)][string]$Path)
+    # remembered in this process even if the marker file is later deleted or never persisted
+    if ($script:FusedQuarantineMem -and $script:FusedQuarantineMem.ContainsKey([IO.Path]::GetFullPath($Path).TrimEnd('').ToLowerInvariant())) { return $true }
+    $dir = Get-FusedWorktreeStateDir
+    if (-not (Test-Path -LiteralPath $dir)) { return $false }
+    return (Test-Path -LiteralPath (Get-FusedQuarantinePath $Path))
+}
+
+function Lock-FusedWorktree {
+    # Pin the worktree directory for the operator: open it once (link refused, no FILE_SHARE_DELETE), compare
+    # the HANDLE's file id and resolved path to the pre-run record, and keep it open. While held, no process
+    # can rename, delete or replace the worktree root or any ancestor, so the path string handed to git
+    # cannot be swapped between the check and git's open. Idempotent. Returns the handle-resolved path.
+    param([Parameter(Mandatory)]$Record)
+    if (-not $script:FusedLocks) { $script:FusedLocks = @{} }
+    $k = [IO.Path]::GetFullPath($Record.Path).TrimEnd('\').ToLowerInvariant()
+    $held = $script:FusedLocks[$k]
+    if ($held) {
+        if (([BlarFusedFileId]::QueryHandle($held.Handle) -split '\|')[0] -ceq $Record.Key) { return $held.Final }
+        Unlock-FusedWorktree -Path $Record.Path
+    }
+    $pin = $null
+    try { $pin = Open-PinnedDirectory -Path $Record.Path } catch { throw "fused leg: '$($Record.Path)' is not the directory recorded before the coder ran (it cannot be pinned: $(ConvertTo-SafeConsoleText $_.Exception.Message 160))." }
+    if ($pin.Reparse -or $pin.Key -cne $Record.Key) { $pin.Handle.Dispose(); if ($pin.Anchor) { $pin.Anchor.Dispose() }; throw "fused leg: '$($Record.Path)' is not the directory recorded before the coder ran (identity $($pin.Key))." }
+    $want = [IO.Path]::GetFullPath($Record.Path).TrimEnd('\')
+    if ($pin.Final.TrimEnd('\') -ine $want) { $pin.Handle.Dispose(); if ($pin.Anchor) { $pin.Anchor.Dispose() }; throw "fused leg: '$($Record.Path)' resolves to '$($pin.Final)' (a path component was swapped for a link)." }
+    $script:FusedLocks[$k] = @{ Handle = $pin.Handle; Anchor = $pin.Anchor; Final = $pin.Final.TrimEnd('\') }
+    return $script:FusedLocks[$k].Final
+}
+
+function Unlock-FusedWorktree {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not $script:FusedLocks) { return }
+    $k = [IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    $held = $script:FusedLocks[$k]
+    if ($held) { try { $held.Anchor.Dispose() } catch { }; try { $held.Handle.Dispose() } catch { }; $script:FusedLocks.Remove($k) }
+}
+
+function Register-FusedWorktree {
+    # Remember, BEFORE the coder runs, what a worktree is: its identity, its own gitdir and the fingerprint
+    # of that gitdir's config and hooks. Get-WtGit holds every later operator-side git call to it. The record
+    # is a file in the operator-side state dir so the candidate Start-Job children and the parent process
+    # (separate processes) all see it. A previous lock on the same path (an earlier attempt) is released. A
+    # quarantined path cannot be re-recorded: the quarantine outlives every retry on that worktree.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Key, [Parameter(Mandatory)][string]$GitDir)
+    if (Test-FusedWorktreeQuarantined $Path) { throw "fused leg: '$Path' is quarantined; only a human can clear that (Clear-FusedQuarantine -ClearedBy), neither removing the worktree nor a new recording does." }
+    Unlock-FusedWorktree -Path $Path
+    $rec = @{ Path = $Path; Key = $Key; GitDir = $GitDir; Fingerprint = (Get-GitDirFingerprint -GitDir $GitDir) }
+    New-Item -ItemType Directory -Force (Get-FusedWorktreeStateDir) | Out-Null
+    ($rec | ConvertTo-Json) | Set-Content -LiteralPath (Get-FusedWorktreeRecordPath $Path) -Encoding UTF8 -ErrorAction Stop
+}
+
+function Unregister-FusedWorktree {
+    param([Parameter(Mandatory)][string]$Path)
+    # drops the pre-run record and the pin; a quarantine marker is NOT touched (only Clear-FusedQuarantine
+    # removes it), so removing and recreating a worktree cannot shed it
+    Unlock-FusedWorktree -Path $Path
+    $f = Get-FusedWorktreeRecordPath $Path
+    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+}
+
+function Assert-FusedWorktreeTrusted {
+    # Everything an operator-side git would TRUST in a coder-writable place, against the pre-run record:
+    # not quarantined, the worktree object (identity, no link), its .git pointer, the gitdir's config and
+    # hooks, and the directory PINNED by a held handle (Lock-FusedWorktree) so it cannot change afterwards.
+    # Returns the handle-resolved worktree path.
+    param([Parameter(Mandatory)]$Record)
+    if (Test-FusedWorktreeQuarantined $Record.Path) { throw "fused leg: '$($Record.Path)' is quarantined (a coder-account process may have survived the leg); operator-side use is refused." }
+    $final = Lock-FusedWorktree -Record $Record
+    $null = Assert-FusedPathIntact -Path $Record.Path -ExpectedKey $Record.Key -What 'fused worktree'
+    if ((Get-FusedWorktreeGitDir -WorkTree $Record.Path) -cne $Record.GitDir) { throw "fused leg: the gitdir pointer of '$($Record.Path)' changed after the coder ran." }
+    if ((Get-GitDirFingerprint -GitDir $Record.GitDir) -cne $Record.Fingerprint) { throw "fused leg: the config or hooks of the gitdir '$($Record.GitDir)' changed after the coder ran." }
+    return $final
+}
+
+function Get-WtGit {
+    # The git argv PREFIX for an operator-side call against a worktree: `git @(Get-WtGit $wt) <command>`.
+    # A path with no fused-worktree record yields the historical @('-C', $Path) -- the exact argv every call
+    # used before. A recorded fused worktree is first re-verified and PINNED by a held directory handle
+    # (Assert-FusedWorktreeTrusted: otherwise this THROWS and git never starts), then git is hardened
+    # (Get-HardenedGitArgs) and handed the path the handle itself resolves to.
+    param([Parameter(Mandatory)][string]$Path)
+    $dir = Get-FusedWorktreeStateDir
+    if (-not (Test-Path -LiteralPath $dir)) { return @('-C', $Path) }
+    if (Test-FusedWorktreeQuarantined $Path) { throw "fused leg: '$Path' is quarantined (a coder-account process may have survived the leg); operator-side use is refused." }
+    $f = Get-FusedWorktreeRecordPath $Path
+    if (-not (Test-Path -LiteralPath $f)) { return @('-C', $Path) }
+    $reg = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+    $final = Assert-FusedWorktreeTrusted -Record $reg
+    return (Get-HardenedGitArgs -GitDir $reg.GitDir -WorkTree $final)
+}
+
+function Test-FusedWorktreeRecorded {
+    # $true when Path has a pre-run fused-worktree record (i.e. the coder ran there as another account).
+    param([Parameter(Mandatory)][string]$Path)
+    $dir = Get-FusedWorktreeStateDir
+    if (-not (Test-Path -LiteralPath $dir)) { return $false }
+    # a quarantine alone (its record deleted) still counts: it must not be possible to shed the quarantine by
+    # removing the record
+    return ((Test-Path -LiteralPath (Get-FusedWorktreeRecordPath $Path)) -or (Test-Path -LiteralPath (Get-FusedQuarantinePath $Path)))
+}
+
+function Assert-OperatorWorktree {
+    # Operator-side gate for ANY use of a worktree the coder ran in: with no fused record it does nothing
+    # (the historical path); with one it re-verifies identity, links, the .git pointer and the gitdir
+    # fingerprint and THROWS on a mismatch. Returns the path it was given.
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-FusedWorktreeQuarantined $Path) { throw "fused leg: '$Path' is quarantined (a coder-account process may have survived the leg); operator-side use is refused." }
+    if (Test-FusedWorktreeRecorded $Path) {
+        $null = Assert-FusedWorktreeTrusted -Record (Get-Content -LiteralPath (Get-FusedWorktreeRecordPath $Path) -Raw | ConvertFrom-Json)
+    }
+    return $Path
+}
+
+function Get-OperatorWorktreePath {
+    # The ONLY way operator-side code should form a path to WRITE, COPY OVER or DELETE inside a worktree the
+    # coder ran in: it re-verifies the worktree (Assert-OperatorWorktree) and refuses a relative path that
+    # leaves it or passes through a link. Unrecorded worktrees get a plain Join-Path.
+    param([Parameter(Mandatory)][string]$Worktree, [Parameter(Mandatory)][string]$Relative)
+    $full = Join-Path $Worktree $Relative
+    if (-not (Test-FusedWorktreeRecorded $Worktree)) { return $full }
+    $null = Assert-OperatorWorktree -Path $Worktree
+    $root = [IO.Path]::GetFullPath($Worktree).TrimEnd('\') + '\'
+    $abs = [IO.Path]::GetFullPath($full)
+    if (-not $abs.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "fused leg: '$Relative' leaves the worktree '$Worktree'." }
+    $cur = $root.TrimEnd('\')
+    foreach ($seg in @($abs.Substring($root.Length).Split('\') | Where-Object { $_ -ne '' })) {
+        $cur = Join-Path $cur $seg
+        $it = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+        if ($it -and ($it.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "fused leg: '$Relative' passes through a link (reparse point) at '$cur'." }
+    }
+    return $abs
+}
+
+function Remove-LinksUnder {
+    # Delete every link (reparse point: junction or symlink) under Root AS A LINK, without ever following
+    # one: an iterative walk that checks the attributes of each entry before descending. The target of a
+    # link is never touched. Returns the number of links removed.
+    param([Parameter(Mandatory)][string]$Root)
+    $removed = 0
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Root)
+    while ($stack.Count -gt 0) {
+        $dir = [string]$stack.Pop()
+        $entries = @()
+        try { $entries = @([IO.Directory]::EnumerateFileSystemEntries($dir)) } catch { continue }
+        foreach ($e in $entries) {
+            $attr = [IO.File]::GetAttributes($e)
+            if ($attr -band [IO.FileAttributes]::ReparsePoint) {
+                try {
+                    if ($attr -band [IO.FileAttributes]::Directory) { [IO.Directory]::Delete($e) } else { [IO.File]::Delete($e) }
+                    $removed++
+                } catch { }
+            } elseif ($attr -band [IO.FileAttributes]::Directory) { $stack.Push($e) }
+        }
+    }
+    return $removed
+}
+
+function Clear-WorktreeUntracked {
+    # `git clean -fd` in a worktree. For a worktree the coder ran in, links under it are removed as links
+    # first, so a recursive delete can never reach through one into another directory.
+    param([Parameter(Mandatory)][string]$Worktree)
+    if (Test-FusedWorktreeRecorded $Worktree) { $null = Remove-LinksUnder -Root $Worktree }
+    git @(Get-WtGit $Worktree) clean -fd 2>&1 | Out-Null
+}
+
+function Remove-WorktreeSafe {
+    # Remove a git worktree directory. For a worktree the coder ran in, links are never followed: a link at
+    # the path (or any link inside the tree) is deleted AS a link first, so the recursive remove cannot
+    # reach through it. Otherwise it is exactly `git -C $Repo worktree remove $Path --force`.
+    param([Parameter(Mandatory)][string]$Repo, [Parameter(Mandatory)][string]$Path)
+    if (Test-FusedWorktreeRecorded $Path) {
+        $it = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($it -and ($it.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            [IO.Directory]::Delete($Path)
+        } elseif ($it) {
+            $null = Remove-LinksUnder -Root $Path
+        }
+        Unregister-FusedWorktree $Path
+    }
+    git -C $Repo worktree remove $Path --force 2>&1 | Out-Null
+}
+
 function Resolve-AclSid {
     param($Reference)
     if ($Reference -is [Security.Principal.SecurityIdentifier]) { return $Reference.Value }
@@ -917,19 +1230,27 @@ function Resolve-AclSid {
 
 function Assert-CoderQueueAclTight {
     # The fused leg's trust in the shared tree rests on its ACLs: refuse to run when any of -Path is
-    # writable (any write, delete, permission or owner right) by someone other than the operator, the
-    # coder account, SYSTEM, Administrators or CREATOR OWNER. A grant to Authenticated Users, Users,
-    # Everyone or an unresolvable identity throws. The ACL fix itself is provisioning (#1686, LA-run).
+    # writable (any write, delete, permission or owner right, including the GENERIC_ALL / GENERIC_WRITE
+    # bits an inherit-only ACE carries unexpanded) by someone other than the operator, the coder account,
+    # SYSTEM, Administrators or CREATOR OWNER, or when the OWNER of any of them is not the operator,
+    # SYSTEM or Administrators (a coder-owned folder can have its DACL loosened after this check). A grant
+    # to Authenticated Users, Users, Everyone or an unresolvable (orphan) identity throws. Inherit-only
+    # ACEs count: they apply to every file created later. The ACL fix itself is provisioning (#1686, LA-run).
     param([Parameter(Mandatory)][string[]]$Path, [string]$CoderUser = 'blarai-coder', [string[]]$ExtraAllowedSids = @())
-    $writeMask = 2 + 4 + 16 + 64 + 256 + 65536 + 262144 + 524288
+    $writeMask = 2 + 4 + 16 + 64 + 256 + 65536 + 262144 + 524288 + 0x10000000 + 0x40000000
     $acls = foreach ($p in $Path) {
         try { [pscustomobject]@{ Path = $p; Acl = (Get-Acl -LiteralPath $p -ErrorAction Stop) } }
         catch { throw "fused leg: cannot read the ACL of '$p' ($(ConvertTo-SafeConsoleText $_.Exception.Message)); the shared tree must be provisioned first (#1686). Not running the coder." }
     }
-    $allowed = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0') + $ExtraAllowedSids
+    $operatorSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $allowed = @($operatorSid, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0') + $ExtraAllowedSids
+    $allowedOwners = @($operatorSid, 'S-1-5-18', 'S-1-5-32-544')
     try { $allowed += [string](Get-LocalUser -Name $CoderUser -ErrorAction Stop).SID.Value } catch { }
     $bad = @()
     foreach ($a in $acls) {
+        $owner = $null
+        try { $owner = [string]$a.Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $owner = $null }
+        if (-not $owner -or $allowedOwners -notcontains $owner) { $bad += "owner '$owner' of $($a.Path)" }
         foreach ($rule in $a.Acl.Access) {
             if ([string]$rule.AccessControlType -ne 'Allow') { continue }
             if (([int]$rule.FileSystemRights -band $writeMask) -eq 0) { continue }
@@ -938,13 +1259,15 @@ function Assert-CoderQueueAclTight {
         }
     }
     if ($bad.Count -gt 0) {
-        throw "fused leg: the shared coder-leg tree is writable by accounts other than the operator, $CoderUser, SYSTEM and Administrators: $($bad -join '; '). Tighten the ACLs first (#1686, LA-run provisioning). Not running the coder."
+        throw "fused leg: the shared coder-leg tree is writable, or owned, by accounts other than the operator, $CoderUser, SYSTEM and Administrators: $($bad -join '; '). Tighten the ACLs first (#1686, LA-run provisioning). Not running the coder."
     }
 }
 
 function Test-CoderContainmentExpected {
     # Is containment expected on this machine? Yes when the coder-leg task is registered, or the provisioning
-    # marker file exists. A task lookup that itself errors counts as expected (fail closed).
+    # marker file (written by provision-coder-account.ps1) exists. A task lookup that itself errors counts as
+    # expected (fail closed). The default marker path equals Get-CoderProvisionMarkerPath in
+    # coder-provisioning-lib.ps1 (a test holds the two together).
     param([string]$TaskPath = '\BlarAI\', [string]$TaskName = 'BlarAI-Coder-Leg', [string]$MarkerPath = 'C:\blarai-fleet\coder-provisioned.marker')
     if (Test-Path -LiteralPath $MarkerPath) { return $true }
     try { return [bool](Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) } catch { return $true }
@@ -955,16 +1278,23 @@ function Invoke-FusedCoderRun {
     # on-demand scheduled task, and return the SAME result hashtable Invoke-AcpCoderRun returns in .Result
     # (TimedOut, TimeoutReason, Capped, CappedReason, ExitCode, LogPath, Seconds, Error, IdleBoundSec,
     # IdleSignal), so the gate/selection/merge consume it unchanged.
-    # FAIL-CLOSED: every non-start throws -- egress hook refusal, a shared tree writable by other accounts,
-    # driver other than acp, workdir or queue paths that pass through links or leave the shared base, coder
-    # account missing, task not registered, serialize-wait timeout, task never started (0x41303 diagnosis),
-    # cancellation, no result in time, a result that is not bound to this job and the coder account, or a
-    # leg that could not run. There is no fallback to the operator account and none to stdin. On any failure
-    # after the trigger the coder-leg task is STOPPED and the claimed job cleared, so an abandoned coder does
-    # not keep editing a worktree nobody is watching.
+    # FAIL-CLOSED: every non-start throws -- egress hook refusal, a shared tree writable or owned by other
+    # accounts, driver other than acp, workdir or queue paths that pass through links or leave the shared
+    # base, a worktree that is not a linked git worktree, coder account missing, task not registered,
+    # serialize-wait timeout, task never started (0x41303 diagnosis), cancellation, no result in time, a
+    # result that is not bound to this job and the coder account, a workdir or staging dir the coder swapped
+    # (identity changed, now a link), or a leg that could not run. There is no fallback to the operator
+    # account and none to stdin. On any failure after the trigger the coder-leg task is STOPPED and the
+    # claimed job cleared, so an abandoned coder does not keep editing a worktree nobody is watching.
     # SERIALIZE: the task is single-instance (IgnoreNew), so concurrent best-of-N candidates take turns
     # behind one named mutex held across enqueue -> start -> result, waiting at most QueueWaitSec for
-    # their turn (bounded: a wait that expires is an error, never a dropped or double-run candidate).
+    # their turn (bounded, and polled for cancellation: a wait that expires is an error, never a dropped or
+    # double-run candidate). The mutex name is a machine-wide name any local account can open: a squatter
+    # holding it can only make the wait expire or be cancelled (the leg then refuses), never make a coder
+    # run, so an ACL on the mutex would add nothing a squatter-first creation could not undo.
+    # POST-RETURN: the coder has Modify on the worktree base, so it can replace its workdir. The worktree's
+    # identity and its own gitdir are recorded BEFORE the coder runs (Register-FusedWorktree); the workdir
+    # is re-verified when the coder returns, and every later operator-side git call goes through Get-WtGit.
     # RESULT BINDING: id, kind, boolean ok flags, ran_as_sid, and (via Wait-CoderLegResult) the result
     # file's OWNER and creation time. A full fix needs the results dir writable only by the coder (#1686).
     param(
@@ -987,19 +1317,28 @@ function Invoke-FusedCoderRun {
         ShouldCancel = { Test-DispatchCancelled }
     }
     if ($Options) { foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] } }
-    foreach ($need in 'Add-CoderLegJob', 'Wait-CoderLegResult', 'Start-CoderLegTask', 'Stop-CoderLegTask', 'Get-CoderLegPaths') {
+    foreach ($need in 'Add-CoderLegJob', 'Wait-CoderLegResult', 'Start-CoderLegTask', 'Stop-CoderLegTask', 'Get-CoderLegPaths', 'Add-CoderFunnelNotice') {
         if (-not (Get-Command $need -ErrorAction SilentlyContinue)) { throw "fused leg: the coder-leg queue contract is not loaded ($need missing; coder-leg-queue.ps1 must sit beside fleet-lib.ps1). Not running the coder." }
     }
 
     # 1. the egress seam, before anything else touches the coder
     $null = Assert-CoderEgressContained -Context 'fused-dispatch'
 
-    # 2. the shared tree must not be writable by other accounts
+    # 2. the shared tree must not be writable (or owned) by other accounts: the root, its parent, the queue
+    #    dirs and the worktree base
     $paths = Get-CoderLegPaths
     $wtBaseRaw = if ($o.WorktreeBase) { [string]$o.WorktreeBase } else { Resolve-WorktreeBase -ScriptRoot $ScriptRoot -Containment 'restricted_account' }
     if (-not (Test-Path -LiteralPath $paths.Root)) { throw "fused leg: the coder-leg root '$($paths.Root)' does not exist -- run provision-coder-account.ps1. Not running the coder." }
     Initialize-CoderLegQueue
-    Assert-CoderQueueAclTight -Path @($paths.Root, $paths.Queue, $paths.Prompts, $paths.Results, $paths.Logs, $wtBaseRaw) -CoderUser $o.CoderUser
+    # the quarantine and the pre-run records live in an operator-only directory: not inside anything the coder
+    # can write, and itself passing the same ACL gate
+    New-Item -ItemType Directory -Force (Get-FusedWorktreeStateDir) | Out-Null
+    $stateDir = [IO.Path]::GetFullPath((Get-FusedWorktreeStateDir)).TrimEnd('\') + '\'
+    foreach ($coderRoot in @($paths.Root, $wtBaseRaw)) {
+        $cr = [IO.Path]::GetFullPath([string]$coderRoot).TrimEnd('\') + '\'
+        if ($stateDir.StartsWith($cr, [StringComparison]::OrdinalIgnoreCase)) { throw "fused leg: the quarantine/record directory '$stateDir' is inside a coder-writable root '$cr'. Not running the coder." }
+    }
+    Assert-CoderQueueAclTight -Path @((Split-Path $paths.Root -Parent), $paths.Root, $paths.Queue, $paths.Prompts, $paths.Results, $paths.Logs, $wtBaseRaw, (Get-FusedWorktreeStateDir)) -CoderUser $o.CoderUser
 
     if ($Cfg.driver -ne 'acp') {
         throw "containment=restricted_account needs driver=acp (the coder leg runs the ACP client only); driver is '$($Cfg.driver)'. Refusing to run the coder uncontained."
@@ -1008,12 +1347,21 @@ function Invoke-FusedCoderRun {
     $queueDir   = Resolve-CoderFinalPath -Path $paths.Queue -What 'queue dir'
     $promptsDir = Resolve-CoderFinalPath -Path $paths.Prompts -What 'prompts dir'
     $logsDir    = Resolve-CoderFinalPath -Path $paths.Logs -What 'logs dir'
-    $null       = Resolve-CoderFinalPath -Path $paths.Results -What 'results dir'
+    $resultsDir = Resolve-CoderFinalPath -Path $paths.Results -What 'results dir'
     $wtBase     = (Resolve-CoderFinalPath -Path $wtBaseRaw -What 'worktree base').TrimEnd('\') + '\'
     $wdFull     = Resolve-CoderFinalPath -Path $WorkDir -What 'workdir'
+    if (Test-FusedWorktreeQuarantined $wdFull) { throw "fused leg: '$wdFull' is quarantined (an earlier leg left a coder process that could not be confirmed gone). Not running the coder in it." }
     if (-not ($wdFull + '\').StartsWith($wtBase, [StringComparison]::OrdinalIgnoreCase)) {
         throw "fused leg: workdir '$WorkDir' is outside the shared worktree base '$wtBase' the coder account can reach."
     }
+    # what each of them IS, before the coder can touch anything
+    $ids = @{
+        Work = (Get-FileIdentity -Path $wdFull).Key; Queue = (Get-FileIdentity -Path $queueDir).Key
+        Prompts = (Get-FileIdentity -Path $promptsDir).Key; Logs = (Get-FileIdentity -Path $logsDir).Key
+        Results = (Get-FileIdentity -Path $resultsDir).Key
+    }
+    $gitDir = Get-FusedWorktreeGitDir -WorkTree $wdFull
+    Register-FusedWorktree -Path $wdFull -Key $ids.Work -GitDir $gitDir
     # 4. the account and the task must exist
     $coderSid = $null
     try { $coderSid = [string](Get-LocalUser -Name $o.CoderUser -ErrorAction Stop).SID.Value } catch { $coderSid = $null }
@@ -1027,18 +1375,26 @@ function Invoke-FusedCoderRun {
     $acpIdle = if ($acp.idle_sec) { [int]$acp.idle_sec } else { 600 }
     $deadline = (Get-Date).AddSeconds([int]$o.QueueWaitSec)
 
-    # 5. take our turn (serialize behind the single-instance task)
+    # 5. take our turn (serialize behind the single-instance task), polling for cancellation
     $mutex = New-Object System.Threading.Mutex($false, [string]$o.MutexName)
     $held = $false
     $jobId = $null; $promptFile = $null; $sharedLog = $null
+    $reportedZero = $false
     try {
-        try {
-            $held = $mutex.WaitOne([int][math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds))
-        } catch [System.Threading.AbandonedMutexException] { $held = $true }
+        while ($true) {
+            if (& $o.ShouldCancel) { throw "fused leg: dispatch cancelled while waiting for the coder leg's turn." }
+            $remainMs = ($deadline - (Get-Date)).TotalMilliseconds
+            if ($remainMs -le 0) { break }
+            try {
+                $held = $mutex.WaitOne([int][math]::Min($remainMs, [double]$o.CancelSliceSec * 1000))
+            } catch [System.Threading.AbandonedMutexException] { $held = $true }
+            if ($held) { break }
+        }
         if (-not $held) { throw "fused leg: waited $($o.QueueWaitSec)s for the coder leg's turn (another candidate holds it) and gave up. Not running the coder." }
 
         # the task must be idle (a still-running earlier job would swallow our trigger: IgnoreNew)
         while ([string](Get-ScheduledTask -TaskPath $o.TaskPath -TaskName $o.TaskName -ErrorAction SilentlyContinue).State -eq 'Running') {
+            if (& $o.ShouldCancel) { throw 'fused leg: dispatch cancelled while the coder-leg task was still running an earlier job.' }
             if ((Get-Date) -ge $deadline) { throw "fused leg: the coder-leg task stayed Running past the $($o.QueueWaitSec)s serialize wait. Not running the coder." }
             Start-Sleep -Milliseconds ([int][math]::Max(1, $o.PollMs))
         }
@@ -1051,7 +1407,11 @@ function Invoke-FusedCoderRun {
         $jobId = New-CoderLegJobId
         $promptFile = Join-Path $promptsDir "$jobId.prompt.txt"
         $sharedLog  = Join-Path $logsDir "$jobId.log"
-        Set-Content -Path $promptFile -Value $Prompt -NoNewline -Encoding UTF8 -ErrorAction Stop
+        # the coder cannot commit (it has read-only access to the source repo's .git, #1678): tell it, and that the
+        # operator funnel is the only committer. Restricted path only; the containment-off prompt is untouched.
+        $null = Assert-FusedPathIntact -Path $promptsDir -ExpectedKey $ids.Prompts -What 'prompts dir'
+        Write-OperatorFileExclusive -LiteralPath $promptFile -Text (Add-CoderFunnelNotice -Prompt $Prompt)
+        if (Test-Path -LiteralPath (Join-Path $resultsDir "$jobId.result.json")) { throw "fused leg: a result file for the new job id '$jobId' already exists (stale or planted); refusing to trigger." }
         $enqueuedAt = Get-Date
         $triggered = $false
         try {
@@ -1081,6 +1441,8 @@ function Invoke-FusedCoderRun {
             if ([string]$res.ran_as_sid -cne $coderSid) {
                 throw "fused leg: the job ran as SID '$(ConvertTo-SafeConsoleText $res.ran_as_sid 80)', not the coder account's '$coderSid'. Discarding the result."
             }
+            # the runner's own report that its job object held no other process when it finished
+            $reportedZero = ($null -ne $res.PSObject.Properties['job_zero_confirmed']) -and ($res.job_zero_confirmed -is [bool]) -and ($res.job_zero_confirmed -eq $true)
             if (($res.ok -isnot [bool]) -or ($res.ok -ne $true)) {
                 $why = if ($res.error) { ConvertTo-SafeConsoleText $res.error } else { 'no error text' }
                 throw "fused leg: the coder leg reported failure for $jobId (ok is not the boolean true: $why). Not falling back to the operator account or stdin."
@@ -1090,11 +1452,34 @@ function Invoke-FusedCoderRun {
                 $why = if ($leg -and $leg.Reason) { ConvertTo-SafeConsoleText $leg.Reason } else { 'no result body' }
                 throw "fused leg: unusable result for $jobId ($why). Not falling back to the operator account or stdin."
             }
+            try { Assert-CoderLegEnvelope -Envelope $leg }
+            catch { throw "fused leg: unusable result for $jobId ($(ConvertTo-SafeConsoleText $_.Exception.Message 160)). Not falling back to the operator account or stdin." }
             if (($leg.Ok -isnot [bool]) -or ($leg.Ok -ne $true)) {
                 throw "fused leg: the coder leg could not run the build ($(ConvertTo-SafeConsoleText $leg.Reason)). Not falling back to the operator account or stdin."
             }
-            # 8. the transcript the gate reads lives at the operator-side LogPath
-            if (Test-Path -LiteralPath $sharedLog) { Copy-Item -LiteralPath $sharedLog -Destination $LogPath -Force -ErrorAction Stop }
+            # 8. the coder has returned: it must also be NOT RUNNING (a coder still running could swap things
+            #    after the checks below), then re-verify everything it could touch before ANY operator-side use
+            Assert-CoderLegTaskIdle -TaskPath $o.TaskPath -TaskName $o.TaskName -WaitSec $o.StopWaitSec -PollMs $o.PollMs
+            #    and NO process of the coder account may be alive. The GATES are operator-side facts: the task state
+            #    (read above) and, for an elevated operator, an enumeration that finds nothing. The runner's
+            #    job_zero_confirmed is the coder's own statement, NOT independent proof: it adds no trust beyond the
+            #    owner/SID binding of the file that carries it. It is required for completeness and diagnostics
+            #    (an honest runner that could not drain says so, and bad news is believed), and a non-elevated
+            #    operator has nothing better; it never overrides an operator-side finding.
+            $gone = Stop-CoderProcessesConfirmed -CoderSid $coderSid -WaitSec $o.StopWaitSec -PollMs $o.PollMs
+            if ($gone -eq $false) {
+                Set-FusedWorktreeQuarantine -Path $wdFull -Reason 'a coder-account process could not be confirmed gone after the leg'
+                throw "fused leg: a process of the coder account could not be confirmed gone after the leg; the worktree '$wdFull' is quarantined until a human clears it (Clear-FusedQuarantine) and will not be used by operator-side git."
+            }
+            if (-not $reportedZero) {
+                Set-FusedWorktreeQuarantine -Path $wdFull -Reason 'the result does not carry job_zero_confirmed=true'
+                throw "fused leg: the result for $jobId does not carry job_zero_confirmed=true, so surviving coder processes cannot be excluded; the worktree '$wdFull' is quarantined until a human clears it (Clear-FusedQuarantine)."
+            }
+            $null = Assert-FusedWorktreeTrusted -Record (Get-Content -LiteralPath (Get-FusedWorktreeRecordPath $wdFull) -Raw | ConvertFrom-Json)
+            $null = Assert-FusedPathIntact -Path $logsDir -ExpectedKey $ids.Logs -What 'logs dir after the coder returned'
+            # the transcript the gate reads lives at the operator-side LogPath: a link or a multiply
+            # hard-linked file is not copied
+            if (Test-Path -LiteralPath $sharedLog) { Copy-CoderTranscript -Source $sharedLog -Destination $LogPath }
             $r = $leg.Result
             $result = @{
                 TimedOut = [bool]$r.TimedOut; TimeoutReason = [string]$r.TimeoutReason
@@ -1112,21 +1497,60 @@ function Invoke-FusedCoderRun {
             if ($triggered) {
                 $stopped = Stop-CoderLegTask -TaskPath $o.TaskPath -TaskName $o.TaskName -WaitSec $o.StopWaitSec -PollMs $o.PollMs
             }
-            Remove-Item -LiteralPath (Join-Path $queueDir "$jobId.json.claimed") -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath (Join-Path $paths.Results "$jobId.result.json") -ErrorAction SilentlyContinue
-            if (-not $stopped) { throw "$($failure.Exception.Message) ALSO: the coder-leg task did not leave Running within $($o.StopWaitSec)s of the stop request; the coder may still be editing the worktree." }
+            if (Test-FusedDirIntact -Path $queueDir -ExpectedKey $ids.Queue) { Remove-Item -LiteralPath (Join-Path $queueDir "$jobId.json.claimed") -ErrorAction SilentlyContinue }
+            if (Test-FusedDirIntact -Path $resultsDir -ExpectedKey $ids.Results) { Remove-Item -LiteralPath (Join-Path $resultsDir "$jobId.result.json") -ErrorAction SilentlyContinue }
+            if ($triggered) {
+                # excluded = the runner reported a drained job, or an elevated operator confirmed none alive
+                # excluded needs an OPERATOR-side fact (the task state was read and is not Running after the stop) AND
+                # either the runner's report (self-attested: believed only as a diagnostic, never alone) or an
+                # elevated enumeration that found nothing
+                $excluded = ($reportedZero -and $stopped)
+                $gone = Stop-CoderProcessesConfirmed -CoderSid $coderSid -WaitSec $o.StopWaitSec -PollMs $o.PollMs
+                if ($gone -eq $true -and $stopped) { $excluded = $true }
+                if (-not $excluded) {
+                    Set-FusedWorktreeQuarantine -Path $wdFull -Reason 'the leg failed and surviving coder-account processes could not be excluded'
+                    $extra = if (-not $stopped) { " The coder-leg task also did not leave Running within $($o.StopWaitSec)s of the stop request, or its state could not be read." } else { '' }
+                    throw "$($failure.Exception.Message) ALSO: surviving processes of the coder account could not be excluded (no operator-confirmed stop together with the runner's report or an elevated enumeration); the worktree '$wdFull' is quarantined until a human clears it (Clear-FusedQuarantine).$extra"
+                }
+            }
+            if (-not $stopped) { throw "$($failure.Exception.Message) ALSO: the coder-leg task did not leave Running within $($o.StopWaitSec)s of the stop request, or its state could not be read; the coder may still be editing the worktree." }
             throw
         }
     } finally {
-        if ($jobId) {
-            # an unclaimed job of ours must not outlive the call; a claimed one is already the leg's
+        # delete only through a directory that is still the one it was: a swapped (linked) staging dir
+        # must never turn the operator's cleanup into a delete somewhere else
+        if ($jobId -and (Test-FusedDirIntact -Path $queueDir -ExpectedKey $ids.Queue)) {
             Remove-Item -LiteralPath (Join-Path $queueDir "$jobId.json") -ErrorAction SilentlyContinue
         }
-        if ($promptFile) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }
-        if ($sharedLog)  { Remove-Item -LiteralPath $sharedLog -ErrorAction SilentlyContinue }
+        if ($promptFile -and (Test-FusedDirIntact -Path $promptsDir -ExpectedKey $ids.Prompts)) { Remove-Item -LiteralPath $promptFile -ErrorAction SilentlyContinue }
+        if ($sharedLog -and (Test-FusedDirIntact -Path $logsDir -ExpectedKey $ids.Logs)) { Remove-Item -LiteralPath $sharedLog -ErrorAction SilentlyContinue }
         # release the turn (Dispose alone also frees it; both are removed together by the harness mutant)
         if ($held) { try { $mutex.ReleaseMutex() } catch {} }; $mutex.Dispose()
     }
+}
+
+function Copy-CoderTranscript {
+    # Copy the coder-written transcript to the operator-side path from ONE held handle: the source is opened
+    # with sharing that denies writers, renames and deletes, checked (not a link, one hard link) while held,
+    # and read from that same handle, so it cannot be swapped between the check and the read. -BeforeCopy is
+    # a test seam run after the check, while the handle is held.
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [scriptblock]$BeforeCopy = $null)
+    if ((Get-Item -LiteralPath $Source -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "fused leg: the shared transcript '$Source' is a link; not copying it." }
+    $in = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $id = Get-FileIdentity -Path $Source
+        if ($id.Reparse -or $id.Links -gt 1) { throw "fused leg: the shared transcript '$Source' is a link or has $($id.Links) hard links; not copying it." }
+        if ($BeforeCopy) { & $BeforeCopy }
+        $out = [IO.File]::Create($Destination)
+        try { $in.CopyTo($out) } finally { $out.Dispose() }
+    } finally { $in.Dispose() }
+}
+
+function Test-FusedDirIntact {
+    # Non-throwing form of Assert-FusedPathIntact for cleanup paths: $true only when the directory still
+    # resolves without links to the identity it had before the coder ran.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ExpectedKey)
+    try { $null = Assert-FusedPathIntact -Path $Path -ExpectedKey $ExpectedKey -What 'staging dir'; return $true } catch { Write-Host "  [containment] skipping cleanup in '$Path': $(ConvertTo-SafeConsoleText $_.Exception.Message)" -ForegroundColor Yellow; return $false }
 }
 
 function Invoke-CoderDriver {
@@ -1953,9 +2377,9 @@ function Resolve-CriticRange {
     # Only reads git; never mutates.
     param([Parameter(Mandatory)][string]$Repo, [string]$Base = 'main', [string]$BaseRef = '')
     $ErrorActionPreference = 'Continue'
-    if ($BaseRef -and (((git -C $Repo diff "$BaseRef..HEAD" --name-only 2>$null) -join "`n"))) { return "$BaseRef..HEAD" }
-    if (((git -C $Repo diff "$Base...HEAD" --name-only 2>$null) -join "`n")) { return "$Base...HEAD" }
-    if (((git -C $Repo diff "HEAD~1..HEAD" --name-only 2>$null) -join "`n")) { return "HEAD~1..HEAD" }
+    if ($BaseRef -and (((git @(Get-WtGit $Repo) diff "$BaseRef..HEAD" --name-only 2>$null) -join "`n"))) { return "$BaseRef..HEAD" }
+    if (((git @(Get-WtGit $Repo) diff "$Base...HEAD" --name-only 2>$null) -join "`n")) { return "$Base...HEAD" }
+    if (((git @(Get-WtGit $Repo) diff "HEAD~1..HEAD" --name-only 2>$null) -join "`n")) { return "HEAD~1..HEAD" }
     return ""
 }
 
@@ -1973,8 +2397,8 @@ function Get-WorktreeDigest {
     # ASCII; PS 5.1 + 7 safe (EAP=Continue so git's informational stderr never throws).
     param([Parameter(Mandatory)][string]$Repo)
     $ErrorActionPreference = 'Continue'
-    $status = (git -C $Repo status --porcelain --untracked-files=all 2>$null) -join "`n"
-    $diff   = (git -C $Repo diff HEAD 2>$null) -join "`n"
+    $status = (git @(Get-WtGit $Repo) status --porcelain --untracked-files=all 2>$null) -join "`n"
+    $diff   = (git @(Get-WtGit $Repo) diff HEAD 2>$null) -join "`n"
     $combined = $status + "`n--DIFF--`n" + $diff
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -2170,10 +2594,10 @@ function Restore-WorktreeToHead {
     # never reaches here).
     param([Parameter(Mandatory)][string]$Repo)
     $ErrorActionPreference = 'Continue'
-    $stray = @(git -C $Repo status --porcelain --untracked-files=all 2>$null | Where-Object { $_ })
+    $stray = @(git @(Get-WtGit $Repo) status --porcelain --untracked-files=all 2>$null | Where-Object { $_ })
     if ($stray.Count -gt 0) {
-        git -C $Repo reset --hard HEAD 2>&1 | Out-Null
-        git -C $Repo clean -fd 2>&1 | Out-Null
+        git @(Get-WtGit $Repo) reset --hard HEAD 2>&1 | Out-Null
+        Clear-WorktreeUntracked -Worktree $Repo
     }
     return @($stray)
 }
@@ -2724,7 +3148,7 @@ function Restore-SmokeContractPin {
     # it, exactly as on the BlarAI side.
     param([string]$Worktree, $PinBytes)
     if ($null -eq $PinBytes -or -not $Worktree -or -not (Test-Path -LiteralPath $Worktree)) { return }
-    try { [System.IO.File]::WriteAllBytes((Join-Path $Worktree 'blarai-smoke.json'), $PinBytes) } catch { }
+    try { [System.IO.File]::WriteAllBytes((Get-OperatorWorktreePath -Worktree $Worktree -Relative 'blarai-smoke.json'), $PinBytes) } catch { }
 }
 
 function Resolve-BuildProfile {
@@ -3028,7 +3452,7 @@ function Copy-ScaffoldInto {
     }
     $ng = Join-Path $base 'nuget.config'
     if (Test-Path $ng) {
-        Copy-Item -LiteralPath $ng -Destination (Join-Path $Worktree 'nuget.config') -Force
+        Copy-Item -LiteralPath $ng -Destination (Get-OperatorWorktreePath -Worktree $Worktree -Relative 'nuget.config') -Force
         [void]$seeded.Add('nuget.config')
     }
     @($seeded)
@@ -3945,7 +4369,7 @@ function Get-CandidateTestPartition {
     # a project with no coder-added python tests yields an empty Scratch set == today's behaviour. Reads
     # only; returns @{ Trusted; Scratch } of POSIX repo-relative paths.
     param([Parameter(Mandatory)][string]$Worktree, [Parameter(Mandatory)][string]$BaseRef)
-    $base = @(git -C $Worktree ls-tree -r --name-only $BaseRef 2>$null | Where-Object { Test-IsGatedTestPath $_ })
+    $base = @(git @(Get-WtGit $Worktree) ls-tree -r --name-only $BaseRef 2>$null | Where-Object { Test-IsGatedTestPath $_ })
     $root = (Resolve-Path -LiteralPath $Worktree).Path
     $wtFiles = New-Object System.Collections.ArrayList
     foreach ($f in @(Get-ChildItem -Path $root -Recurse -File -Filter '*.py' -ErrorAction SilentlyContinue)) {
@@ -4314,7 +4738,7 @@ function Invoke-CandidateBuild {
     # shared baseline first (a FRESH independent start). The concurrent path gets a fresh worktree per
     # candidate already AT $CodeBase, so it leaves -ResetToBase $false. (Was $BuildTestVerify's `if
     # ($resetToBase)` line, verbatim.)
-    if ($ResetToBase) { git -C $wt reset --hard $CodeBase 2>&1 | Out-Null; git -C $wt clean -fd 2>&1 | Out-Null }
+    if ($ResetToBase) { git @(Get-WtGit $wt) reset --hard $CodeBase 2>&1 | Out-Null; Clear-WorktreeUntracked -Worktree $wt }
     # Inner no-op retry (Invoke-BuildWithRetry): a small/quantized model intermittently produces a NO-OP
     # build; cheap independent re-runs lift ~50% per-attempt to ~85-90%. Never retries a timeout. Each retry
     # starts CLEAN (reset to HEAD == $CodeBase, since no commit has landed yet for this fresh candidate).
@@ -4350,10 +4774,11 @@ function Invoke-CandidateBuild {
     }
     $build = Invoke-BuildWithRetry -MaxBuildAttempts $MaxBuildAttempts `
         -OnRetry { param($n) if ($escape.enabled) { $escape.active = $true }; Write-Host "  Attempt $($n - 1) produced no changes; retrying ($n/$MaxBuildAttempts) from a clean worktree$(if ($escape.active) { ' (no-change escape offered)' })..." -ForegroundColor Yellow } `
-        -ResetWorktree { git -C $wt reset --hard HEAD 2>&1 | Out-Null; git -C $wt clean -fd 2>&1 | Out-Null } `
+        -ResetWorktree { git @(Get-WtGit $wt) reset --hard HEAD 2>&1 | Out-Null; Clear-WorktreeUntracked -Worktree $wt } `
         -RunAgent { $escape.anchor = Get-TranscriptAnchor -LogPath $LogPath; Invoke-CoderDriver -WorkDir $wt -Model $Model -Prompt $(if ($escape.active) { Add-NoChangeEscape -Prompt $AttemptPrompt } else { $AttemptPrompt }) -LogPath $LogPath -TimeoutSec ($MaxRunMinutes * 60) -IdleTimeoutSec $IdleTimeoutSec -ScriptRoot $ScriptRoot } `
-        -ProducedChanges { (@(git -C $wt status --porcelain 2>$null).Count -gt 0) -or (([int](git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null)) -gt 0) } `
+        -ProducedChanges { (@(git @(Get-WtGit $wt) status --porcelain 2>$null).Count -gt 0) -or (([int](git @(Get-WtGit $wt) rev-list --count "$CodeBase..HEAD" 2>$null)) -gt 0) } `
         -NoChangeDeclared { if ($escape.active) { (Get-NoChangeDeclaration -LogPath $LogPath -Anchor $escape.anchor).Declared } else { $false } }
+    $null = Assert-OperatorWorktree -Path $wt   # the coder has returned: the worktree must still be what it was
     $run = $build.Run
     $noChangeDeclared = [bool]$build.NoChangeDeclared
     $noChangeEvidence = ''
@@ -4376,7 +4801,7 @@ function Invoke-CandidateBuild {
     # #690: RESTORE the protected acceptance oracle BEFORE staging + the gate, so a candidate that edited,
     # weakened, or deleted it is OVERWRITTEN -- judged by the BYTE-IDENTICAL scorecard, and the merged commit
     # keeps the original. `git checkout <baseline> -- <path>` re-materialises the committed bytes.
-    if ($OracleActive) { git -C $wt checkout $CodeBase -- $AcceptanceTestPath 2>&1 | Out-Null }
+    if ($OracleActive) { git @(Get-WtGit $wt) checkout $CodeBase -- $AcceptanceTestPath 2>&1 | Out-Null }
     # #790: SCOPE the per-candidate hard gate to the SPEC/BASELINE tests, quarantining the coder's own
     # throwaway self-verification tests. A plan-graph NODE seeds NO oracle into the worktree (the job
     # oracle runs only at integration -- BlarAI shared/fleet/acceptance.py), so EVERY test_*.py at a node
@@ -4394,10 +4819,10 @@ function Invoke-CandidateBuild {
     # error falls back to today's whole-tree gate (fail-safe toward the stricter old behaviour, never open).
     try {
         $__part = Get-CandidateTestPartition -Worktree $wt -BaseRef $CodeBase
-        foreach ($__tt in @($__part.Trusted)) { git -C $wt checkout $CodeBase -- "$__tt" 2>&1 | Out-Null }
+        foreach ($__tt in @($__part.Trusted)) { git @(Get-WtGit $wt) checkout $CodeBase -- "$__tt" 2>&1 | Out-Null }
         if (@($__part.Scratch).Count -gt 0) {
             $__scratch = Invoke-ScratchTestSignal -Worktree $wt -ScratchTests @($__part.Scratch)
-            foreach ($__rf in @($__scratch.Red)) { Remove-Item (Join-Path $wt $__rf) -Force -ErrorAction SilentlyContinue }
+            foreach ($__rf in @($__scratch.Red)) { Remove-Item -LiteralPath (Get-OperatorWorktreePath -Worktree $wt -Relative $__rf) -Force -ErrorAction SilentlyContinue }
             $__scColor = if ($__scratch.Result -eq 'fail') { 'Yellow' } else { 'DarkGray' }
             Write-Host "  SCRATCH TESTS (coder-added; advisory, non-gating): $($__scratch.Detail)" -ForegroundColor $__scColor
         }
@@ -4447,7 +4872,7 @@ function Invoke-CandidateBuild {
                     "file(s) before staging -- they cannot be indexed and would fail the whole " +
                     "capture: " + ($__reserved -join ', '))
     }
-    $addOut = (git -C $wt add -A 2>&1 | Out-String); $addRc = $LASTEXITCODE
+    $addOut = (git @(Get-WtGit $wt) add -A 2>&1 | Out-String); $addRc = $LASTEXITCODE
     # Read the INDEX, not git's English: the staged set is what tells an honest "nothing to commit"
     # apart from a real commit failure, so a commit is only ATTEMPTED when something is staged.
     # STDOUT ONLY for the two reads whose output is COUNTED. git writes warnings and advice to stderr
@@ -4459,9 +4884,9 @@ function Invoke-CandidateBuild {
     # output is never counted, only reported.)
     $stagedOut = @(); $stagedRaw = ''; $stagedRc = 0
     if ($addRc -eq 0) {
-        $stagedOut = @(git -C $wt diff --cached --name-only 2>$null | Where-Object { "$_".Trim() })
+        $stagedOut = @(git @(Get-WtGit $wt) diff --cached --name-only 2>$null | Where-Object { "$_".Trim() })
         $stagedRc = $LASTEXITCODE
-        if ($stagedRc -ne 0) { $stagedOut = @(); $stagedRaw = (git -C $wt diff --cached --name-only 2>&1 | Out-String) }
+        if ($stagedRc -ne 0) { $stagedOut = @(); $stagedRaw = (git @(Get-WtGit $wt) diff --cached --name-only 2>&1 | Out-String) }
     }
     $commitRc = $null; $commitOut = ''
     $secret = $null; $secretBlocked = $false
@@ -4475,12 +4900,12 @@ function Invoke-CandidateBuild {
         $secretBlocked = ($secret -and $secret.status -eq 'blocked')
         if ($secretBlocked) {
             Write-Host "  SECRET SCAN: BLOCKED - $($secret.detail)" -ForegroundColor Red
-            git -C $wt reset 2>&1 | Out-Null   # unstage; leave the work in the worktree for human review
+            git @(Get-WtGit $wt) reset 2>&1 | Out-Null   # unstage; leave the work in the worktree for human review
         } else {
             if ($secret.status -eq 'unavailable') { Write-Host "  SECRET SCAN: skipped (gitleaks not installed - run install-gitleaks.ps1)" -ForegroundColor Yellow }
             else { Write-Host "  SECRET SCAN: clean" -ForegroundColor Green }
             if (@($stagedOut).Count -gt 0) {
-                $commitOut = (git -C $wt -c user.email='agent@local' -c user.name='coding-agent' commit -m "agent: $Task" 2>&1 | Out-String)
+                $commitOut = (git @(Get-WtGit $wt) -c user.email='agent@local' -c user.name='coding-agent' commit -m "agent: $Task" 2>&1 | Out-String)
                 $commitRc = $LASTEXITCODE
             }
             # else: nothing staged == the honest no-op. Skipping the commit keeps that case OUT of the
@@ -4492,16 +4917,16 @@ function Invoke-CandidateBuild {
     # and a bare `else { 0 }` would then report a branch that HOLDS the coder's commit as "none
     # made" -- the same laundering by a different route, which is why moving this line was never the
     # same thing as fixing it.
-    $__rl = "$(git -C $wt rev-list --count "$CodeBase..HEAD" 2>$null)".Trim()
+    $__rl = "$(git @(Get-WtGit $wt) rev-list --count "$CodeBase..HEAD" 2>$null)".Trim()
     $rlRc = $LASTEXITCODE
     $rlRaw = ''
     $baseResolvable = $true
     if (($rlRc -ne 0) -or ($__rl -notmatch '^\d+$')) {
-        $rlRaw = (git -C $wt rev-list --count "$CodeBase..HEAD" 2>&1 | Out-String)
+        $rlRaw = (git @(Get-WtGit $wt) rev-list --count "$CodeBase..HEAD" 2>&1 | Out-String)
         # Only when the count already failed: is the BASELINE itself resolvable here? $CodeBase is not
         # guaranteed to be a SHA (the caller falls back to a branch NAME), so an unresolvable base is a
         # dispatch-config problem on a perfectly healthy repo -- not a failure to capture anything.
-        git -C $wt rev-parse --verify --quiet "$CodeBase^{commit}" 2>&1 | Out-Null
+        git @(Get-WtGit $wt) rev-parse --verify --quiet "$CodeBase^{commit}" 2>&1 | Out-Null
         $baseResolvable = ($LASTEXITCODE -eq 0)
     }
     $commitCount = if ($__rl -match '^\d+$') { [int]$__rl } else { 0 }
@@ -4509,10 +4934,10 @@ function Invoke-CandidateBuild {
     # [3/5] verify steps. Those steps legitimately litter the tree (a python verify leaves
     # app/__pycache__/), so a status read taken later would turn every healthy python build into a
     # false capture fault. Locked by verify-git-capture-honesty.ps1 D5f.
-    $dirtyLines = @(git -C $wt status --porcelain 2>$null | Where-Object { "$_".Trim() })   # stdout only -- see above
+    $dirtyLines = @(git @(Get-WtGit $wt) status --porcelain 2>$null | Where-Object { "$_".Trim() })   # stdout only -- see above
     $statusRc = $LASTEXITCODE
     $statusRaw = ''
-    $dirtyCount = if ($statusRc -eq 0) { $dirtyLines.Count } else { $statusRaw = (git -C $wt status --porcelain 2>&1 | Out-String); 0 }
+    $dirtyCount = if ($statusRc -eq 0) { $dirtyLines.Count } else { $statusRaw = (git @(Get-WtGit $wt) status --porcelain 2>&1 | Out-String); 0 }
     $capture = Resolve-CommitCapture -AddExitCode $addRc -AddOutput $addOut `
         -StagedReadExitCode $stagedRc -StagedReadOutput $stagedRaw -StagedCount (@($stagedOut).Count) `
         -SecretBlocked $secretBlocked -CommitExitCode $commitRc -CommitOutput $commitOut `
@@ -4530,7 +4955,7 @@ function Invoke-CandidateBuild {
         # Loud but NOT a fault: the capture worked, the baseline we were handed does not resolve.
         Write-Host "  BASELINE UNRESOLVABLE (dispatch config, NOT a capture failure): $gitError" -ForegroundColor Yellow
     }
-    $sha = if ($hasChanges) { "$(git -C $wt rev-parse HEAD 2>$null)".Trim() } else { '' }
+    $sha = if ($hasChanges) { "$(git @(Get-WtGit $wt) rev-parse HEAD 2>$null)".Trim() } else { '' }
     # #771: a stop that landed during generation short-circuits the gate steps (tests + verify) -- the
     # candidate's work is already committed to its branch (reflog-reachable), so it PARKS rather than
     # auto-merging a gate we didn't finish. VerifyResult/TestResult stay 'none' => never a winner => park.
@@ -4578,7 +5003,7 @@ function Invoke-CandidateBuild {
             # stage runs in a different process after candidate selection and already holds
             # $wt, so this needs no cross-process plumbing and dies with the worktree.
             # Fail-soft -- a stats file that cannot be written must never sink a build.
-            try { Set-Content -LiteralPath (Join-Path $wt '.blarai-hypothesis-stats.txt') -Value $testOut -Encoding utf8 } catch { }
+            try { Set-Content -LiteralPath (Get-OperatorWorktreePath -Worktree $wt -Relative '.blarai-hypothesis-stats.txt') -Value $testOut -Encoding utf8 } catch { }
         } else { Write-Host "[2/5] No test setup found - skipping." }
     }
     $testError = if ($testResult -eq 'fail') { "The test step failed:`n" + ((($testOut -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 25) -join "`n") } else { '' }
@@ -5002,4 +5427,22 @@ function Get-BreakerReason {
         'ceiling' { return "hit the ${MaxRunMinutes}-min ceiling while still working" }
         default   { return "exceeded its time budget" }
     }
+}
+
+function Assert-CoderLegJobPathsSafe {
+    # Runner side, before anything starts: the paths a job names are the ones the operator generates, in the
+    # places the operator generates them. prompt_file and log_path must be exactly <prompts|logs>\<job id>.<ext>
+    # in the coder-leg root, and workdir must resolve (no links, every component present) to a directory under
+    # the shared worktree base. A job file is written into a coder-writable directory: its strings are input.
+    param([Parameter(Mandatory)]$Job, [string]$WorktreeBase = '')
+    $paths = Get-CoderLegPaths
+    $id = [string]$Job.id
+    $wantPrompt = Join-Path $paths.Prompts "$id.prompt.txt"
+    $wantLog = Join-Path $paths.Logs "$id.log"
+    if ([IO.Path]::GetFullPath([string]$Job.prompt_file) -ine [IO.Path]::GetFullPath($wantPrompt)) { throw "job path refused: prompt_file is not '$wantPrompt'." }
+    if ([IO.Path]::GetFullPath([string]$Job.log_path) -ine [IO.Path]::GetFullPath($wantLog)) { throw "job path refused: log_path is not '$wantLog'." }
+    $base = if ($WorktreeBase) { $WorktreeBase } elseif ($env:BLARAI_CODER_LEG_WORKTREE_BASE) { $env:BLARAI_CODER_LEG_WORKTREE_BASE } else { 'C:\blarai-fleet\worktrees' }
+    $baseFull = (Resolve-CoderFinalPath -Path $base -What 'worktree base').TrimEnd('\') + '\'
+    $wd = Resolve-CoderFinalPath -Path ([string]$Job.workdir) -What 'job workdir'
+    if (-not ($wd + '\').StartsWith($baseFull, [StringComparison]::OrdinalIgnoreCase)) { throw "job path refused: workdir '$wd' is outside '$baseFull'." }
 }

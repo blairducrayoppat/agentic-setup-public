@@ -34,9 +34,10 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # critic.md has bash:deny; the agent cannot run git. We run it here and embed the output.
 # Resolve-CriticRange (fleet-lib.ps1) handles the #687 #9 empty-diff bug: post-merge on the base
 # branch "<base>...HEAD" is EMPTY (HEAD == base), so it falls back to the merged work's range.
+$null = Assert-OperatorWorktree -Path $AppDir   # no-op unless AppDir is a worktree the coder ran in
 $criticRange = Resolve-CriticRange -Repo $AppDir -Base $BaseBranch -BaseRef $BaseRef
-$diffStat = if ($criticRange) { (git -C $AppDir diff $criticRange --stat 2>$null) -join "`n" } else { '' }
-$diffFull = if ($criticRange) { (git -C $AppDir diff $criticRange 2>$null) -join "`n" } else { '' }
+$diffStat = if ($criticRange) { (git @(Get-WtGit $AppDir) diff $criticRange --stat 2>$null) -join "`n" } else { '' }
+$diffFull = if ($criticRange) { (git @(Get-WtGit $AppDir) diff $criticRange 2>$null) -join "`n" } else { '' }
 # Truncate very large diffs; the critic can Read individual files for more context.
 $MaxDiffChars = 8000
 if ($diffFull -and $diffFull.Length -gt $MaxDiffChars) {
