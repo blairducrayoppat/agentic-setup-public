@@ -1,11 +1,7 @@
 # agentic-setup — a fully-local coding-agent stack for one Lunar Lake laptop
 
-**&#9654; The BlarAI vision film (66 seconds):**
-
-https://github.com/user-attachments/assets/9ffd473b-93e5-4763-a9ec-e12ac6afa10c
-
-I believe the laptop already on your desk can run useful AI privately, and that an AI
-agent acting on your machine should answer to controls you can check.
+I believe the laptop already in your bag can run useful AI privately, and that an AI
+agent acting on any machine should answer to controls you can check.
 
 This repository is the **operations layer** for a self-contained, offline-capable AI
 coding system that runs entirely on a single Intel Lunar Lake laptop — no cloud model,
