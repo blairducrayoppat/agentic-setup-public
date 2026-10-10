@@ -59,6 +59,16 @@ $topicRegexes = @(Get-Content $privatePatterns | Where-Object { $_ -and $_ -notm
 #     identifier (Vikunja #1104 comment 2541).
 #   - nist_ai_rmf_playbook.json: reviewed 2026-08-09, same generic-word class
 #     (a standard AI-risk-framework mention of ordinary human-factors terms).
+#   - B4-eu-law-liability-privacy-of-the-record.md: reviewed 2026-10-09 (Vikunja
+#     #1716), one hit, a two-word health term inside a quotation of the EU
+#     product-liability directive's definition of compensable damage; the
+#     generic-word class, no private identifier. (The term itself is not
+#     repeated here: this file is in the published tree and the gate scans it.)
+#   - 2026-10-09 (#1716): the DECISION_REGISTER.md and 2026-07.md blobs were
+#     re-pinned. The 2026-08-08 pins had lapsed through ordinary edits to both
+#     files; the flagged lines are unchanged in kind (the DEC-12 row; the one
+#     journal entry that explains the 07-24 false positives), re-checked by
+#     grep on 2026-10-09 and re-cleared by the LA.
 #   - docs/DECISION_REGISTER.md / docs/archive/journal/2026-07.md: the LA
 #     reviewed the exact flagged references in these two files verbatim and
 #     cleared them for publication (see DEC-12 in docs/DECISION_REGISTER.md,
@@ -71,8 +81,9 @@ $allowlist = @(
     @{ Repo = 'blarai'; Path = 'docs/research/publication-program/novelty-survey/P5-verdict.md'; Blob = 'b2ca0ff0128b9874e4026246e1ad051ca17c8c8a' }
     @{ Repo = 'blarai'; Path = 'evals/fixtures/injection_corpus/promptfoo_injection_corpus.json'; Blob = 'a2bd5de1ecb44f10c08a699e82d48410fd2da72c' }
     @{ Repo = 'blarai'; Path = 'docs/governance/nist_ai_rmf_playbook.json'; Blob = '3804556942b25c0034c86465b40ebd894f03f017' }
-    @{ Repo = 'blarai'; Path = 'docs/DECISION_REGISTER.md'; Blob = '30d19319300e76e875b2d5478401334711e9071a' }
-    @{ Repo = 'blarai'; Path = 'docs/archive/journal/2026-07.md'; Blob = '68652e1a6a4c0f09799258b9010af2e17bb506a3' }
+    @{ Repo = 'blarai'; Path = 'docs/DECISION_REGISTER.md'; Blob = '36af4ee927179001298097f53a3707d540f5cd51' }
+    @{ Repo = 'blarai'; Path = 'docs/archive/journal/2026-07.md'; Blob = '8824096b60769d1fa4fa9657bdf89a1f559c4c4a' }
+    @{ Repo = 'blarai'; Path = 'docs/research/runtime-action-governance-product-feasibility-2026-09-17-appendices/B4-eu-law-liability-privacy-of-the-record.md'; Blob = '13393c0d53b47444f7955e5bd09e43b5e63a2d2b' }
 )
 
 $fail = 0

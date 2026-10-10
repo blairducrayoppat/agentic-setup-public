@@ -4,9 +4,14 @@
 
 https://github.com/user-attachments/assets/9ffd473b-93e5-4763-a9ec-e12ac6afa10c
 
+I believe the laptop already on your desk can run useful AI privately, and that an AI
+agent acting on your machine should answer to controls you can check.
+
 This repository is the **operations layer** for a self-contained, offline-capable AI
 coding system that runs entirely on a single Intel Lunar Lake laptop — no cloud model,
-no API keys, no data leaving the machine. It serves a 30-billion-parameter coder model
+no API keys, no model call leaving the machine. (The coding agent's own outbound
+network access is an open, accepted gap; see "Recent advancements".) It serves a
+30-billion-parameter coder model
 from the integrated GPU, drives it with a terminal coding agent, dispatches autonomous
 overnight coding runs through a supervised fleet, and exposes every one of those
 capabilities behind a single text menu a non-developer can operate.
@@ -23,28 +28,81 @@ tuned to the one hard constraint that governs the whole design.
 > verify matrix; if a specific file must be 5.1-parseable for an external tool, add a BOM to
 > that one file. (#785 decision (b), 2026-07-10.)
 
-## Recent advancements (as of August 2026)
+## Recent advancements (as of October 2026)
 
-- **A real review loop for what the fleet builds.** The operator can now open
-  any website the coding fleet produced directly from the run's own review
-  page — the page also hands him his original request back as a line-by-line
-  checklist, flags every link that leads nowhere before he has to click it
-  himself, and surfaces media/placement findings (repeated images, missing
-  per-item assets) next to the build. The first time this loop was used for
-  real, it surfaced three defects that every automated grading pass had
-  missed — the fastest of them found by a person clicking one link.
-- **Guards now measure over an interval, not a single sample.** Several checks
-  that gate whether a resource is safe to reclaim were found asking what is
-  functionally an interval question — "has anything happened recently?" — but
-  sampling only a single instant, which cannot tell a healthy pause from a
-  stall. Fixed across the run guards that make that call.
-- **The overnight fleet fails loud, never silent** (carried forward from
-  July): a failed git capture is surfaced as an errored task with git's own
-  message, never silently misreported as empty output; a genuine no-op is
-  recognized as success rather than retried against an impossible diff;
-  new-project scaffolding is language-neutral and backed by a hundred-plus
-  locked assertions; a crash in a run's postlude can no longer strand the
-  resident model in the shared ~31 GB pool.
+The containment work below is merged with its switch **off**: `containment` in
+`configs/fleet-driver.json` reads `off`, the coder still runs as the operator's own
+account, and no complete dispatch has yet run through the coder account. Each item
+says what is built, what is applied to the machine, and what is not.
+
+- **Only the coder step is to run as a separate, deliberately powerless Windows
+  account; the gate, every git commit and the merge stay with the operator.** The
+  fused coder leg (`Invoke-FusedCoderRun` in `scripts/fleet-lib.ps1`,
+  `scripts/coder-leg-queue.ps1`, `scripts/coder-leg-run.ps1`) writes a job and a
+  prompt into a queue, starts the `\BlarAI\BlarAI-Coder-Leg` scheduled task as
+  `blarai-coder`, waits for a result file, and accepts it only when its job id, kind,
+  boolean ok flag, reported account and file owner all match. Every failure throws;
+  there is no fallback to running as the operator. The flip is a go-live ceremony
+  with the operator present, against a criteria list recorded in the BlarAI
+  repository (ADR-045). This is an account boundary, not a kernel or
+  virtual-machine boundary.
+- **Once the coder has run, the dispatch never runs plain git in its worktree.**
+  `Get-WtGit` returns the plain `-C` form only for a worktree with no fused-run
+  record; for a recorded one, `Assert-FusedWorktreeTrusted` re-checks identity,
+  links and a fingerprint of the git directory's config, hooks and attributes, and
+  `Get-HardenedGitArgs` pins `--git-dir` and `--work-tree` and turns off hooks,
+  fsmonitor, the ssh command and the ext protocol on the command line. A lint in
+  `scripts/verify-coder-fused-seam.ps1` fails when a new operator-side use skips
+  its funnel. [`docs/fused-leg-operator-uses.md`](docs/fused-leg-operator-uses.md)
+  lists each operator-side use of a path the coder can write in the dispatch
+  scripts, and names what it did not audit.
+- **The worktree is held open while it is checked, and the coder's processes run
+  inside a job object.** `Lock-FusedWorktree` holds the worktree root, plus a
+  share-read handle on its `.git` pointer file, so it cannot be renamed or swapped
+  under a check; an independent review had reproduced exactly that swap, and 173
+  swap-after-check attempts against the fix leaked nothing. The coder-side runner
+  creates a Windows job object kill-on-close with no breakaway and starts the
+  coder's client suspended inside it (`Start-ProcessInJob`), so every descendant is
+  born in the job. Residual, stated plainly: a process created through Windows
+  Management Instrumentation escapes the job, a non-elevated operator cannot see
+  it, and an escaped process editing file contents between the gate and the merge
+  is not excluded (the "Non-elevated residual" in the operator-uses document).
+- **A permission-narrowing stage, built and not applied.** `provision-coder-acls.ps1`
+  replaces the coder's write grant on every source repository with one inheritable
+  read-and-run entry, closes the fleet folder to other local accounts and protects
+  the model folders. It is dry-run by default, prints a plan digest, applies only
+  against that digest, backs up every access list it touches and reads each one
+  back. It has not been applied to the machine: the coder account still holds write
+  access on the operator's `projects` folder today.
+- **The coder gets its own tool-chain configuration, rendered from this
+  repository.** `provision-coder-setup.ps1` installs an opencode configuration into
+  the coder's profile (the operator's config without its MCP block, the restricted
+  rules, two fleet plugins, an offline-docs wrapper), owned by Administrators and
+  stamped through verified handles; `Test-CoderOpencodeConfigSafe` is the single
+  verdict. Built and merged; not applied. The rename of the coder's own config
+  folder by the account that owns its parent is detected by a check, not prevented.
+- **Two independent reviews are published with their findings.** A separate AI
+  agent that did not write the code reviewed the fused leg
+  ([review](docs/reviews/code-review-775-fused-leg-2026-10-05.md),
+  [disposition](docs/reviews/code-review-775-fused-leg-disposition-2026-10-05.md));
+  its first finding was that a forged result file was accepted as a real coder
+  run, fixed before merge. A second review covered the permission stage
+  ([review](docs/reviews/code-review-1678-provisioning-2026-10-06.md),
+  [disposition](docs/reviews/provisioning-1678-disposition-2026-10-06.md)); its
+  first finding was that the stage's read-back proved "no coder entry", not "the
+  coder cannot write" (a grant through a group, or ownership, was invisible), fixed
+  before merge. Each disposition names what stays open and the condition that
+  would close it.
+- **Blocking the coder account's outbound network traffic is an open, accepted
+  gap.** A third-party security suite owns the firewall on this machine, so the
+  per-account Windows Firewall rule the provisioning creates does not enforce. A
+  raw Windows Filtering Platform block keyed to a dedicated account (the coder
+  account in three runs, a throwaway account of the same kind in the others) was
+  measured in the BlarAI repository's evidence record, in windows of seconds to
+  about two minutes in a session that vanishes when the script exits; it is
+  evidence, not a control. Nothing persistent is built,
+  and until it is, the coder can reach the network, including a package
+  installer's downloads.
 
 ## The one constraint everything follows from
 
@@ -220,6 +278,12 @@ write dated logs under `state/logs` (newest kept); failures auto-print their las
   throughput is stated as a real number, not a cloud-blog aspiration.
 - **Fail-closed security.** Secret-shaped paths are denied to the agent, egress commands
   prompt, secrets never enter git history, and the eval suite actively tests refusal.
+  Those are the agent's own settings, and the containment work above follows the rule
+  that a control is enforced where the agent cannot argue with it: the operating
+  system's account token and file permissions rather than the agent's permission
+  list, a second independent layer behind the first (the operator re-verifies every
+  coder-written path before using it), and a result record the operator side binds
+  to the job before trusting it. The account boundary is built and not switched on.
 
 ## Repository layout
 
@@ -231,7 +295,7 @@ write dated logs under `state/logs` (newest kept); failures auto-print their las
 | `tools/` | `qwen-proxy.py` and the Qwen tool-call repair library; benchmarking utilities. |
 | `bench/` | Benchmark harness, results, and telemetry captures. |
 | `evals/tasks/` | Capability + security golden-task suite. |
-| `docs/` | `LESSONS-LEARNED.md`, builder briefs, and research docs. |
+| `docs/` | `LESSONS-LEARNED.md`, builder briefs, research docs, `fused-leg-operator-uses.md` (the containment design record) and `reviews/` (the published independent reviews and their dispositions). |
 
 ## License
 
