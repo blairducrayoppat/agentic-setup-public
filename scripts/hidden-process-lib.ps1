@@ -96,7 +96,7 @@ function Invoke-HiddenProcess {
     # Start FilePath with ArgumentList, never with a window; wait up to TimeoutSec. Returns @{ ExitCode; Stdout; Stderr; TimedOut }.
     # -DeElevate: when the caller is elevated, start with a standard-user restricted token (still no window; output
     # is not captured in that mode, the child writes files).
-    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutSec = 600, [switch]$DeElevate, [string]$WorkingDirectory = '')
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutSec = 600, [switch]$DeElevate, [string]$WorkingDirectory = '', [hashtable]$Environment = @{})
     if ($DeElevate -and (Test-CallerElevated)) {
         Initialize-HiddenLaunchType
         $cl = '"' + $FilePath + '" ' + (ConvertTo-ArgumentLine $ArgumentList)
@@ -112,6 +112,7 @@ function Invoke-HiddenProcess {
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
     if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
+    foreach ($k in $Environment.Keys) { $psi.Environment[[string]$k] = [string]$Environment[$k] }   # this child only; ignored with -DeElevate
     $p = [System.Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $so = $p.StandardOutput.ReadToEndAsync(); $se = $p.StandardError.ReadToEndAsync()
