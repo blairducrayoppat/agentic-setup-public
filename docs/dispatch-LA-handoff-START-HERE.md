@@ -135,6 +135,7 @@ Run A and B in parallel (A unblocks the operator's visible goal; B removes the f
    - the **LA journal** `agentic-setup/docs/LESSONS-LEARNED.md` — append a **dated narrative entry** in its
      "Running log" style (`## YYYY-MM-DD — title that names the lesson/arc`, ✅/❌/🔬 tags, `→ BlarAI` notes,
      failures-stay-in) whenever a workstream ships a milestone, a real decision is made (name the trade-off),
-     or a lesson is learned. The **builders** keep BlarAI's `BUILD_JOURNAL.md` for the code they ship; **you**
-     keep `LESSONS-LEARNED.md` for the orchestration arc + lessons. (The `#670` arc through 2026-06-23 is
+     or a lesson is learned. The **builders** write no journal: BlarAI's build journal is retired and frozen
+     (DEC-23, ADR-050), and what they ship reaches the Knowledge wiki through the integrating session, never
+     from the fleet; **you** keep `LESSONS-LEARNED.md` for the orchestration arc + lessons. (The `#670` arc through 2026-06-23 is
      already backfilled there — continue from the bottom; bump the header "Last updated" date.)
