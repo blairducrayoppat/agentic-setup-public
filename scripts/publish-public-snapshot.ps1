@@ -375,6 +375,10 @@ if ($phraseNeedles.Count -eq 0) {
 #   - 2026-10-15 (#1741, LA Decision A): re-pinned again to BlarAI main 13456085's
 #     blob after the DEC-22 licence row; the DEC-12 row compared byte-for-byte
 #     against the cleared blob 36af4ee9 and is identical.
+#   - 2026-10-29 (#1834, LA-approved gate point 2): DECISION_REGISTER.md re-pinned to BlarAI main
+#     6d311bdb's blob. The pin had lapsed through ordinary edits (a83c8907, efb170a1) and the publisher had
+#     failed since its 2026-10-26 run; the only flagged line, the DEC-12 row, was compared byte-for-byte
+#     against the cleared blob 36af4ee9 and is identical.
 #   - docs/DECISION_REGISTER.md / docs/archive/journal/2026-07.md: the LA
 #     reviewed the exact flagged references in these two files verbatim and
 #     cleared them for publication (see DEC-12 in docs/DECISION_REGISTER.md,
@@ -387,7 +391,7 @@ $allowlist = @(
     @{ Repo = 'blarai'; Path = 'docs/research/publication-program/novelty-survey/P5-verdict.md'; Blob = 'b2ca0ff0128b9874e4026246e1ad051ca17c8c8a' }
     @{ Repo = 'blarai'; Path = 'evals/fixtures/injection_corpus/promptfoo_injection_corpus.json'; Blob = 'a2bd5de1ecb44f10c08a699e82d48410fd2da72c' }
     @{ Repo = 'blarai'; Path = 'docs/governance/nist_ai_rmf_playbook.json'; Blob = '3804556942b25c0034c86465b40ebd894f03f017' }
-    @{ Repo = 'blarai'; Path = 'docs/DECISION_REGISTER.md'; Blob = '9d82c46436e504fe526609ca4eb50c7015288497' }
+    @{ Repo = 'blarai'; Path = 'docs/DECISION_REGISTER.md'; Blob = '7d61b7ba271aa1830cd979e76dbfaf7efa11aa2c' }
     @{ Repo = 'blarai'; Path = 'docs/archive/journal/2026-07.md'; Blob = '8824096b60769d1fa4fa9657bdf89a1f559c4c4a' }
     @{ Repo = 'blarai'; Path = 'docs/research/runtime-action-governance-product-feasibility-2026-09-17-appendices/B4-eu-law-liability-privacy-of-the-record.md'; Blob = '13393c0d53b47444f7955e5bd09e43b5e63a2d2b' }
 )
