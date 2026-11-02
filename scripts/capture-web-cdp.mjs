@@ -444,16 +444,37 @@ export function assessForms(m) {
   // form with no action genuinely does lose the data, and that case still convicts.
   let loseDataUndecidable = 0;
   if (m.wouldLoseData > 0) {
-    // `scriptCount` absent means an older probe that never reported it — which is exactly the
-    // state of not knowing whether a listener could exist, so it reads as undecidable too.
-    const scriptless = m.scriptCount === 0;
-    if (scriptless) {
+    // #1434. THE BROWSER'S OWN ANSWER OUTRANKS BOTH ATTRIBUTE READS. `addEventListener` is the
+    // normal way to wire a form and is invisible to `action`/`onsubmit`, so before listener
+    // introspection existed this clause could only say "undecidable" on any page carrying a
+    // script — which is nearly every page. That was honest and it was not a measurement.
+    // When `DOMDebugger.getEventListeners` answered, "undecidable" is no longer available:
+    // a form is convicted only when the browser reports no submit listener on it AND none on
+    // any delegation target, and vindicated when one exists.
+    const listeners = m.submitListeners;
+    if (listeners && listeners.decided === true) {
+      if (listeners.unhandled > 0) {
+        const eg = m.loseDataExample ? ` (e.g. ${m.loseDataExample})` : '';
+        out.push(cleanText(
+          `${listeners.unhandled} form(s) have no action, no onsubmit and no submit listener${eg}`
+          + ' — the browser reports no submit listener on the form, any of its ancestors or the'
+          + ' window — so a native submit would reload the page and throw the typed values away'
+          + ' (click and keypress handlers were not inspected)', 400));
+      }
+      // Decided and handled: nothing to say, and `loseDataUndecidable` stays 0. That zero is
+      // the whole point of this ticket — the clause is now measurable in VERDICT, not only in
+      // coverage (DoD row 15).
+    } else if (m.scriptCount === 0) {
+      // Introspection unavailable, but no script could have attached a listener anyway. The
+      // pre-#1434 conviction, kept because it is still sound on its own terms.
       const eg = m.loseDataExample ? ` (e.g. ${m.loseDataExample})` : '';
       out.push(cleanText(
         `${m.wouldLoseData} form(s) have neither an action nor a submit handler${eg}, and the `
         + 'page loads no script that could attach one — submitting reloads the page and throws '
         + 'the typed values away', 400));
     } else {
+      // Could not ask the browser, and a script might have wired it. Still undecidable, and
+      // still published rather than dropped.
       loseDataUndecidable = m.wouldLoseData;
     }
   }
@@ -464,6 +485,17 @@ export function assessForms(m) {
     // findings: [] beside loseDataUndecidable: 1 knows the difference between a form that is
     // fine and a form nothing could adjudicate. #1434 is the instrument that would decide it.
     loseDataUndecidable,
+    // #1434: published so a reader can tell "no forms lose data" from "the browser was never
+    // asked". decided:false with loseDataUndecidable:0 means there was nothing to adjudicate.
+    // `blindSpots` = shadow hosts + iframes the document-level form census cannot see into;
+    // `decided:false` with `reason` says why no verdict was reached (never a clean pass).
+    submitListeners: (m.submitListeners && m.submitListeners.decided === true)
+      ? { decided: true, checked: m.submitListeners.checked,
+          handled: m.submitListeners.handled, unhandled: m.submitListeners.unhandled,
+          blindSpots: m.submitListeners.blindSpots || 0 }
+      : { decided: false, checked: 0, handled: 0, unhandled: 0,
+          blindSpots: (m.submitListeners && m.submitListeners.blindSpots) || 0,
+          reason: (m.submitListeners && m.submitListeners.reason) || 'not-measured' },
     findings: out,
   };
 }
@@ -499,6 +531,109 @@ export const FORMS_PROBE = [
   " scriptCount:document.querySelectorAll('script').length};})()",
 ].join('');
 
+/** #1434 REVIEW FIX: every node that could legitimately hold a delegated submit listener for a
+ *  given form -- the form itself, then EVERY ancestor up to and including document. The window sits above
+ *  document on the event path and is asked separately by measureSubmitListeners.
+ *
+ *  THE DEFECT THIS RETIRES, found by independent review and reproduced against real Edge. The
+ *  first version asked only `document`, `document.body` and `document.documentElement`. React 17+
+ *  binds delegated listeners to the ROOT CONTAINER element (`createRoot(container)`), not to
+ *  document -- so `<body><div id="root"><form>...` with the listener on `#root` was CONVICTED,
+ *  one DOM level past what was checked. That is the same false-conviction class #1434 exists to
+ *  retire, wearing a different depth, and the new wording made it worse by claiming "the browser
+ *  was asked directly" rather than hedging.
+ *
+ *  Returns a FLAT handle array: form0, its ancestors..., form1, its ancestors..., in order. The
+ *  companion SHAPE probe below returns the chain lengths by value, so the caller can attribute
+ *  each handle back to its form. Flat because Runtime.getProperties enumerates one array level. */
+export const SUBMIT_CHAIN_HANDLE_PROBE = [
+  '(function(){',
+  "var fs=document.querySelectorAll('form'), out=[];",
+  'for(var i=0;i<fs.length;i++){var f=fs[i];',
+  "var act=f.getAttribute('action');",
+  "var onsub=f.getAttribute('onsubmit')||f.onsubmit;",
+  'if(act||onsub)continue;',
+  'var n=f;',
+  'while(n){out.push(n);n=n.parentNode;}',
+  '}',
+  'return out;})()',
+].join('');
+
+/** #1434 REVIEW FIX: the chain LENGTHS, by value, so a flat handle list can be split per form. */
+export const SUBMIT_CHAIN_SHAPE_PROBE = [
+  '(function(){',
+  "var fs=document.querySelectorAll('form'), lens=[];",
+  'for(var i=0;i<fs.length;i++){var f=fs[i];',
+  "var act=f.getAttribute('action');",
+  "var onsub=f.getAttribute('onsubmit')||f.onsubmit;",
+  'if(act||onsub)continue;',
+  'var n=f,c=0;',
+  'while(n){c++;n=n.parentNode;}',
+  'lens.push(c);',
+  '}',
+  'return {lengths:lens};})()',
+].join('');
+
+/** Forms the document-level `querySelectorAll('form')` cannot see: shadow hosts (elements with a
+ *  shadowRoot) plus iframes, counted by value. Read-only. */
+export const SUBMIT_BLIND_PROBE = [
+  "(function(){var c=0,all=document.querySelectorAll('*');",
+  'for(var i=0;i<all.length;i++){if(all[i].shadowRoot)c++;}',
+  "return {blind:c+document.querySelectorAll('iframe').length};})()",
+].join('');
+
+/** True when a `DOMDebugger.getEventListeners` reply carries a submit listener.
+ *
+ *  Pure, and tolerant of a reply shape it does not recognise: an unreadable answer is NOT a
+ *  "no listener" answer, and the caller keeps those two apart. */
+export function hasSubmitListener(reply) {
+  if (!reply || !Array.isArray(reply.listeners)) return false;
+  return reply.listeners.some((l) => l && l.type === 'submit');
+}
+
+/** #1434: fold the raw listener readings into the three states this file keeps.
+ *
+ *  `decided` is the whole point. Before this existed the "would lose data" rule could only say
+ *  "undecidable" on any page carrying a script, which is nearly every page — measurable in
+ *  coverage and not in verdict (DoD row 15). Now a form is convicted only when the BROWSER says
+ *  no submit listener is attached to it or to any delegation target, and vindicated when one is.
+ *
+ *  Pure: takes readings, returns a decision. The CDP round trips live in `run`. */
+export function assessSubmitListeners(readings, expectedCount = null) {
+  // #1434 REVIEW FIX: `decided` must mean "every doubtful form was actually asked about". The
+  // listener census and the attribute census are two SEPARATE Runtime.evaluate round trips, so a
+  // DOM that mutates between them (a hydrating page) can return fewer handles than wouldLoseData
+  // counted -- and the first version reported decided:true, unhandled:0, findings:[] for the forms
+  // it never asked about. A confident clean pass over an incomplete population is the
+  // "measured:true beside files_scanned:0" shape this project keeps retiring.
+  if (readings && Array.isArray(readings.forms) && readings.readable === true
+      && Number.isFinite(expectedCount) && readings.forms.length < expectedCount) {
+    return { measured: true, decided: false, checked: readings.forms.length,
+             handled: 0, unhandled: 0, blindSpots: readings.blindSpots || 0,
+             reason: 'census-shortfall', shortfall: expectedCount - readings.forms.length };
+  }
+  if (!readings || !Array.isArray(readings.forms) || readings.readable !== true) {
+    // Could not ask, or the browser would not answer. NOT "no listeners" — the same three-state
+    // discipline assessPhoneWidth and assessContentWidth keep.
+    return { measured: false, decided: false, checked: 0, handled: 0, unhandled: 0,
+             blindSpots: 0, reason: 'unreadable' };
+  }
+  const blindSpots = readings.blindSpots || 0;
+  // Zero forms examined is not a verdict: the probe could not look (forms in shadow roots or
+  // iframes are invisible to it) or there was nothing to adjudicate. Either way, not "clean".
+  if (readings.forms.length === 0) {
+    return { measured: true, decided: false, checked: 0, handled: 0, unhandled: 0,
+             blindSpots, reason: 'no-forms-examined' };
+  }
+  let handled = 0, unhandled = 0;
+  for (const own of readings.forms) {
+    if (own === true) handled += 1;
+    else unhandled += 1;
+  }
+  return { measured: true, decided: true, checked: readings.forms.length, handled, unhandled, blindSpots };
+}
+
+
 /** DoD row 15's "forms submit" clause, aggregated across the pages actually looked at (#1433).
  *
  *  THE DEFECT THIS EXISTS TO RETIRE. The forms check ran once, on the entry page, before the
@@ -524,7 +659,12 @@ export const FORMS_PROBE = [
  *
  *  Pure: takes the pages array, returns a decision. The measuring lives in `run`. */
 export function aggregateForms(pages) {
-  const out = { measured: false, pagesChecked: 0, pagesWithForms: 0, formCount: 0, findings: [] };
+  const out = { measured: false, pagesChecked: 0, pagesWithForms: 0, formCount: 0, findings: [],
+    // #1434 round 2: a page whose only forms sit in shadow roots / iframes reads formCount 0 and
+    // findings [] -- "looked, no forms" -- unless the unread places are carried up here too.
+    // `blindSpots` = total unread places; `pagesWithBlindSpots` = pages that had any;
+    // `pagesWithUnreadForms` = pages that read formCount 0 while having some (nothing was decided).
+    blindSpots: 0, pagesWithBlindSpots: 0, pagesWithUnreadForms: 0 };
   for (const p of pages || []) {
     const f = p && p.forms;
     // `measured !== true` covers every way a page can lack an answer: never visited, skipped for
@@ -534,8 +674,319 @@ export function aggregateForms(pages) {
     out.pagesChecked += 1;
     out.formCount += f.formCount;
     if (f.formCount > 0) out.pagesWithForms += 1;
+    const blind = f.submitListeners && typeof f.submitListeners.blindSpots === 'number'
+      ? f.submitListeners.blindSpots : 0;
+    if (blind > 0) {
+      out.blindSpots += blind;
+      out.pagesWithBlindSpots += 1;
+      if (f.formCount === 0) out.pagesWithUnreadForms += 1;
+    }
     const where = p.entry ? '' : ` [page: ${p.url}]`;
     for (const finding of f.findings || []) out.findings.push(cleanText(`Forms${where}: ${finding}`, 500));
+  }
+  return out;
+}
+
+/** The width this check measures at, and it is NOT the 1280 the screenshot uses (#1435).
+ *
+ *  1280 cannot answer the question. The commonest page container on the web is
+ *  `max-width: 1200px; margin: 0 auto`, which at a 1265px layout viewport leaves a 32px gutter —
+ *  numerically indistinguishable from a page with no container at all and a single `1rem` of
+ *  padding. Measured on the banked deliveries: a CORRECT container read 33px and a MISSING one
+ *  read 32px. A rule cannot separate those, and one tuned until it did would be measuring noise.
+ *
+ *  At 1600 the same container reads ~200px and the same bare padding still reads 16px, so the
+ *  two stop overlapping. It is also closer to the screen the operator actually reviewed on: his
+ *  complaint was that text ran the full width of his monitor, and monitors are not 1280 wide.
+ *
+ *  Overridden and restored around each measurement, never left applied — the screenshot, the
+ *  design critic and the phone pass must all still see the 1280x900 page. */
+const CONTENT_WIDTH_VIEWPORT_PX = 1600;
+
+/** The content-width probe (#1435). ONE definition, two call sites, same reasons as FORMS_PROBE.
+ *
+ *  READS THE LAYOUT AND CHANGES NOTHING. No click, no submit, no dispatched event, no style
+ *  write. A Range is created to measure text, which is a detached object: it does not touch the
+ *  document and does not disturb the user's selection.
+ *
+ *  IT MEASURES WHERE THE GLYPHS ARE, NOT WHERE THE BOX IS, and that is the single most important
+ *  decision in this file. A centred `<h2>` inside a full-bleed band has a box spanning the whole
+ *  window and text sitting comfortably in the middle; a left-aligned `<h1>` with no wrapper has
+ *  a box spanning the whole window and text starting at pixel zero. Those are opposite facts and
+ *  the element box reports them identically. `Range.getClientRects()` returns the actual line
+ *  boxes, so centred, right-aligned and short headings are all measured honestly.
+ *
+ *  Measured on the banked deliveries, this is exactly what separates the two pages of ONE
+ *  delivery that the operator judged differently: `home.html`'s edge-spanning headings are
+ *  `.section-header { text-align: center }` and their glyphs are nowhere near the edge, while
+ *  `pieces.html`'s page title sits in `.page-header` — a class the stylesheet never defines — and
+ *  its glyphs start at zero.
+ *
+ *  THE REST OF THE FILTERING, and every clause is a precision decision:
+ *    - `p,h1..h6,li,blockquote` — BODY TEXT AND HEADINGS. A `<section>`, a `<div>` and an `<img>`
+ *      are all legitimately full-width; a paragraph is what a person reads along.
+ *    - anything inside `header,nav,footer,[role=banner],[role=navigation],[role=contentinfo]` is
+ *      SKIPPED. Page chrome is edge-to-edge by design across most of the web.
+ *    - `el.querySelector(sel)` is SKIPPED, so only text LEAVES are measured and an `<li>`
+ *      wrapping a `<p>` cannot be counted twice.
+ *    - under 8 characters is SKIPPED: "Home", "$25.99". An `<h1>Contact Us</h1>` is ten, and is
+ *      exactly the block the operator saw starting at pixel zero, so the floor stays low.
+ *
+ *  IT ALSO ANSWERS WHY. A wrapper class that the HTML applies and no stylesheet defines is the
+ *  sharpest form of this defect: every file looks right on its own and the page has no container
+ *  at all. That is decidable here and nowhere else — walk the ancestors of a block that reached
+ *  the edge, and report class names that appear in no rule of any readable stylesheet.
+ *  `stylesheetsRead` gates the claim: a cross-origin sheet cannot be enumerated, and "I could not
+ *  read the CSS" must never be published as "the class is undefined".
+ *
+ *  Per-block geometry only; NO verdict. The thresholds live in `assessContentWidth`, so the
+ *  judgement is a pure function of numbers a unit test can drive without a browser. */
+export const CONTENT_WIDTH_PROBE = [
+  '(function(){',
+  'var vw=(document.documentElement&&document.documentElement.clientWidth)||window.innerWidth||0;',
+  "var sel='p,h1,h2,h3,h4,h5,h6,li,blockquote';",
+  "var chrome='header,nav,footer,[role=banner],[role=navigation],[role=contentinfo]';",
+  // Every class name any readable stylesheet defines a rule for. Grouping rules (@media,
+  // @supports) are walked, or a class defined only inside a breakpoint would read as undefined.
+  'var defined=null, sheetsRead=0;',
+  'try{var d={};var ss=document.styleSheets;',
+  'var walk=function(rules){for(var r=0;r<rules.length;r++){var rule=rules[r];',
+  'if(rule.selectorText){var mm=rule.selectorText.match(/\\.[A-Za-z_-][A-Za-z0-9_-]*/g);',
+  'if(mm)for(var q=0;q<mm.length;q++)d[mm[q].slice(1)]=1;}',
+  'if(rule.cssRules)walk(rule.cssRules);}};',
+  'for(var si=0;si<ss.length;si++){var cr=null;',
+  // A cross-origin sheet throws here. Skipped, and it lowers sheetsRead rather than being
+  // silently treated as a sheet that defined nothing.
+  'try{cr=ss[si].cssRules;}catch(e){cr=null;}',
+  'if(!cr)continue;sheetsRead++;walk(cr);}',
+  'if(sheetsRead>0)defined=d;}catch(e){defined=null;}',
+  'var offColumn=function(e){for(var a=e;a&&a.nodeType===1;a=a.parentElement){',
+  'var c=getComputedStyle(a);',
+  "if(c.position==='fixed'||c.position==='sticky')return true;",
+  'if(parseFloat(c.opacity)===0)return true;',
+  "if(c.clip&&c.clip!=='auto'&&c.position==='absolute')return true;",
+  "if(c.overflow!=='visible'&&(a.clientWidth<=1||a.clientHeight<=1))return true;}",
+  'return false;};',
+  'var els=document.querySelectorAll(sel), blocks=[], capped=false;',
+  'var rng=document.createRange();',
+  'for(var i=0;i<els.length;i++){',
+  'if(blocks.length>=400){capped=true;break;}',
+  'var el=els[i];',
+  'if(el.closest(chrome))continue;',
+  'if(el.querySelector(sel))continue;',
+  "var t=(el.textContent||'').replace(/\\s+/g,' ').trim();",
+  'if(t.length<8)continue;',
+  'var s=getComputedStyle(el);',
+  "if(s.display==='none'||s.visibility==='hidden')continue;",
+  // Not part of the page's reading column: a fixed or sticky ancestor (cookie banner, floating
+  // widget), an ancestor at opacity 0, or a visually-hidden clipped box (skip-link, sr-only).
+  // visibility:hidden is inherited so the check above covers it; these three are not.
+  'if(offColumn(el))continue;',
+  // THE GLYPH MEASUREMENT. Line boxes, not the element box.
+  'var lo=Infinity, hi=-Infinity;',
+  'try{rng.selectNodeContents(el);var rs=rng.getClientRects();',
+  'for(var k=0;k<rs.length;k++){var qr=rs[k];',
+  'if(qr.width<=0||qr.height<=0)continue;',
+  'if(qr.left<lo)lo=qr.left;if(qr.right>hi)hi=qr.right;}}catch(e){}',
+  'if(!isFinite(lo)||!isFinite(hi))continue;',
+  // Wholly outside the window (a skip-link parked at left:-9999px) is not on the page a visitor sees.
+  'if(hi<=0||lo>=vw)continue;',
+  // The NEAREST edge. Text flush against either side is the defect; a short left-aligned title
+  // at x=0 has an enormous right-hand gutter and is still flush against the window.
+  'var g=Math.round(Math.min(lo, vw-hi));',
+  "var cn=(el.className&&typeof el.className==='string')?el.className.trim():'';",
+  "var name=el.tagName.toLowerCase()+(cn?'.'+cn.split(/\\s+/)[0]:'');",
+  'var undef=[];',
+  'if(defined){var a=el;',
+  'while(a&&a!==document.body&&undef.length<4){',
+  "var ac=(a.className&&typeof a.className==='string')?a.className.trim():'';",
+  'if(ac){var ps=ac.split(/\\s+/);',
+  'for(var p2=0;p2<ps.length;p2++){',
+  'if(ps[p2]&&!defined[ps[p2]]&&undef.indexOf(ps[p2])<0)undef.push(ps[p2]);}}',
+  'a=a.parentElement;}}',
+  'blocks.push({tag:name, chars:t.length, gutterPx:g, text:t.slice(0,40), undefinedClasses:undef});',
+  '}',
+  'return {viewportPx:vw, blocks:blocks, capped:capped, stylesheetsRead:sheetsRead};})()',
+].join('');
+
+/** WHAT THIS CHECK CANNOT SEE, and WHAT IT MAY OVER-REPORT (#1435). Published in the sidecar as
+ *  `contentWidth.cannotSee` so a reader adjudicating a finding sees the limits next to it. The
+ *  check is ADVISORY; none of these is tuned away with a threshold, because the first group is a
+ *  design judgement no DOM fact decides. */
+export const CONTENT_WIDTH_CANNOT_SEE = Object.freeze([
+  'MAY OVER-REPORT: a left-aligned full-bleed hero, a docs-style sidebar/aside or a banner whose text sits inside a deliberate 16-24px padding reads as flush to the edge (within the 24px tolerance) when the main content is in fact contained.',
+  'MAY OVER-REPORT: a deliberate full-bleed editorial layout, and a container whose max-width is at or above the measurement width.',
+  'MAY UNDER-REPORT: fixed or sticky elements (cookie banners, floating sidebars), opacity:0 and visually-hidden skip-links are skipped, so flush text inside one is not counted.',
+  'FALSE NEGATIVE: a page with a single flush paragraph (fewer than 2 edge blocks, or under 40 edge characters) is judgeable but never unconstrained.',
+  'FALSE NEGATIVE: only p, h1-h6, li and blockquote leaves are measured; text held in a bare div or span, or in header/nav/footer, is never judged (such a page reads judgeable=false).',
+  'FALSE NEGATIVE: the probe stops at 400 blocks in document order (published as `capped`); edge text after that is unseen.',
+  'NOT MEASURED: line height, font size, column count, or whether an existing constraint is a good measure.',
+]);
+
+/** How close a line of text may come to the window edge before it counts as flush against it.
+ *  Not zero: a hairline rounding artefact should not convict. Not large: at the measurement
+ *  width above, a real container leaves ~200px, so anything in this range is bare padding at
+ *  best. Measured on the banked deliveries, the nearest correct layout reads 32px. */
+const CONTENT_WIDTH_GUTTER_PX = 24;
+/** THE NEAR-TWIN GUARD. One element at the edge is a pull-quote, a breadcrumb, a full-bleed
+ *  caption — and correct. Two or more, carrying real words, is a page with nothing holding its
+ *  content in. Deliberately NOT a share-of-the-page rule: the delivered gallery page has a
+ *  correctly gridded card list under a page title that starts at pixel zero, so the broken text
+ *  is a SMALL share of a page that is nonetheless broken where the operator looked first. */
+const CONTENT_WIDTH_MIN_EDGE_BLOCKS = 2;
+const CONTENT_WIDTH_MIN_EDGE_CHARS = 40;
+
+/** DoD row 15, the DESKTOP half of "the layout survives a width" (#1435).
+ *
+ *  THE DEFECT, AND WHY THE PHONE CHECK IS BLIND TO IT. `assessPhoneWidth` above asks one
+ *  question — is content WIDER than the viewport? On 2026-08-16 the operator opened a delivered
+ *  pottery site and his verdict was "not good"; the pages had no width constraint, so every
+ *  heading and paragraph began at pixel zero and ran the full width of his monitor. That run's
+ *  own sidecar recorded `phoneWidth: {measured:true, overflows:false, overflowPx:0}`. True, and
+ *  useless: unconstrained content at 390px is not wider than 390px, so an unwrapped page and a
+ *  correctly wrapped one produce an IDENTICAL verdict. A check that cannot distinguish the
+ *  defect from its absence is not a passing check (#1241).
+ *
+ *  So this asks the opposite question at a desktop width: does the page's own text run flush
+ *  against the edge of the window, with nothing holding it in?
+ *
+ *  THE VERDICT IS PER PAGE, and that is a requirement rather than an implementation detail. A
+ *  delivery is not uniformly wrapped or unwrapped: measured on `20260817-070902`, the contact
+ *  page renders as a neat centred card while the gallery page in the SAME build runs flush to
+ *  the left edge, because `.contact-container` is defined and `.page-container` is applied and
+ *  defined nowhere. A whole-site verdict would have hidden one behind the other, so every page
+ *  carries its own answer and `aggregateContentWidth` publishes counts rather than a site-wide
+ *  pass or fail.
+ *
+ *  IT MUST NOT BE IMPLEMENTED BY LOOKING AT CLASS NAMES. That delivery uses `container`,
+ *  `page-container`, `max-width-container`, `contact-container`, `header-container` and
+ *  `hero-content`, and only some are defined; a name-matching rule would have read
+ *  `page-container` as a success. The verdict comes from measured geometry alone. The class
+ *  names appear in the FINDING, never in the decision.
+ *
+ *  PRECISION FIRST, because the honest near-twin is common and correct. Full-bleed heroes, nav
+ *  bars, footers and centred section headings are edge-to-edge on purpose, and a rule that
+ *  convicts them nags a coder into breaking working design and ends up switched off. Three
+ *  independent guards keep them out: the probe skips page chrome; it measures where the glyphs
+ *  actually are, so centred text in a full-bleed band is correctly nowhere near the edge; and a
+ *  verdict needs at least two blocks carrying real words, so one stray element cannot convict.
+ *
+ *  WHAT IT CANNOT SEE, named rather than left to be discovered. A container whose `max-width` is
+ *  at or above the measurement width has no gutter to find and will be reported — true at that
+ *  width, harmless to fix, but not the defect this is about. It says nothing about line height,
+ *  font size, column count, or whether a constraint that exists is a GOOD measure: text held to
+ *  1500px is "constrained" here and still punishing to read. It cannot tell a deliberately
+ *  full-bleed editorial layout from a forgotten container, because no DOM fact separates them.
+ *
+ *  Pure: takes measured numbers, returns a decision. The measuring lives in `run`. */
+export function assessContentWidth(m, gutterTolerancePx = CONTENT_WIDTH_GUTTER_PX) {
+  // "Could not measure" is NOT "the layout is fine" — the discipline the whole file keeps.
+  if (!m || !Array.isArray(m.blocks)
+      || typeof m.viewportPx !== 'number' || !Number.isFinite(m.viewportPx) || m.viewportPx <= 0) {
+    return { measured: false, judgeable: false, unconstrained: false, findings: [] };
+  }
+  const sheetsRead = Number.isFinite(m.stylesheetsRead) ? m.stylesheetsRead : 0;
+  let blocksMeasured = 0, textChars = 0, edgeBlocks = 0, edgeChars = 0;
+  let minGutterPx = 0, example = '', exampleChars = -1;
+  const undefinedClasses = [];
+  for (const b of m.blocks) {
+    if (!b || typeof b.gutterPx !== 'number' || !Number.isFinite(b.gutterPx)) continue;
+    const chars = Number.isFinite(b.chars) ? b.chars : 0;
+    blocksMeasured += 1;
+    textChars += chars;
+    if (b.gutterPx > gutterTolerancePx) continue;
+    minGutterPx = edgeBlocks === 0 ? b.gutterPx : Math.min(minGutterPx, b.gutterPx);
+    edgeBlocks += 1;
+    edgeChars += chars;
+    // The widest-read example, not the first: a reader adjudicating this against the screenshot
+    // should be pointed at the block carrying the most text, which is the one they will see.
+    if (chars > exampleChars) {
+      exampleChars = chars;
+      const words = cleanText(b.text || '', 40);
+      example = cleanText(b.tag || '', 40) + (words ? ` "${words}…"` : '');
+    }
+    // Only claimed when a stylesheet was actually enumerated. A sheet this probe could not read
+    // is a reason to say nothing, never a reason to accuse a class of not existing.
+    if (sheetsRead > 0) {
+      for (const c of Array.isArray(b.undefinedClasses) ? b.undefinedClasses : []) {
+        if (typeof c === 'string' && c && undefinedClasses.length < 3
+            && !undefinedClasses.includes(c)) {
+          undefinedClasses.push(cleanText(c, 40));
+        }
+      }
+    }
+  }
+  // A page with no body text at all was LOOKED AT and cannot be judged. Third state, published.
+  const judgeable = blocksMeasured > 0;
+  const unconstrained = judgeable
+    && edgeBlocks >= CONTENT_WIDTH_MIN_EDGE_BLOCKS
+    && edgeChars >= CONTENT_WIDTH_MIN_EDGE_CHARS;
+  const findings = [];
+  if (unconstrained) {
+    const many = undefinedClasses.length > 1;
+    const why = undefinedClasses.length
+      ? `The wrapper ${many ? 'classes' : 'class'} `
+        + `${undefinedClasses.map((c) => `"${c}"`).join(', ')} ${many ? 'are' : 'is'} applied in `
+        + `the HTML but defined in no stylesheet, so ${many ? 'they constrain' : 'it constrains'} `
+        + 'nothing. '
+      : '';
+    findings.push(cleanText(
+      `Body text runs flush to the edge at ${Math.round(m.viewportPx)}px wide: ${edgeBlocks} of `
+      + `${blocksMeasured} text blocks start within ${Math.round(minGutterPx)}px of the window `
+      + `edge (e.g. ${example || 'a paragraph'}). ${why}`
+      + 'Wrap the page content in a width-limited element (a max-width plus margin: 0 auto). '
+      + 'Headers, navs, footers and fixed banners were excluded. Advisory: a padded left-aligned '
+      + 'hero or sidebar may false-positive (see contentWidth.cannotSee).',
+      600));
+  }
+  return {
+    measured: true,
+    judgeable,
+    unconstrained,
+    viewportPx: Math.round(m.viewportPx),
+    blocksMeasured,
+    edgeBlocks,
+    textChars,
+    edgeChars,
+    // NULL, not 0, when nothing came near the edge. A zero here would read as "text touches the
+    // window edge" on precisely the pages where nothing does — the same three-state confusion
+    // this check exists to end, one field down.
+    minGutterPx: edgeBlocks > 0 ? Math.round(minGutterPx) : null,
+    example,
+    // Published even when empty, and distinct from "no stylesheet was readable" below.
+    undefinedClasses,
+    stylesheetsRead: sheetsRead,
+    // The probe stops at 400 blocks. A truncated scan is still a sample of the page, but a reader
+    // comparing two runs deserves to know the number came from a bounded walk.
+    capped: m.capped === true,
+    findings,
+  };
+}
+
+/** DoD row 15's desktop-width clause, aggregated across the pages actually looked at (#1435).
+ *
+ *  COUNTS, NEVER A SITE-WIDE VERDICT. The delivery that caused this ticket has a contact page
+ *  that is fine and a gallery page that is not, and either a site-level pass or a site-level
+ *  fail would have been a lie about half of it. So the aggregate reports how many pages were
+ *  checked, how many could be judged, and how many run flush to the edge, and every finding
+ *  names its page.
+ *
+ *  Same denominator discipline as `aggregateForms`: a page skipped for budget, one that failed
+ *  to navigate, or one whose probe threw carries no `contentWidth` at all, so it lowers coverage
+ *  instead of faking it. `pagesJudged` is separate from `pagesChecked` because a page with no
+ *  body text was looked at and still cannot be spoken for. */
+export function aggregateContentWidth(pages) {
+  const out = { measured: false, pagesChecked: 0, pagesJudged: 0, pagesUnconstrained: 0, findings: [], cannotSee: CONTENT_WIDTH_CANNOT_SEE.slice() };
+  for (const p of pages || []) {
+    const c = p && p.contentWidth;
+    if (!c || c.measured !== true) continue;
+    out.measured = true;
+    out.pagesChecked += 1;
+    if (c.judgeable === true) out.pagesJudged += 1;
+    if (c.unconstrained === true) out.pagesUnconstrained += 1;
+    const where = p.entry ? '' : ` [page: ${p.url}]`;
+    // Marker FIRST so the cap truncates the message rather than the attribution.
+    for (const finding of c.findings || []) out.findings.push(cleanText(`Layout${where}: ${finding}`, 700));
   }
   return out;
 }
@@ -648,6 +1099,118 @@ async function evalJson(cdp, expression) {
   if (r && r.result && r.result.value !== undefined) return r.result.value;
   return null;
 }
+
+/** Run the content-width probe at a WIDE desktop viewport, then put 1280x900 back (#1435).
+ *
+ *  The override is the whole reason this is a helper rather than an inline evaluate. At 1280 a
+ *  correct 1200px container and a missing container are 33px and 32px apart — see
+ *  `CONTENT_WIDTH_VIEWPORT_PX` — so the measurement has to happen somewhere the two separate.
+ *
+ *  RESTORED IN A `finally`, not after the call. If the probe throws, the override must still come
+ *  off: a wide viewport left applied would silently change the screenshot, the design critic's
+ *  input, the phone pass and every page swept after it. That is the failure mode the existing
+ *  phone-pass restore exists for, and it costs nothing to make this one unconditional. */
+async function measureContentWidth(cdp, settleMs) {
+  try {
+    await cdp.send('Emulation.setDeviceMetricsOverride',
+                   { width: CONTENT_WIDTH_VIEWPORT_PX, height: 900, deviceScaleFactor: 1, mobile: false });
+    await sleep(Math.min(settleMs, 400));   // let a responsive layout reflow before it is measured
+    return await evalJson(cdp, CONTENT_WIDTH_PROBE);
+  } finally {
+    await cdp.send('Emulation.setDeviceMetricsOverride',
+                   { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false }).catch(() => {});
+    await sleep(120);
+  }
+}
+
+/** Shadow hosts + iframes on the page, as context for the sidecar (never a verdict). Best effort. */
+async function countBlindSpots(cdp) {
+  try {
+    const b = await cdp.send('Runtime.evaluate',
+      { expression: SUBMIT_BLIND_PROBE, returnByValue: true });
+    const n = b && b.result && b.result.value && b.result.value.blind;
+    return Number.isFinite(n) ? n : 0;
+  } catch { return 0; }
+}
+
+/** #1434: ask the browser which of the doubtful forms actually have a submit listener.
+ *
+ *  The CDP dance the attribute reads cannot do: `Runtime.evaluate` returning HANDLES rather than
+ *  values, `Runtime.getProperties` to walk the returned array into per-element `objectId`s, then
+ *  `DOMDebugger.getEventListeners` on each. Each form's ancestor chain and the window are asked, because a
+ *  listener on any of them handles the form.
+ *
+ *  FAIL-SOFT AND FAIL-HONEST. Every failure path returns `readable:false`, which `assessSubmitListeners`
+ *  turns into "undecidable" — never into "no listener". A browser that will not answer must not be
+ *  able to manufacture a conviction. Handles are released in a `finally` so a page with many forms
+ *  cannot leak them across the sweep. */
+export async function measureSubmitListeners(cdp) {
+  const release = [];
+  try {
+    // Chain SHAPE first (by value): how many nodes belong to each doubtful form.
+    const shape = await cdp.send('Runtime.evaluate',
+      { expression: SUBMIT_CHAIN_SHAPE_PROBE, returnByValue: true });
+    const lengths = shape && shape.result && shape.result.value && Array.isArray(shape.result.value.lengths)
+      ? shape.result.value.lengths : null;
+    if (!lengths) return { readable: false, forms: [] };
+    if (lengths.length === 0) {
+      return { readable: true, forms: [], blindSpots: await countBlindSpots(cdp) };
+    }
+
+    // Then the flat HANDLE list: form0, its ancestors..., form1, its ancestors...
+    const arr = await cdp.send('Runtime.evaluate',
+      { expression: SUBMIT_CHAIN_HANDLE_PROBE, returnByValue: false });
+    const arrId = arr && arr.result && arr.result.objectId;
+    if (!arrId) return { readable: false, forms: [] };
+    release.push(arrId);
+    const props = await cdp.send('Runtime.getProperties', { objectId: arrId, ownProperties: true });
+    const ids = (props && Array.isArray(props.result) ? props.result : [])
+      .filter((x) => x && /^\d+$/.test(x.name) && x.value && x.value.objectId)
+      .map((x) => x.value.objectId);
+    for (const id of ids) release.push(id);
+
+    // The flat list must match the shape exactly, or attribution would be guesswork.
+    const need = lengths.reduce((a, b) => a + b, 0);
+    if (ids.length !== need) return { readable: false, forms: [] };
+
+    // Walk each form's own chain: the form itself, then every ancestor up to document.
+    // A listener ANYWHERE on that chain handles the form -- that is what delegation IS.
+    const forms = [];
+    let cursor = 0;
+    for (const len of lengths) {
+      let handled = false;
+      for (let k = 0; k < len; k += 1) {
+        if (!handled) {
+          const r = await cdp.send('DOMDebugger.getEventListeners', { objectId: ids[cursor + k] });
+          if (hasSubmitListener(r)) handled = true;
+        }
+      }
+      forms.push(handled);
+      cursor += len;
+    }
+    // Above document on the event path sits the window; a listener there handles every form
+    // still unhandled. Asked once, and only when it could change the answer.
+    if (forms.some((h) => !h)) {
+      const w = await cdp.send('Runtime.evaluate',
+        { expression: 'window', returnByValue: false });
+      const wId = w && w.result && w.result.objectId;
+      if (!wId) return { readable: false, forms: [] };
+      release.push(wId);
+      const wr = await cdp.send('DOMDebugger.getEventListeners', { objectId: wId });
+      if (hasSubmitListener(wr)) for (let i = 0; i < forms.length; i += 1) forms[i] = true;
+    }
+    const blindSpots = await countBlindSpots(cdp);
+    return { readable: true, forms, blindSpots };
+  } catch {
+    // Unsupported domain, closed target, anything at all: undecidable, never a conviction.
+    return { readable: false, forms: [] };
+  } finally {
+    for (const objectId of release) {
+      try { await cdp.send('Runtime.releaseObject', { objectId }); } catch { /* best effort */ }
+    }
+  }
+}
+
 
 // A DOM snapshot expression (IIFE returning a JSON-serializable object). Records the structural
 // axes a positive behavior smoke needs, plus an optional named region.
@@ -961,6 +1524,19 @@ async function run() {
     await Promise.race([loaded, sleep(Math.min(timeoutMs, 20000))]);
     await sleep(settleMs); // let deferred module JS run + async console/exception fire
 
+    // #1435. DoD row 15's DESKTOP-width slice. Measured HERE for two reasons, both locked:
+    //  (1) BEFORE the behavior-smoke click below. The heuristic click takes the first visible
+    //      link/button, which is often a nav link, and a click that navigates leaves the browser
+    //      on a DIFFERENT page: measured after it, the entry row described the wrong page, in
+    //      both polarities (a well-built page convicted with another page's text, a broken one
+    //      reported clean while the sidecar named the URL it never measured).
+    //  (2) before the phone override, because the whole question is what a desktop visitor sees.
+    //      Measuring it at 390px would ask the same blind question the phone check already asks.
+    let entryContentWidth = { measured: false, judgeable: false, unconstrained: false, findings: [] };
+    try {
+      entryContentWidth = assessContentWidth(await measureContentWidth(cdp, settleMs));
+    } catch { /* leaves measured=false — an unmeasured layout is never a passing one */ }
+
     // ---- H9 behavior smoke: snapshot -> click primary action -> snapshot -> evaluate delta ----
     // Both the initial value and the catch below carry status UNAVAILABLE, never a passing one: a
     // smoke that did not reach a verdict must not be readable as one that did.
@@ -1084,7 +1660,11 @@ async function run() {
     // on the contact page, and looking only here published an entry-page fact as a site fact.
     let entryForms = { measured: false, findings: [] };
     try {
-      entryForms = assessForms(await evalJson(cdp, FORMS_PROBE));
+      {
+        const fm = await evalJson(cdp, FORMS_PROBE) || {};
+        entryForms = assessForms(Object.assign(fm,
+          { submitListeners: assessSubmitListeners(await measureSubmitListeners(cdp), fm.wouldLoseData) }));
+      }
     } catch { /* leaves measured=false — never "the forms are fine" */ }
 
     let phoneWidth = { measured: false, overflows: false, overflowPx: 0 };
@@ -1122,6 +1702,9 @@ async function run() {
       // #1433. Per-page, exactly as `consoleErrors` already is. The top-level `forms` below is
       // now an AGGREGATE over these, so the per-page answers are what a reader adjudicates.
       forms: entryForms,
+      // #1435, same shape and the same reason: the top-level `contentWidth` is an aggregate over
+      // these, so "which page runs edge-to-edge" is answerable rather than inferred.
+      contentWidth: entryContentWidth,
     };
     const pages = [entrySnapshot];
     const extraPages = String(args['extra-pages'] || '')
@@ -1177,8 +1760,20 @@ async function run() {
         // Left ABSENT on failure rather than set to a zero: `aggregateForms` counts only pages
         // whose answer is `measured: true`, so an absence lowers coverage instead of faking it.
         try {
-          rec.forms = assessForms(await evalJson(cdp, FORMS_PROBE));
+          {
+            const fm2 = await evalJson(cdp, FORMS_PROBE) || {};
+            rec.forms = assessForms(Object.assign(fm2,
+              { submitListeners: assessSubmitListeners(await measureSubmitListeners(cdp), fm2.wouldLoseData) }));
+          }
         } catch { /* no `forms` key — "did not look", never "looked and found nothing" */ }
+        // #1435. Same per-page treatment, its own try/catch for the same reason: a probe that
+        // throws costs this page its width answer and nothing else. Left ABSENT on failure, so
+        // `aggregateContentWidth` lowers coverage rather than counting a page it never read.
+        // PER PAGE is the point — one delivery can have a wrapped contact page and an unwrapped
+        // gallery page, and a site-level answer hides one behind the other.
+        try {
+          rec.contentWidth = assessContentWidth(await measureContentWidth(cdp, settleMs));
+        } catch { /* no `contentWidth` key — "did not look", never "looked and it was fine" */ }
       } catch (e) {
         // A page that cannot be visited is recorded as NOT VISITED -- never as clean. An
         // unvisited page and a page with no findings must not read the same.
@@ -1206,6 +1801,14 @@ async function run() {
     // build that passes today. Promoting it is a reader change plus the operator's say-so.
     const forms = aggregateForms(pages);
     for (const f of forms.findings) findings.push(f); // ADVISORY
+    // #1435, ADVISORY like every one of its siblings and for the identical reason: the operator
+    // was asked directly whether "the page has no margins" should fail a build outright, and his
+    // answer on 2026-08-16 was "probably just reported". So it joins `findings`, which a human
+    // reads, and stays out of `computeHard`. Promoting it to blocking is a new way for a build to
+    // fail, which is his ceremony — one reader change away, against evidence that will exist by
+    // then. Locked in verify-capture-cdp.mjs against computeHard growing a width input.
+    const contentWidth = aggregateContentWidth(pages);
+    for (const f of contentWidth.findings) findings.push(f); // ADVISORY
 
 
     writeSidecar(sidecarPath, {
@@ -1240,6 +1843,11 @@ async function run() {
       // with no forms, and `measured: false` is a site nothing looked at. Before this, both
       // rendered identically as `formCount: 0` and the second was being read as the first.
       forms,
+      // #1435: an AGGREGATE over `pages[].contentWidth`. Three readings, deliberately distinct:
+      // `measured: false` is a site nothing looked at; `pagesJudged: 0` with `pagesChecked: 5` is
+      // a site with too little body text for this rule to speak to; `pagesUnconstrained: n` is
+      // the count of pages whose body text runs edge-to-edge at the desktop width.
+      contentWidth,
       notes,
       pages,
       pagesRequested: extraPages.length + 1,
